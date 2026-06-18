@@ -1,0 +1,6 @@
+.git
+baremetal.db
+data/
+tmp/
+*.log
+*.test

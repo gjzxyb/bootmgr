@@ -1,0 +1,12 @@
+html, body, #root { height: 100%; margin: 0; }
+body { background: #f4f6f8; }
+.app-shell { min-height: 100%; }
+.sidebar { min-height: 100vh; }
+.brand { color: white !important; padding: 20px 18px 8px; margin: 0 !important; line-height: 1.35 !important; }
+.topbar { background: white; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; border-bottom: 1px solid #e8e8e8; }
+.content { padding: 20px; }
+.page-title { margin: 0 0 16px !important; }
+.toolbar { display: flex; gap: 8px; margin-bottom: 12px; }
+.route-loading { min-height: 260px; display: grid; place-items: center; }
+.login-wrap { min-height: 100vh; display: grid; place-items: center; background: #101828; }
+.login-panel { width: 380px; background: white; padding: 28px; border-radius: 8px; box-shadow: 0 18px 60px rgba(0,0,0,.24); }

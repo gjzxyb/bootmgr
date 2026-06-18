@@ -1,0 +1,2070 @@
+openapi: 3.0.3
+info:
+  title: Bare Metal Lifecycle Platform MVP API
+  version: 0.1.0
+  description: Unified bare metal lifecycle management platform MVP API draft.
+servers:
+  - url: http://localhost:8080/api/v1
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    PageMeta:
+      type: object
+      properties:
+        total: { type: integer }
+        page: { type: integer }
+        page_size: { type: integer }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+    LoginResponse:
+      type: object
+      properties:
+        token: { type: string }
+        user: { $ref: '#/components/schemas/User' }
+    HealthStatus:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        database: { type: string, enum: [ok, error] }
+        redis: { type: string, enum: [ok, disabled, error] }
+        error: { type: string }
+    ConfigIssue:
+      type: object
+      properties:
+        level: { type: string, enum: [error, warning] }
+        key: { type: string }
+        message: { type: string }
+    ReadinessCheck:
+      type: object
+      properties:
+        name: { type: string, enum: [database, redis, image_storage, pxe_services, config] }
+        status: { type: string, enum: [ok, warning, error] }
+        message: { type: string }
+    ReadinessStatus:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        checks:
+          type: array
+          items: { $ref: '#/components/schemas/ReadinessCheck' }
+        config_issues:
+          type: array
+          items: { $ref: '#/components/schemas/ConfigIssue' }
+    BackupValidationCheck:
+      type: object
+      properties:
+        name: { type: string }
+        status: { type: string, enum: [ok, warning, error] }
+        message: { type: string }
+    BackupValidationReport:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, warning, error] }
+        version: { type: string }
+        generated_at: { type: string, format: date-time }
+        totals:
+          type: object
+          additionalProperties: { type: integer }
+        target_counts:
+          type: object
+          additionalProperties: { type: integer }
+        checks:
+          type: array
+          items: { $ref: '#/components/schemas/BackupValidationCheck' }
+    BackupRestoreResult:
+      type: object
+      properties:
+        status: { type: string, enum: [restored] }
+        imported:
+          type: object
+          additionalProperties: { type: integer }
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/BackupValidationCheck' }
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        email: { type: string, format: email }
+        name: { type: string }
+        role: { type: string, enum: [admin, operator, viewer] }
+    Tenant:
+      type: object
+      required: [tenant_id, name]
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        tenant_id:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$'
+          description: Backend-owned after create. Update requests cannot change it.
+        name: { type: string }
+        status: { type: string, enum: [active, disabled], default: active }
+        owner: { type: string }
+        description: { type: string }
+        quota:
+          type: object
+          additionalProperties: true
+          description: Optional JSON object. Numeric quota values must be non-negative; quota.servers is enforced as a non-negative integer server asset limit.
+    NetworkConfig:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        purpose: { type: string, enum: [management, deployment, business] }
+        cidr:
+          type: string
+          description: Must be a valid CIDR prefix.
+        gateway:
+          type: string
+          description: Optional IP address that must be inside cidr.
+        dns: { type: string }
+        vlan_id:
+          type: integer
+          minimum: 0
+          maximum: 4094
+        dhcp_mode: { type: string, enum: [proxy, builtin, external] }
+        proxy_dhcp: { type: boolean }
+        status: { type: string, enum: [enabled, disabled] }
+        description: { type: string }
+        created_by: { type: string }
+    NetworkCheck:
+      type: object
+      properties:
+        name: { type: string }
+        status: { type: string, enum: [ok, warning, error] }
+        message: { type: string }
+    NetworkCheckReport:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, warning, error] }
+        checks:
+          type: array
+          items: { $ref: '#/components/schemas/NetworkCheck' }
+    MetadataNetworkInterface:
+      type: object
+      properties:
+        name: { type: string }
+        mac: { type: string }
+        address: { type: string }
+        network_id: { type: integer }
+        network_name: { type: string }
+        cidr: { type: string }
+        gateway: { type: string }
+        dns:
+          type: array
+          items: { type: string }
+        vlan_id: { type: integer }
+        dhcp_mode: { type: string, enum: [proxy, builtin, external] }
+        proxy_dhcp: { type: boolean }
+    MetadataNetwork:
+      type: object
+      properties:
+        interfaces:
+          type: array
+          items: { $ref: '#/components/schemas/MetadataNetworkInterface' }
+    MetadataSSHKeys:
+      type: object
+      properties:
+        keys:
+          type: array
+          items: { type: string }
+    Server:
+      type: object
+      properties:
+        id: { type: integer }
+        asset_no:
+          type: string
+          description: Unique when non-empty.
+        hostname:
+          type: string
+          description: Unique when non-empty. Saved in lowercase.
+        status:
+          type: string
+          enum: [discovered, ready, deploying, running, maintenance, retired, scrapped]
+          default: discovered
+        architecture:
+          type: string
+          enum: [x86_64, arm64]
+          default: x86_64
+        primary_ip:
+          type: string
+          description: Optional valid IP address.
+        primary_mac:
+          type: string
+          description: Optional valid MAC address. Saved in lowercase colon-separated form and unique when non-empty.
+        owner: { type: string }
+        tenant_id:
+          type: string
+          description: Optional. When provided on create, update, or import, it must reference an active tenant.
+        location: { type: string }
+        rack: { type: string }
+        rack_unit: { type: string }
+        tags:
+          description: JSON array or object used for CMDB labels and keyword search.
+          oneOf:
+            - type: array
+              items: { type: string }
+            - type: object
+              additionalProperties: true
+        notes: { type: string }
+    RetireServerRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          maxLength: 500
+          description: Terminal lifecycle reason. Defaults according to the action when omitted.
+        erase_status:
+          type: string
+          enum: [not_required, pending, verified, failed]
+          default: not_required
+        erase_method:
+          type: string
+          maxLength: 120
+        evidence:
+          type: string
+          maxLength: 2000
+          description: Required when erase_status is verified.
+    RetirementRecord:
+      type: object
+      properties:
+        id: { type: integer }
+        server_id: { type: integer }
+        from_status: { type: string }
+        to_status: { type: string, enum: [retired, scrapped] }
+        reason: { type: string }
+        erase_status: { type: string, enum: [not_required, pending, verified, failed] }
+        erase_method: { type: string }
+        evidence: { type: string }
+        requested_by: { type: string }
+        requested_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+    RetireServerResponse:
+      type: object
+      properties:
+        status: { type: string, enum: [retired] }
+        retirement: { $ref: '#/components/schemas/RetirementRecord' }
+    ScrapServerResponse:
+      type: object
+      properties:
+        status: { type: string, enum: [scrapped] }
+        retirement: { $ref: '#/components/schemas/RetirementRecord' }
+    Image:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        os_family: { type: string }
+        os_version: { type: string }
+        architecture: { type: string, enum: [x86_64, arm64], default: x86_64 }
+        file_path:
+          type: string
+          description: Required for manual registration. Must resolve inside IMAGE_STORAGE_DIR. Relative paths are resolved under IMAGE_STORAGE_DIR. Updating this field resets verification to untested.
+        size_bytes:
+          type: integer
+          format: int64
+          readOnly: true
+        sha256:
+          type: string
+          readOnly: true
+        status: { type: string, enum: [enabled, disabled] }
+        test_status:
+          type: string
+          enum: [untested, tested_passed, test_failed]
+          readOnly: true
+    InstallTemplate:
+      type: object
+      required: [name, template_type, content]
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        name: { type: string }
+        os_family: { type: string }
+        os_version: { type: string }
+        template_type: { type: string, enum: [cloud-init, autoinstall, kickstart, preseed, unattend] }
+        content: { type: string }
+        variables_schema:
+          type: object
+          additionalProperties: true
+        version: { type: string, default: v1 }
+        status: { type: string, enum: [enabled, disabled], default: enabled }
+        created_by:
+          type: string
+          readOnly: true
+    WorkflowTemplate:
+      type: object
+      required: [name, definition]
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        name: { type: string }
+        version: { type: string, default: v1 }
+        description: { type: string }
+        definition:
+          type: object
+          required: [steps]
+          properties:
+            steps:
+              type: array
+              minItems: 1
+              items:
+                type: object
+                required: [name, action]
+                properties:
+                  name: { type: string }
+                  action: { type: string }
+        status: { type: string, enum: [enabled, disabled], default: enabled }
+        created_by:
+          type: string
+          readOnly: true
+    Deployment:
+      type: object
+      properties:
+        id: { type: integer }
+        server_id: { type: integer }
+        image_id: { type: integer }
+        template_id: { type: integer, nullable: true, minimum: 1 }
+        workflow_id: { type: integer, nullable: true, minimum: 1 }
+        network_id:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: Optional selected enabled deployment network. When omitted, metadata falls back to the latest enabled deployment network for compatibility.
+        variables:
+          type: object
+          additionalProperties: true
+        erase_policy:
+          type: string
+          enum: [none, quick, full, external_verified]
+          default: quick
+          description: Deployment erase/reinstall policy selected before creation.
+        erase_confirmed:
+          type: boolean
+          description: Must be true when creating a deployment.
+        erase_confirmed_at:
+          type: string
+          format: date-time
+          nullable: true
+          readOnly: true
+        status: { type: string }
+        requested_by: { type: string }
+        error_message: { type: string }
+    DeploymentLogSummary:
+      type: object
+      properties:
+        deployment_id: { type: integer }
+        status: { type: string }
+        latest_run_id: { type: integer }
+        total_runs: { type: integer }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+        duration_ms: { type: integer, format: int64 }
+        task_total: { type: integer }
+        task_success: { type: integer }
+        task_failed: { type: integer }
+        task_cancelled: { type: integer }
+        task_running: { type: integer }
+        task_pending: { type: integer }
+    WorkflowRunLog:
+      type: object
+      properties:
+        id: { type: integer }
+        attempt: { type: integer }
+        deployment_id: { type: integer }
+        name: { type: string }
+        version: { type: string }
+        status: { type: string }
+        definition: { type: string }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+        duration_ms: { type: integer, format: int64 }
+        task_total: { type: integer }
+        task_success: { type: integer }
+        task_failed: { type: integer }
+        task_cancelled: { type: integer }
+        task_running: { type: integer }
+        task_pending: { type: integer }
+    TaskExecutionLog:
+      type: object
+      properties:
+        id: { type: integer }
+        workflow_run_id: { type: integer }
+        step_name: { type: string }
+        action: { type: string }
+        status: { type: string }
+        retry_count: { type: integer }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+        duration_ms: { type: integer, format: int64 }
+        stdout: { type: string }
+        stderr: { type: string }
+        error_message: { type: string }
+    DeploymentLogs:
+      type: object
+      properties:
+        summary: { $ref: '#/components/schemas/DeploymentLogSummary' }
+        workflow:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/WorkflowRunLog'
+        runs:
+          type: array
+          items: { $ref: '#/components/schemas/WorkflowRunLog' }
+        tasks:
+          type: array
+          items: { $ref: '#/components/schemas/TaskExecutionLog' }
+    HardwareInventory:
+      type: object
+      properties:
+        cpu_summary: { type: string }
+        memory_summary: { type: string }
+        disk_summary: { type: string }
+        network_summary: { type: string }
+        gpu_summary: { type: string }
+        raid_summary: { type: string }
+        collected_by: { type: string }
+        raw_payload:
+          type: object
+          additionalProperties: true
+    BmcEndpoint:
+      type: object
+      properties:
+        id: { type: integer }
+        server_id: { type: integer }
+        type: { type: string, enum: [redfish, ipmi] }
+        protocol: { type: string, enum: [http, https, ipmi] }
+        endpoint:
+          type: string
+          description: Redfish requires an http/https URL; IPMI requires a valid host/IP or host:port.
+        username: { type: string }
+        status: { type: string }
+        power_state: { type: string }
+    BMCFirmwareInfo:
+      type: object
+      properties:
+        adapter: { type: string }
+        endpoint_status: { type: string }
+        manufacturer: { type: string }
+        model: { type: string }
+        serial_number: { type: string }
+        firmware_version: { type: string }
+        bios_version: { type: string }
+        bmc_version: { type: string }
+        last_checked_at: { type: string, format: date-time }
+    BatchBmcPowerResult:
+      type: object
+      properties:
+        server_id: { type: integer }
+        status: { type: string, enum: [success, failed] }
+        power_state: { type: string }
+        error: { type: string }
+    BatchBmcPowerResponse:
+      type: object
+      properties:
+        requested: { type: integer }
+        succeeded: { type: integer }
+        failed: { type: integer }
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/BatchBmcPowerResult' }
+    SSHAccess:
+      type: object
+      properties:
+        server_id: { type: integer }
+        host:
+          type: string
+          description: Valid hostname or IP address.
+        port: { type: integer, minimum: 1, maximum: 65535, default: 22 }
+        username: { type: string }
+        auth_type: { type: string, enum: [password, private_key], default: password }
+        status: { type: string }
+    TerminalCommandRequest:
+      type: object
+      required: [command]
+      properties:
+        command:
+          type: string
+          maxLength: 4000
+          description: Command appended to an active terminal session. Requires X-Confirm-Action ops.terminal.command.
+    MetricSample:
+      type: object
+      properties:
+        id: { type: integer }
+        server_id: { type: integer }
+        metric_name:
+          type: string
+          description: Examples include host_up, cpu_usage, memory_usage, disk_usage, disk_smart_health, network_rx_mbps, and network_tx_mbps. disk_smart_health uses 0 for healthy and 1 for abnormal.
+        value: { type: number }
+        unit: { type: string }
+        collected_at: { type: string, format: date-time }
+    CollectionJob:
+      type: object
+      properties:
+        id: { type: integer }
+        server_id: { type: integer }
+        mode: { type: string }
+        status: { type: string }
+        requested_by: { type: string }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+        error_message: { type: string }
+    LogEvent:
+      type: object
+      properties:
+        id: { type: integer }
+        server_id: { type: integer }
+        source: { type: string }
+        level: { type: string }
+        message: { type: string }
+        trace_id: { type: string }
+        occurred_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+    LogCollectionResult:
+      type: object
+      properties:
+        server_id: { type: integer }
+        status: { type: string, enum: [success, failed] }
+        events:
+          type: array
+          items: { type: integer }
+        error: { type: string }
+    LogCollectionResponse:
+      type: object
+      properties:
+        requested: { type: integer }
+        succeeded: { type: integer }
+        failed: { type: integer }
+        events_created: { type: integer }
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/LogCollectionResult' }
+    TerminalSession:
+      type: object
+      properties:
+        id: { type: integer }
+        server_id: { type: integer }
+        status: { type: string, enum: [active, closed] }
+        mode: { type: string, enum: [simulated, ssh] }
+        requested_by: { type: string }
+        reason: { type: string, maxLength: 255 }
+        transcript: { type: string }
+        opened_at: { type: string, format: date-time }
+        closed_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+    Alert:
+      type: object
+      properties:
+        id: { type: integer }
+        server_id: { type: integer }
+        severity: { type: string }
+        status: { type: string }
+        rule_id: { type: string }
+        title: { type: string }
+        description: { type: string }
+        acknowledged_by: { type: string }
+        resolved_by: { type: string }
+        triggered_at: { type: string, format: date-time }
+    AlertEvaluationResponse:
+      type: object
+      properties:
+        created:
+          type: integer
+          description: Number of new firing alerts created.
+        deduplicated:
+          type: integer
+          description: Number of matching firing or acknowledged alerts refreshed instead of duplicated.
+        alerts:
+          type: array
+          items: { $ref: '#/components/schemas/Alert' }
+    AlertRule:
+      type: object
+      properties:
+        id: { type: integer }
+        rule_id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        metric_name: { type: string }
+        operator: { type: string, enum: ['>', '>=', '<', '<=', '=='] }
+        threshold: { type: number }
+        severity: { type: string, enum: [critical, warning, info] }
+        status: { type: string, enum: [enabled, disabled] }
+        created_by: { type: string }
+    AuditLog:
+      type: object
+      properties:
+        id: { type: integer }
+        actor_email: { type: string }
+        action: { type: string }
+        resource_type: { type: string }
+        resource_id: { type: string }
+        risk_level: { type: string }
+        request_id: { type: string }
+        client_ip: { type: string }
+        created_at: { type: string, format: date-time }
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token.
+    NotFound:
+      description: Resource not found.
+    ConfirmationRequired:
+      description: X-Confirm-Action header is required for this operation.
+paths:
+  /healthz:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Check service health.
+      description: Checks database connectivity and Redis PING when REDIS_ADDR is configured.
+      responses:
+        '200':
+          description: Service is healthy.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+        '503':
+          description: Database or Redis health check failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+  /readyz:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Check runtime readiness.
+      description: Checks database, Redis, image storage, PXE/TFTP runtime prerequisites, and configuration validation issues.
+      responses:
+        '200':
+          description: Readiness report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadinessStatus' }
+  /boot/ipxe:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Render server-specific iPXE script and auto-discover unknown MACs.
+      parameters:
+        - { name: mac, in: query, schema: { type: string } }
+        - { name: arch, in: query, schema: { type: string } }
+        - { name: firmware, in: query, schema: { type: string } }
+      responses:
+        '200': { description: iPXE script. }
+  /boot/discovery.ipxe:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Render discovery iPXE script.
+      responses:
+        '200': { description: Discovery iPXE script. }
+  /boot/linux-installer.ipxe:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Render generic Linux installer iPXE script.
+      responses:
+        '200': { description: Linux installer iPXE script. }
+  /boot/events:
+    post:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Record boot event, matching deployment context, and auto-discover unknown MACs.
+      responses:
+        '201': { description: Boot event recorded. }
+  /metadata/instance-id:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return metadata instance id by client IP.
+      responses:
+        '200': { description: Instance id text. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Client IP did not match a server. }
+  /metadata/hostname:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return metadata hostname by client IP.
+      responses:
+        '200': { description: Hostname text. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Client IP did not match a server. }
+  /metadata/network:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return metadata network JSON by client IP.
+      responses:
+        '200':
+          description: Network metadata JSON.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetadataNetwork' }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Client IP did not match a server. }
+  /metadata/ssh-keys:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return SSH public keys by client IP.
+      responses:
+        '200':
+          description: SSH public keys JSON.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetadataSSHKeys' }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Client IP did not match a server. }
+  /metadata/userdata:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return rendered userdata by client IP.
+      responses:
+        '200': { description: Userdata text. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Client IP did not match a server. }
+  /userdata:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Compatibility alias for client-IP userdata.
+      responses:
+        '200': { description: Userdata text. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Client IP did not match a server. }
+  /metadata/by-server/{id}/instance-id:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return metadata instance id for a server.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200': { description: Instance id text. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+  /metadata/by-server/{id}/hostname:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return metadata hostname for a server.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200': { description: Hostname text. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+  /metadata/by-server/{id}/network:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return metadata network JSON for a server.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200':
+          description: Network metadata JSON.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetadataNetwork' }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+  /metadata/by-server/{id}/ssh-keys:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return SSH public keys for a server metadata context.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200':
+          description: SSH public keys JSON.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetadataSSHKeys' }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+  /metadata/by-server/{id}/userdata:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return rendered userdata for a server.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200': { description: Userdata text. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+  /userdata/by-server/{id}:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Compatibility alias for server userdata.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200': { description: Userdata text. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+  /metadata/by-token/{token}/instance-id:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return metadata instance id using a deployment metadata token.
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Instance id text. }
+        '401': { description: Metadata token expired. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Metadata token not found. }
+  /metadata/by-token/{token}/hostname:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return metadata hostname using a deployment metadata token.
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Hostname text. }
+        '401': { description: Metadata token expired. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Metadata token not found. }
+  /metadata/by-token/{token}/network:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return metadata network JSON using a deployment metadata token.
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Network metadata JSON.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetadataNetwork' }
+        '401': { description: Metadata token expired. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Metadata token not found. }
+  /metadata/by-token/{token}/ssh-keys:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return SSH public keys using a deployment metadata token.
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: SSH public keys JSON.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetadataSSHKeys' }
+        '401': { description: Metadata token expired. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Metadata token not found. }
+  /metadata/by-token/{token}/userdata:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return rendered userdata using a deployment metadata token.
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Userdata text. }
+        '401': { description: Metadata token expired. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Metadata token not found. }
+  /userdata/by-token/{token}:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Compatibility alias for token-based server userdata.
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Userdata text. }
+        '401': { description: Metadata token expired. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Metadata token not found. }
+  /metadata/by-mac/{mac}/{field}:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return metadata by server primary MAC.
+      description: Field must be one of instance-id, hostname, network, ssh-keys, or userdata.
+      parameters:
+        - { name: mac, in: path, required: true, schema: { type: string } }
+        - { name: field, in: path, required: true, schema: { type: string, enum: [instance-id, hostname, network, ssh-keys, userdata] } }
+      responses:
+        '200': { description: Metadata field response. }
+        '400': { description: Invalid MAC. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Server or field not found. }
+  /userdata/by-mac/{mac}:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Compatibility alias for MAC-based userdata.
+      parameters:
+        - { name: mac, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Userdata text. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Server not found. }
+  /metadata/by-ip/{ip}/{field}:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return metadata by server primary IP.
+      description: Field must be one of instance-id, hostname, network, ssh-keys, or userdata.
+      parameters:
+        - { name: ip, in: path, required: true, schema: { type: string } }
+        - { name: field, in: path, required: true, schema: { type: string, enum: [instance-id, hostname, network, ssh-keys, userdata] } }
+      responses:
+        '200': { description: Metadata field response. }
+        '400': { description: Invalid IP. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Server or field not found. }
+  /userdata/by-ip/{ip}:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Compatibility alias for IP-based userdata.
+      parameters:
+        - { name: ip, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: Userdata text. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Server not found. }
+  /metadata/by-deployment/{id}/{field}:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Return metadata by deployment ID.
+      description: Field must be one of instance-id, hostname, network, ssh-keys, or userdata.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+        - { name: field, in: path, required: true, schema: { type: string, enum: [instance-id, hostname, network, ssh-keys, userdata] } }
+      responses:
+        '200': { description: Metadata field response. }
+        '400': { description: Invalid deployment ID. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Deployment, server, or field not found. }
+  /userdata/by-deployment/{id}:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Compatibility alias for deployment-based userdata.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200': { description: Userdata text. }
+        '403': { description: Metadata access is only allowed from enabled deployment networks when configured. }
+        '404': { description: Deployment or server not found. }
+  /images/{id}/file:
+    get:
+      servers:
+        - url: http://localhost:8080
+      security: []
+      summary: Download enabled and verified image file.
+      description: Serves only enabled, tested_passed images whose file_path resolves inside IMAGE_STORAGE_DIR. Supports HTTP Range requests.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+        - { name: Range, in: header, schema: { type: string } }
+      responses:
+        '200': { description: Image file content. }
+        '206': { description: Partial image file content. }
+        '403': { description: Image is not enabled and verified, or file_path is outside image storage. }
+        '404': { description: Image record or file not found. }
+  /auth/login:
+    post:
+      security: []
+      summary: Login with local account.
+      description: Failed attempts are rate-limited by LOGIN_RATE_LIMIT_ATTEMPTS and LOGIN_RATE_LIMIT_WINDOW_SECONDS. 429 responses include Retry-After.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Login succeeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '401': { description: Invalid credentials. }
+        '429': { description: Too many failed login attempts. Retry-After header is returned. }
+  /auth/me:
+    get:
+      summary: Get current user.
+      responses:
+        '200':
+          description: Current user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+  /dashboard:
+    get:
+      summary: Get dashboard aggregate counts and recent activity.
+      responses:
+        '200': { description: Dashboard payload. }
+  /users:
+    get:
+      summary: List users.
+      description: Admin role required.
+      parameters:
+        - { name: keyword, in: query, schema: { type: string } }
+        - { name: role, in: query, schema: { type: string, enum: [admin, operator, viewer] } }
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: page_size, in: query, schema: { type: integer } }
+      responses:
+        '200': { description: User array or paged result. }
+    post:
+      summary: Create user.
+      description: Admin role required. Email is normalized to lowercase; password must be at least 8 characters and include uppercase, lowercase, and digit characters.
+      responses:
+        '201': { description: User created. }
+        '400': { description: Invalid email, role, or password. }
+  /users/{id}:
+    patch:
+      summary: Update user name or role.
+      description: Admin role required. Role must be admin, operator, or viewer. Demoting the last admin user is rejected.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: User updated. }
+        '400': { description: Invalid role. }
+        '409': { description: Cannot demote the last admin user. }
+  /users/{id}/reset-password:
+    post:
+      summary: Reset user password.
+      description: Admin role required. Password must be at least 8 characters and include uppercase, lowercase, and digit characters.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Password reset. }
+        '400': { description: Invalid password. }
+  /tenants:
+    get:
+      summary: List tenants.
+      description: Admin role required. MVP tenant records are used for ownership, filtering, and quota.servers server asset limits.
+      parameters:
+        - { name: keyword, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: page_size, in: query, schema: { type: integer } }
+      responses:
+        '200': { description: Tenant array or paged result. }
+    post:
+      summary: Create tenant.
+      description: Admin role required. Validates tenant_id, status, and quota JSON object. quota.servers must be a non-negative integer when present.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Tenant' }
+      responses:
+        '201':
+          description: Tenant created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tenant' }
+        '400': { description: Invalid tenant payload. }
+  /tenants/{id}:
+    patch:
+      summary: Update tenant.
+      description: Admin role required. Ignores backend-owned tenant_id and timestamp fields, then validates status and quota JSON object. quota.servers cannot be lower than the tenant's current server usage.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Tenant' }
+      responses:
+        '200':
+          description: Tenant updated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tenant' }
+        '400': { description: Invalid tenant payload. }
+  /network-configs:
+    get:
+      summary: List network configurations.
+      description: Network topology records for management, deployment and business networks.
+      parameters:
+        - { name: keyword, in: query, schema: { type: string } }
+        - { name: purpose, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: page_size, in: query, schema: { type: integer } }
+      responses:
+        '200': { description: NetworkConfig array or paged result. }
+    post:
+      summary: Create network configuration.
+      description: Admin role required. Validates CIDR, gateway, DNS IP list, VLAN range, purpose, status, DHCP mode, and prevents overlapping enabled CIDRs with the same purpose.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NetworkConfig' }
+      responses:
+        '201': { description: NetworkConfig created. }
+        '400': { description: Invalid network configuration. }
+  /network-configs/{id}/check:
+    post:
+      summary: Check network configuration.
+      description: Admin role required. Runs static deployment-network readiness checks for CIDR format, overlap, gateway, DNS, status, DHCP mode, and deployment usage without starting DHCP/TFTP services.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: Network check report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NetworkCheckReport' }
+        '404': { description: NetworkConfig not found. }
+  /network-configs/{id}:
+    patch:
+      summary: Update network configuration.
+      description: Admin role required. Validates the final network configuration before writing changes, including overlapping enabled CIDRs with the same purpose.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NetworkConfig' }
+      responses:
+        '200': { description: NetworkConfig updated. }
+        '400': { description: Invalid network configuration. }
+  /servers:
+    get:
+      summary: List servers.
+      parameters:
+        - { name: keyword, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: owner, in: query, schema: { type: string } }
+        - { name: tenant_id, in: query, schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: page_size, in: query, schema: { type: integer } }
+      responses:
+        '200': { description: Server array or paged server result. }
+    post:
+      summary: Create server asset.
+      description: Requires at least one of asset_no, hostname, or primary_mac. Validates status, architecture, IP, MAC, identity uniqueness, and active tenant reference.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Server' }
+      responses:
+        '201': { description: Server created. }
+        '400': { description: Invalid server payload or inactive/missing tenant reference. }
+  /servers/import:
+    post:
+      summary: Batch import server assets.
+      description: Validates each server exactly like create, including identity uniqueness and active tenant references.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [servers]
+              properties:
+                servers:
+                  type: array
+                  items: { $ref: '#/components/schemas/Server' }
+      responses:
+        '200': { description: Import summary. }
+        '400': { description: Invalid import payload or inactive/missing tenant reference. }
+  /servers/{id}:
+    get:
+      summary: Get server.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Server detail. }
+    patch:
+      summary: Update server.
+      description: Validates the final server asset, including status, architecture, IP, MAC, identity uniqueness, and active tenant reference. Backend-owned timestamp fields are ignored. Changing status to retired or scrapped requires X-Confirm-Action server.status-terminal.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Server' }
+      responses:
+        '200': { description: Server updated. }
+        '400': { description: Invalid server payload or inactive/missing tenant reference. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+    delete:
+      summary: Delete an unreferenced server asset.
+      description: Requires admin role and X-Confirm-Action server.delete. Soft deletes only assets without business references; deployments, BMC/SSH configuration, inventories, metrics, logs, collection jobs, script executions, terminal sessions, metadata tokens, alerts, and retirement records return 409 blockers.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '204': { description: Server deleted. }
+        '409': { description: Server has related records and cannot be deleted. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /servers/{id}/retire:
+    post:
+      summary: Retire server.
+      description: Requires X-Confirm-Action server.retire. Records retirement reason, erasure status, erasure method, and evidence. erase_status verified requires erase_method and evidence. Repeated retire requests are idempotent and do not create duplicate status history or retirement records; scrapped servers return 409.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RetireServerRequest' }
+      responses:
+        '200':
+          description: Server retired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetireServerResponse' }
+        '400': { description: Invalid retirement payload. }
+        '409': { description: Scrapped server cannot be retired. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /servers/{id}/scrap:
+    post:
+      summary: Scrap server.
+      description: Requires X-Confirm-Action server.scrap. Records scrap reason, erasure status, erasure method, and evidence with to_status=scrapped. erase_status verified requires erase_method and evidence. Repeated scrap requests are idempotent and do not create duplicate status history or terminal records.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RetireServerRequest' }
+      responses:
+        '200':
+          description: Server scrapped.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScrapServerResponse' }
+        '400': { description: Invalid scrap payload. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /servers/{id}/inventory:
+    get:
+      summary: Get latest hardware inventory.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Inventory detail. }
+    post:
+      summary: Create hardware inventory snapshot.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HardwareInventory' }
+      responses:
+        '201': { description: Inventory created. }
+        '400': { description: Invalid inventory payload. }
+  /servers/{id}/status-history:
+    get:
+      summary: List server lifecycle status history.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Status history array. }
+  /servers/{id}/retirement-records:
+    get:
+      summary: List server retirement records.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: Retirement record array.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RetirementRecord' }
+        '404': { description: Server not found. }
+  /servers/{id}/bom:
+    get:
+      summary: Get server BOM JSON.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: BOM payload. }
+  /servers/{id}/bom.csv:
+    get:
+      summary: Export server BOM CSV.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: CSV file. }
+  /bom.csv:
+    get:
+      summary: Export all server BOM CSV.
+      responses:
+        '200': { description: CSV file. }
+  /images:
+    get:
+      summary: List images.
+      parameters:
+        - { name: keyword, in: query, schema: { type: string } }
+        - { name: os_family, in: query, schema: { type: string } }
+        - { name: architecture, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: test_status, in: query, schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: page_size, in: query, schema: { type: integer } }
+      responses:
+        '200': { description: Image array or paged image result. }
+    post:
+      summary: Create image.
+      description: Manual registration requires name and file_path inside IMAGE_STORAGE_DIR, validates status and architecture, starts as untested, and ignores client-supplied test_status, sha256, and size_bytes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Image' }
+      responses:
+        '201': { description: Image created. }
+        '400': { description: Invalid image payload. }
+  /images/upload:
+    post:
+      summary: Upload image file and create a verified image record.
+      description: Validates status and architecture, stores the file under IMAGE_STORAGE_DIR, computes SHA256 and size, and marks the image tested_passed.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                name: { type: string }
+                os_family: { type: string }
+                os_version: { type: string }
+                architecture: { type: string, enum: [x86_64, arm64] }
+                status: { type: string, enum: [enabled, disabled] }
+      responses:
+        '201': { description: Image uploaded and registered. }
+        '400': { description: Missing or invalid upload. }
+  /images/{id}:
+    patch:
+      summary: Update image.
+      description: Validates status and architecture. file_path must resolve inside IMAGE_STORAGE_DIR. test_status, sha256, and size_bytes cannot be written directly. Updating file_path resets verification to untested.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Image' }
+      responses:
+        '200': { description: Image updated. }
+        '400': { description: Invalid image payload. }
+    delete:
+      summary: Delete an unreferenced image.
+      description: Requires admin role and X-Confirm-Action image.delete. Returns 409 when any deployment references the image; disable referenced images instead of deleting them.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '204': { description: Image deleted. }
+        '409': { description: Image is referenced by deployment records. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /images/{id}/verify:
+    post:
+      summary: Verify image file SHA256 and size.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Verification result. }
+  /install-templates:
+    get:
+      summary: List install templates.
+      description: Demo seeder includes Ubuntu Server 24.04 Autoinstall, Rocky Linux 9 Kickstart, and Debian 12 Preseed templates.
+      responses:
+        '200':
+          description: Template array or paged result.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: array
+                    items: { $ref: '#/components/schemas/InstallTemplate' }
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/InstallTemplate' }
+                      total: { type: integer }
+                      page: { type: integer }
+                      page_size: { type: integer }
+    post:
+      summary: Create install template.
+      description: Validates name, template_type, content, status, and variables_schema before writing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InstallTemplate' }
+      responses:
+        '201':
+          description: Template created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InstallTemplate' }
+        '400': { description: Invalid install template payload. }
+  /install-templates/{id}:
+    patch:
+      summary: Update install template.
+      description: Merges submitted fields into the existing template, ignores backend-owned system fields, and applies create-time validation.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InstallTemplate' }
+      responses:
+        '200':
+          description: Template updated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InstallTemplate' }
+        '400': { description: Invalid install template payload. }
+    delete:
+      summary: Delete an unreferenced install template.
+      description: Requires admin role and X-Confirm-Action install_template.delete. Returns 409 when any deployment references the template; disable referenced templates instead of deleting them.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '204': { description: Install template deleted. }
+        '409': { description: Install template is referenced by deployment records. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /workflow-templates:
+    get:
+      summary: List workflow templates.
+      responses:
+        '200':
+          description: Workflow template array or paged result.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: array
+                    items: { $ref: '#/components/schemas/WorkflowTemplate' }
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/WorkflowTemplate' }
+                      total: { type: integer }
+                      page: { type: integer }
+                      page_size: { type: integer }
+    post:
+      summary: Create workflow template.
+      description: Validates name, status, and definition.steps[].name/action before writing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkflowTemplate' }
+      responses:
+        '201':
+          description: Workflow template created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkflowTemplate' }
+        '400': { description: Invalid workflow template payload. }
+  /workflow-templates/{id}:
+    patch:
+      summary: Update workflow template.
+      description: Merges submitted fields into the existing template, ignores backend-owned system fields, and applies create-time validation.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkflowTemplate' }
+      responses:
+        '200':
+          description: Workflow template updated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkflowTemplate' }
+        '400': { description: Invalid workflow template payload. }
+    delete:
+      summary: Delete an unreferenced workflow template.
+      description: Requires admin role and X-Confirm-Action workflow_template.delete. Returns 409 when any deployment references the template; disable referenced templates instead of deleting them.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '204': { description: Workflow template deleted. }
+        '409': { description: Workflow template is referenced by deployment records. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /deployments:
+    get:
+      summary: List deployments.
+      parameters:
+        - { name: status, in: query, schema: { type: string } }
+        - { name: server_id, in: query, schema: { type: integer } }
+        - { name: image_id, in: query, schema: { type: integer } }
+        - { name: network_id, in: query, schema: { type: integer } }
+        - { name: requested_by, in: query, schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: page_size, in: query, schema: { type: integer } }
+      responses:
+        '200': { description: Deployment array or paged result. }
+    post:
+      summary: Create deployment and start simulated workflow.
+      description: Requires X-Confirm-Action: deployment.create and erase_confirmed=true. erase_policy accepts none, quick, full, or external_verified and defaults to quick. variables must be a JSON object when provided; template_id, workflow_id, and network_id must be greater than 0 when provided. Preflight verifies deployable server state, BMC endpoint connectivity through the configured adapter, selected enabled deployment network when provided, at least one enabled deployment network, verified image, and enabled templates.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Deployment' }
+      responses:
+        '201': { description: Deployment created. }
+        '400': { description: Invalid deployment request or preflight failure. }
+        '404': { description: Server not found. }
+        '409': { description: Server already has an active deployment or is not in a deployable state. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /deployments/batch:
+    post:
+      summary: Create deployments for up to 20 servers.
+      description: Requires X-Confirm-Action: deployment.batch-create and erase_confirmed=true. Uses server_ids instead of server_id and may include network_id to bind every created deployment to the same enabled deployment network. The request is all-or-nothing: every target must pass preflight before any deployment is created.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/Deployment'
+                - type: object
+                  required: [server_ids, image_id, erase_confirmed]
+                  properties:
+                    server_ids:
+                      type: array
+                      minItems: 1
+                      maxItems: 20
+                      items: { type: integer, minimum: 1 }
+      responses:
+        '201': { description: Batch deployments created. }
+        '400': { description: Invalid batch request or preflight failure. }
+        '409': { description: Any server already has an active deployment or is not deployable. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /deployments/{id}:
+    get:
+      summary: Get deployment.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Deployment detail. }
+  /deployments/{id}/cancel:
+    post:
+      summary: Cancel deployment.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Deployment cancelled. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /deployments/{id}/retry:
+    post:
+      summary: Retry a failed or cancelled deployment.
+      description: Requires X-Confirm-Action: deployment.retry. Reuses the original server, image, templates, workflow, and variables, reruns deployment preflight, clears the previous error, and creates a new workflow run. Deployment logs keep prior workflow run history and mark attempts.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: Deployment requeued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Deployment' }
+        '400': { description: Deployment preflight failed. }
+        '404': { description: Deployment or server not found. }
+        '409': { description: Deployment is not retryable or server is busy. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /deployments/{id}/logs:
+    get:
+      summary: List deployment workflow logs.
+      description: Returns latest workflow, latest task logs, all workflow run attempts, task counters, and duration_ms fields for deployment troubleshooting.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: Deployment workflow log bundle.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeploymentLogs' }
+  /servers/bmc/batch-power:
+    post:
+      summary: Run batch BMC power operation.
+      description: Requires action-specific confirmation header. action=power-on requires X-Confirm-Action bmc.batch-power-on; action=power-off requires bmc.batch-power-off; action=reboot requires bmc.batch-reboot. At most 50 unique non-zero server IDs are accepted. Each target returns an independent success or failure result and receives a high-risk audit record.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, server_ids]
+              properties:
+                action: { type: string, enum: [power-on, power-off, reboot] }
+                server_ids:
+                  type: array
+                  maxItems: 50
+                  items: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: Batch power operation finished with per-target results.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BatchBmcPowerResponse' }
+        '400': { description: Invalid action or target list. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /servers/{id}/bmc:
+    post:
+      summary: Configure BMC endpoint.
+      description: Requires an existing non-retired, non-scrapped server. Redfish endpoints require an http/https URL; IPMI endpoints require protocol=ipmi and a valid host/IP or host:port. Saving or updating resets status to unknown until the next connectivity check.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BmcEndpoint' }
+      responses:
+        '200': { description: BMC endpoint saved. }
+        '400': { description: Invalid BMC endpoint type, protocol, endpoint, or username. }
+        '404': { description: Server not found. }
+        '409': { description: BMC operation is not allowed for retired or scrapped server. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /servers/{id}/bmc/power:
+    get:
+      summary: Get BMC power state.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Power state. }
+        '404': { description: BMC endpoint not found. }
+  /servers/{id}/bmc/firmware:
+    get:
+      summary: Get BMC firmware information.
+      description: Read-only BMC/BIOS firmware inventory query. It remains available for retired or scrapped servers for troubleshooting and does not require a confirmation header.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: BMC firmware information.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BMCFirmwareInfo' }
+        '404': { description: BMC endpoint not found. }
+        '502': { description: BMC adapter firmware query failed. }
+  /servers/{id}/bmc/power-on:
+    post:
+      summary: Power on server.
+      description: Requires X-Confirm-Action bmc.power-on. Rejected for retired or scrapped servers.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Power action result. }
+        '400': { description: Power action failed. }
+        '404': { description: BMC endpoint not found. }
+        '409': { description: BMC operation is not allowed for retired or scrapped server. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /servers/{id}/bmc/power-off:
+    post:
+      summary: Power off server.
+      description: Requires X-Confirm-Action bmc.power-off. Rejected for retired or scrapped servers.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Power action result. }
+        '400': { description: Power action failed. }
+        '404': { description: BMC endpoint not found. }
+        '409': { description: BMC operation is not allowed for retired or scrapped server. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /servers/{id}/bmc/reboot:
+    post:
+      summary: Reboot server.
+      description: Requires X-Confirm-Action bmc.reboot. Rejected for retired or scrapped servers.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Power action result. }
+        '400': { description: Power action failed. }
+        '404': { description: BMC endpoint not found. }
+        '409': { description: BMC operation is not allowed for retired or scrapped server. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /servers/{id}/bmc/check:
+    post:
+      summary: Check BMC connectivity.
+      description: Rejected for retired or scrapped servers. Adapter failures mark the endpoint as error and return 502.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Check result. }
+        '404': { description: BMC endpoint not found. }
+        '409': { description: BMC operation is not allowed for retired or scrapped server. }
+        '502': { description: BMC adapter connectivity check failed. }
+  /servers/{id}/metrics:
+    get:
+      summary: List recent metric samples.
+      description: Returns up to 200 samples for the server within the 7-day retention window.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Metric sample array. }
+        '404': { description: Server not found. }
+  /servers/{id}/ssh:
+    get:
+      summary: Get SSH Agentless access configuration.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: SSH access configuration. }
+        '404': { description: SSH access not found. }
+    post:
+      summary: Upsert SSH Agentless access configuration.
+      description: Requires an existing server that is not retired or scrapped. Host must be a valid hostname or IP; port must be 1-65535; auth_type must be password or private_key. In COLLECTOR_MODE=ssh and SSH_OPERATIONS_MODE=ssh the built-in Go SSH executor supports stored password and private_key credentials.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SSHAccess' }
+      responses:
+        '200': { description: SSH access saved. }
+        '400': { description: Invalid SSH access configuration. }
+        '404': { description: Server not found. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /servers/{id}/collections:
+    get:
+      summary: List collection jobs for one server.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Collection job array. }
+        '404': { description: Server not found. }
+    post:
+      summary: Start SSH Agentless collection.
+      description: Server must exist and cannot be retired or scrapped.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '201': { description: Collection job created. }
+        '400': { description: Server is retired or scrapped. }
+        '404': { description: Server not found. }
+  /collections:
+    get:
+      summary: List collection jobs globally.
+      parameters:
+        - { name: server_id, in: query, schema: { type: integer } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: mode, in: query, schema: { type: string } }
+        - { name: requested_by, in: query, schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: page_size, in: query, schema: { type: integer } }
+      responses:
+        '200': { description: Collection job array or paged result. }
+  /log-events:
+    get:
+      summary: List platform and server log events.
+      parameters:
+        - { name: keyword, in: query, schema: { type: string } }
+        - { name: server_id, in: query, schema: { type: integer } }
+        - { name: source, in: query, schema: { type: string } }
+        - { name: level, in: query, schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: page_size, in: query, schema: { type: integer } }
+      responses:
+        '200': { description: Log event array or paged result. }
+  /alerts:
+    get:
+      summary: List alerts.
+      responses:
+        '200': { description: Alert array or paged result. }
+  /alert-rules:
+    get:
+      summary: List alert rules.
+      parameters:
+        - { name: keyword, in: query, schema: { type: string } }
+        - { name: metric_name, in: query, schema: { type: string } }
+        - { name: severity, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: page_size, in: query, schema: { type: integer } }
+      responses:
+        '200': { description: Alert rule array or paged result. }
+    post:
+      summary: Create alert rule.
+      description: Validates rule_id, metric_name, operator, severity, and status.
+      responses:
+        '201': { description: Alert rule created. }
+        '400': { description: Invalid alert rule. }
+  /alert-rules/{id}:
+    patch:
+      summary: Update alert rule.
+      description: Validates the final alert rule before writing changes.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Alert rule updated. }
+        '400': { description: Invalid alert rule. }
+  /alert-rules/evaluate:
+    post:
+      summary: Evaluate enabled alert rules against latest metric samples.
+      description: Uses the latest sample per server and metric within the 7-day retention window. Existing firing or acknowledged alerts for the same server and rule are refreshed and counted as deduplicated; resolved alerts remain historical and can be retriggered as a new firing alert.
+      responses:
+        '200':
+          description: Evaluation summary and created alerts.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AlertEvaluationResponse' }
+  /alerts/{id}/ack:
+    post:
+      summary: Acknowledge alert.
+      description: note max length is 1000. Already acknowledged or resolved alerts cannot be acknowledged again.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string, maxLength: 1000 }
+      responses:
+        '200': { description: Alert acknowledged. }
+        '400': { description: Invalid note or alert state. }
+  /alerts/{id}/resolve:
+    post:
+      summary: Resolve alert.
+      description: note max length is 1000. Already resolved alerts cannot be resolved again.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string, maxLength: 1000 }
+      responses:
+        '200': { description: Alert resolved. }
+        '400': { description: Invalid note. }
+  /alerts/{id}/events:
+    get:
+      summary: List alert handling events.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Alert event array. }
+  /ops/script-jobs:
+    get:
+      summary: List simulated script jobs.
+      responses:
+        '200': { description: Script job array or paged result. }
+    post:
+      summary: Create simulated script job.
+      description: Requires X-Confirm-Action: ops.script.create. Targets must exist, be unique, and not be retired or scrapped. At most 100 servers; concurrency max 50; timeout max 3600 seconds. The MVP simulator advances executions in batches according to concurrency.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [script, server_ids]
+              properties:
+                name: { type: string }
+                script: { type: string, maxLength: 16000 }
+                server_ids:
+                  type: array
+                  maxItems: 100
+                  uniqueItems: true
+                  items: { type: integer, minimum: 1 }
+                concurrency: { type: integer, minimum: 1, maximum: 50 }
+                timeout_seconds: { type: integer, minimum: 1, maximum: 3600 }
+      responses:
+        '201': { description: Script job created. }
+        '400': { description: Invalid script job request. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /ops/script-jobs/{id}:
+    get:
+      summary: Get script job.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Script job detail. }
+  /ops/script-jobs/{id}/results:
+    get:
+      summary: List script execution results.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Script execution array. }
+        '404': { description: Script job not found. }
+  /ops/log-collections:
+    post:
+      summary: Collect syslog, dmesg, and hardware logs.
+      description: Requires X-Confirm-Action: ops.logs.collect. Targets must be unique, cannot be retired or scrapped, and are limited to 100 servers. Default mode writes simulated LogEvent records; SSH_OPERATIONS_MODE=ssh reads logs from real hosts through the stored SSHAccess configuration.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [server_ids]
+              properties:
+                server_ids:
+                  type: array
+                  maxItems: 100
+                  uniqueItems: true
+                  items: { type: integer, minimum: 1 }
+                sources:
+                  type: array
+                  items: { type: string, enum: [syslog, dmesg, hardware] }
+      responses:
+        '201':
+          description: Log collection created events.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LogCollectionResponse' }
+        '400': { description: Invalid target list or source list. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /ops/terminal-sessions:
+    get:
+      summary: List terminal sessions.
+      description: Automatically closes active sessions older than TERMINAL_SESSION_TTL_MINUTES before returning rows.
+      responses:
+        '200':
+          description: Terminal session array or paged result.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: array
+                    items: { $ref: '#/components/schemas/TerminalSession' }
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/TerminalSession' }
+                      total: { type: integer }
+                      page: { type: integer }
+                      page_size: { type: integer }
+    post:
+      summary: Open terminal session.
+      description: Requires X-Confirm-Action: ops.terminal.open. Server must exist and not be retired or scrapped; reason max length is 255. Default mode opens a simulated transcript; SSH_OPERATIONS_MODE=ssh validates the real SSH host through stored SSHAccess. Active sessions are later auto-closed by TERMINAL_SESSION_TTL_MINUTES during list/detail reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [server_id]
+              properties:
+                server_id: { type: integer, minimum: 1 }
+                reason: { type: string, maxLength: 255 }
+      responses:
+        '201':
+          description: Terminal session created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TerminalSession' }
+        '400': { description: Invalid terminal session request. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /ops/terminal-sessions/{id}:
+    get:
+      summary: Get terminal session transcript.
+      description: Automatically closes expired active sessions before loading the requested session.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: Terminal session detail.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TerminalSession' }
+  /ops/terminal-sessions/{id}/commands:
+    post:
+      summary: Run a command in a terminal session.
+      description: Requires X-Confirm-Action: ops.terminal.command. The session must be active. In SSH mode the command is executed on the real host through Go SSH; in simulated mode the command is appended to the transcript without remote execution.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TerminalCommandRequest' }
+      responses:
+        '200':
+          description: Terminal session with updated transcript.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TerminalSession' }
+        '400': { description: Invalid command or inactive session. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /ops/terminal-sessions/{id}/close:
+    post:
+      summary: Close terminal session.
+      description: Requires X-Confirm-Action: ops.terminal.close.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: Terminal session closed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TerminalSession' }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /ops/backup/export:
+    get:
+      summary: Export MVP backup JSON.
+      description: Requires admin role and X-Confirm-Action: ops.backup.export. Credentials, SSH access configs, BMC endpoints, boot events, and metadata tokens are intentionally excluded.
+      responses:
+        '200': { description: Backup JSON payload. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /ops/backup/validate:
+    post:
+      summary: Validate a backup JSON before restore.
+      description: Admin-only dry run. Checks backup schema, version, row format, key uniqueness, references, tenant server quota usage, network configuration validity and overlap, deployment networks, alert rules, and target database state, including sensitive and runtime-only tables, without writing data.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Backup validation report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BackupValidationReport' }
+        '400': { description: Invalid backup JSON. }
+  /ops/backup/restore:
+    post:
+      summary: Restore a validated backup JSON into a fresh target database.
+      description: Requires admin role and X-Confirm-Action: ops.backup.restore. Reuses backup validation, rejects validation errors, and returns 409 unless the target is fresh. Runtime-only and sensitive tables are cleared, PostgreSQL/SQLite identity sequences are reset after import, ordinary restored users receive random disabled password hashes, and the current restore admin keeps the target-environment password as the recovery login.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Backup restored.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BackupRestoreResult' }
+        '400': { description: Invalid backup JSON or validation errors. }
+        '409': { description: Target database is not fresh. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /audit-logs:
+    get:
+      summary: List audit logs.
+      responses:
+        '200': { description: Audit log array or paged result. }
+  /audit-logs/{id}:
+    get:
+      summary: Get audit log detail.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: Audit log detail. }

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.db
+*.log
+*.tsbuildinfo
+.env
+.tools/
+.DS_Store
+frontend/dist/
+frontend/node_modules/
+backend/baremetal.db
+backend/baremetal-api.exe
+backend/data/
+data/
