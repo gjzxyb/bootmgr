@@ -2,6 +2,14 @@
 
 平台默认使用安全的本地/演示配置；真实 PXE/DHCP/TFTP、物理 Redfish/IPMI 和真实 SSH 主机能力已经接入，但必须在隔离实验网或生产部署网中显式启用和验证。
 
+## 实验室验收接口
+
+- `GET /api/v1/system/lab-validation` 汇总真实能力验收状态，管理员可用。报告包含 PXE/DHCP/TFTP 配置和最近启动事件、启用的部署网段数量、BMC 适配器和端点状态、SSH 模式和 SSH Access 状态。
+- `POST /api/v1/system/lab-validation/run` 需要 `X-Confirm-Action: system.lab-validation.run`，默认执行 PXE HTTP/DHCP/TFTP 只读探测，并对最近 20 个 BMC 端点和 SSH Access 执行安全检查，可用 `{ "check_pxe": true, "check_bmc": true, "check_ssh": true, "limit": 20 }` 调整，最大 50。
+- BMC 验收只调用当前 `BMC_ADAPTER` 的连通性检查，不执行开机、关机或重启；当 `BMC_ADAPTER=simulated` 时会跳过物理 BMC 检查，避免把模拟结果误判为真实通过。
+- SSH 验收使用保存的 SSH 配置和加密凭据执行轻量只读命令，成功后把 SSHAccess 标记为 `ok`，失败标记为 `error`。
+- PXE 验收不会动态启用 DHCP/TFTP；执行检查会请求 `BOOT_BASE_URL/boot/ipxe`，在 `BOOT_SERVICES_ENABLED=true` 且模式不是 `external` 时向当前监听地址发送合成 PXE DHCPDISCOVER 校验 bootfile 响应，并在 `BOOT_SERVICES_ENABLED=true` 时通过 UDP TFTP 拉取 `boot.ipxe`。真实物理启动证据仍来自 `BootEvent`，需要物理客户端经 DHCP/TFTP/iPXE 访问平台后才会出现。
+
 ## PXE/iPXE
 
 - 后端 `PXEService` 负责 DHCP/ProxyDHCP 响应、TFTP 文件和动态 iPXE chain 脚本。
@@ -75,6 +83,7 @@
 
 - `POST /api/v1/servers/{id}/ssh` 可保存 SSH Agentless 采集目标，password/private key secret 通过 `CredentialService` 加密保存。
 - SSH 配置、单机采集和指标查询必须绑定已存在资产；SSH 配置和单机采集会拒绝 `retired`/`scrapped` 资产；SSH host 必须是合法主机名或 IP，端口限制为 1-65535，`auth_type` 支持 `password` 和 `private_key`。
+- `POST /api/v1/servers/{id}/ssh/check` 使用保存的 SSH 配置连接真实主机并执行轻量只读命令，成功后把 SSHAccess 状态标记为 `ok`，失败标记为 `error`，适合作为真实主机验收第一步。
 - `COLLECTOR_MODE=simulated` 时写入模拟指标；`COLLECTOR_MODE=ssh` 时通过内置 Go SSH 执行器连接真实主机，执行只读采集命令并解析 `host_up`、CPU、内存、磁盘、网络收发、进程数量和僵尸进程数量指标，单次采集默认 30 秒超时。
 - 指标查询和告警评估只读取 7 天保留窗口内的样本；采集成功后会清理超过 7 天的历史指标，避免长期运行后指标表无界增长。
 - 内置 SSH 执行器支持保存的 `password` 和 `private_key` 凭据；当前 host key 策略由 `SSH_HOST_KEY_POLICY` 控制，默认 `insecure_ignore`，应仅用于受控部署网，后续可扩展 known_hosts 校验。

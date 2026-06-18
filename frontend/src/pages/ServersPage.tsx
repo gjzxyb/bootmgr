@@ -377,6 +377,18 @@ export function ServersPage({ role }: { role?: string }) {
     setSshOpen(false);
   };
 
+  const checkSSH = async () => {
+    if (!activeServer) return;
+    try {
+      const { data } = await api.post<{ status: string; checked_at?: string }>(`/servers/${activeServer.id}/ssh/check`, {}, { suppressGlobalError: true });
+      const checkedAt = data.checked_at ? `，检查时间: ${data.checked_at}` : '';
+      msg.success(`${activeServer.hostname || activeServer.asset_no} SSH 连通性正常，状态: ${data.status || 'ok'}${checkedAt}`);
+      await loadServerMonitoring(activeServer);
+    } catch {
+      msg.error('SSH 连通性检查失败，请检查主机、端口或凭据');
+    }
+  };
+
   const downloadBlob = (data: BlobPart, filename: string, type = 'text/csv;charset=utf-8') => {
     const url = URL.createObjectURL(new Blob([data], { type }));
     const a = document.createElement('a');
@@ -586,6 +598,7 @@ export function ServersPage({ role }: { role?: string }) {
           <Button icon={<ReloadOutlined />} onClick={refreshMonitor}>刷新</Button>
           {canWrite && <Button type="primary" icon={<ToolOutlined />} disabled={isTerminalServer(activeServer)} onClick={startCollection}>触发采集</Button>}
           {admin && <Button icon={<ToolOutlined />} disabled={isTerminalServer(activeServer)} onClick={() => activeServer && openSSH(activeServer)}>SSH 配置</Button>}
+          {canWrite && <Button icon={<ToolOutlined />} disabled={isTerminalServer(activeServer)} onClick={checkSSH}>SSH 检查</Button>}
         </Space>
       </div>
       <Tabs items={[

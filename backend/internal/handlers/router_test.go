@@ -81,6 +81,23 @@ func TestMVPFlow(t *testing.T) {
 	if intFromJSON(t, bootEvent, "server_id") != discoveredID {
 		t.Fatalf("expected boot event to match discovered asset: %#v", bootEvent)
 	}
+	labValidation := requestJSON(t, r, http.MethodGet, "/api/v1/system/lab-validation", token, nil)
+	if labValidation["status"] == "" {
+		t.Fatalf("expected lab validation status: %#v", labValidation)
+	}
+	labChecks, ok := labValidation["checks"].([]any)
+	if !ok || !jsonArrayContainsField(labChecks, "name", "pxe_boot_events") || !jsonArrayContainsField(labChecks, "name", "bmc_adapter") || !jsonArrayContainsField(labChecks, "name", "ssh_connectivity") {
+		t.Fatalf("expected lab validation checks for PXE/BMC/SSH: %#v", labValidation)
+	}
+	pxeSummary, ok := labValidation["pxe"].(map[string]any)
+	if !ok || intFromJSON(t, pxeSummary, "boot_events") < 1 {
+		t.Fatalf("expected lab validation to include PXE boot event evidence: %#v", labValidation)
+	}
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/system/lab-validation/run", token, map[string]any{"check_pxe": false, "check_bmc": false, "check_ssh": false}, http.StatusPreconditionRequired, "")
+	labRun := requestJSONWithConfirm(t, r, http.MethodPost, "/api/v1/system/lab-validation/run", token, map[string]any{"check_pxe": false, "check_bmc": false, "check_ssh": false}, "system.lab-validation.run")
+	if labRun["checks"] == nil {
+		t.Fatalf("expected lab validation run to return a report: %#v", labRun)
+	}
 	requestExpectStatus(t, r, http.MethodPost, "/api/v1/users", token, map[string]any{"email": "not-an-email", "name": "Bad User", "role": "operator", "password": "Operator@123456"}, http.StatusBadRequest, "")
 	requestExpectStatus(t, r, http.MethodPost, "/api/v1/users", token, map[string]any{"email": "weak@example.com", "name": "Weak User", "role": "operator", "password": "short"}, http.StatusBadRequest, "")
 	requestExpectStatus(t, r, http.MethodPost, "/api/v1/users", token, map[string]any{"email": "badrole@example.com", "name": "Bad Role", "role": "owner", "password": "Operator@123456"}, http.StatusBadRequest, "")
@@ -1104,6 +1121,15 @@ func TestMVPFlow(t *testing.T) {
 	}
 	if storedSSH.CredentialRef != originalSSHRef {
 		t.Fatalf("SSH credential reference was overwritten from request body: %#v", storedSSH)
+	}
+	labWithEndpoints := requestJSON(t, r, http.MethodGet, "/api/v1/system/lab-validation", token, nil)
+	bmcSummary, ok := labWithEndpoints["bmc"].(map[string]any)
+	if !ok || intFromJSON(t, bmcSummary, "total") < 2 {
+		t.Fatalf("expected lab validation to summarize configured BMC endpoints: %#v", labWithEndpoints)
+	}
+	sshSummary, ok := labWithEndpoints["ssh"].(map[string]any)
+	if !ok || intFromJSON(t, sshSummary, "total") < 1 {
+		t.Fatalf("expected lab validation to summarize configured SSH access: %#v", labWithEndpoints)
 	}
 
 	requestExpectStatus(t, r, http.MethodPost, "/api/v1/servers/999999/collections", token, map[string]any{}, http.StatusNotFound, "")

@@ -337,13 +337,23 @@ type dhcpPacket struct {
 	secs    [2]byte
 	flags   [2]byte
 	ciaddr  [4]byte
+	yiaddr  [4]byte
+	siaddr  [4]byte
 	chaddr  [16]byte
 	options map[byte][]byte
 }
 
 func parseDHCPPacket(data []byte) (dhcpPacket, error) {
-	if len(data) < 240 || data[0] != 1 || data[236] != 99 || data[237] != 130 || data[238] != 83 || data[239] != 99 {
-		return dhcpPacket{}, errors.New("not a DHCP request")
+	return parseDHCPMessage(data, 1, "request")
+}
+
+func parseDHCPResponse(data []byte) (dhcpPacket, error) {
+	return parseDHCPMessage(data, 2, "response")
+}
+
+func parseDHCPMessage(data []byte, op byte, label string) (dhcpPacket, error) {
+	if len(data) < 240 || data[0] != op || data[236] != 99 || data[237] != 130 || data[238] != 83 || data[239] != 99 {
+		return dhcpPacket{}, fmt.Errorf("not a DHCP %s", label)
 	}
 	var p dhcpPacket
 	p.htype = data[1]
@@ -353,6 +363,8 @@ func parseDHCPPacket(data []byte) (dhcpPacket, error) {
 	copy(p.secs[:], data[8:10])
 	copy(p.flags[:], data[10:12])
 	copy(p.ciaddr[:], data[12:16])
+	copy(p.yiaddr[:], data[16:20])
+	copy(p.siaddr[:], data[20:24])
 	copy(p.chaddr[:], data[28:44])
 	p.options = parseDHCPOptions(data[240:])
 	return p, nil
@@ -439,6 +451,14 @@ func (o *dhcpOptions) addU32(code byte, value uint32) {
 
 func (o *dhcpOptions) bytes() []byte {
 	return append(o.buf, 255)
+}
+
+type DHCPProbeResult struct {
+	MessageType  byte
+	Bootfile     string
+	ServerIP     string
+	NextServerIP string
+	LeaseIP      string
 }
 
 type tftpRRQ struct {
@@ -535,6 +555,236 @@ func tftpWaitACK(conn *net.UDPConn, addr *net.UDPAddr, block uint16) error {
 			return errors.New("TFTP client returned error")
 		}
 	}
+}
+
+func ProbeTFTPFile(ctx context.Context, listenAddr string, filename string, maxBytes int64) ([]byte, error) {
+	if strings.TrimSpace(filename) == "" {
+		return nil, errors.New("TFTP probe filename is required")
+	}
+	if maxBytes <= 0 {
+		maxBytes = 64 * 1024
+	}
+	serverAddr, err := resolveTFTPProbeAddr(listenAddr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.ListenUDP("udp4", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	req := []byte{0, 1}
+	req = append(req, []byte(filename)...)
+	req = append(req, 0)
+	req = append(req, []byte("octet")...)
+	req = append(req, 0)
+	if _, err := conn.WriteToUDP(req, serverAddr); err != nil {
+		return nil, err
+	}
+
+	var out bytes.Buffer
+	var transferAddr *net.UDPAddr
+	expectedBlock := uint16(1)
+	buf := make([]byte, 4+512)
+	for {
+		if err := setProbeReadDeadline(ctx, conn, 3*time.Second); err != nil {
+			return nil, err
+		}
+		n, from, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			return nil, err
+		}
+		if transferAddr != nil && (from.IP.String() != transferAddr.IP.String() || from.Port != transferAddr.Port) {
+			continue
+		}
+		if n < 4 || buf[0] != 0 {
+			continue
+		}
+		opcode := buf[1]
+		switch opcode {
+		case 3:
+			block := binary.BigEndian.Uint16(buf[2:4])
+			if block != expectedBlock {
+				continue
+			}
+			transferAddr = from
+			chunk := buf[4:n]
+			if int64(out.Len()+len(chunk)) > maxBytes {
+				_ = sendTFTPACK(conn, from, block)
+				return nil, fmt.Errorf("TFTP probe response exceeded %d bytes", maxBytes)
+			}
+			_, _ = out.Write(chunk)
+			if err := sendTFTPACK(conn, from, block); err != nil {
+				return nil, err
+			}
+			if len(chunk) < 512 {
+				return out.Bytes(), nil
+			}
+			expectedBlock++
+		case 5:
+			message := strings.TrimRight(string(buf[4:n]), "\x00")
+			if message == "" {
+				message = "unknown TFTP error"
+			}
+			return nil, errors.New(message)
+		default:
+			continue
+		}
+	}
+}
+
+func ProbePXEDHCP(ctx context.Context, listenAddr string, macText string, arch uint16) (DHCPProbeResult, error) {
+	serverAddr, err := resolveDHCPProbeAddr(listenAddr)
+	if err != nil {
+		return DHCPProbeResult{}, err
+	}
+	mac, err := probeMAC(macText)
+	if err != nil {
+		return DHCPProbeResult{}, err
+	}
+	var xid [4]byte
+	binary.BigEndian.PutUint32(xid[:], uint32(time.Now().UnixNano()))
+	packet := buildPXEDHCPDiscover(mac, arch, xid)
+
+	conn, err := net.ListenUDP("udp4", nil)
+	if err != nil {
+		return DHCPProbeResult{}, err
+	}
+	defer conn.Close()
+	if _, err := conn.WriteToUDP(packet, serverAddr); err != nil {
+		return DHCPProbeResult{}, err
+	}
+
+	buf := make([]byte, 1500)
+	for {
+		if err := setProbeReadDeadline(ctx, conn, 3*time.Second); err != nil {
+			return DHCPProbeResult{}, err
+		}
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			return DHCPProbeResult{}, err
+		}
+		response, err := parseDHCPResponse(buf[:n])
+		if err != nil {
+			continue
+		}
+		if !bytes.Equal(response.xid[:], xid[:]) || !bytes.Equal(response.chaddr[:6], []byte(mac)) {
+			continue
+		}
+		msgType := byte(0)
+		if value := response.options[53]; len(value) > 0 {
+			msgType = value[0]
+		}
+		if msgType != 2 && msgType != 5 {
+			continue
+		}
+		bootfile := strings.TrimSpace(string(response.options[67]))
+		if bootfile == "" {
+			return DHCPProbeResult{}, errors.New("DHCP response did not include PXE bootfile option 67")
+		}
+		return DHCPProbeResult{
+			MessageType:  msgType,
+			Bootfile:     bootfile,
+			ServerIP:     dhcpOptionIP(response.options[54]),
+			NextServerIP: dhcpPacketIP(response.siaddr[:]),
+			LeaseIP:      dhcpPacketIP(response.yiaddr[:]),
+		}, nil
+	}
+}
+
+func buildPXEDHCPDiscover(mac net.HardwareAddr, arch uint16, xid [4]byte) []byte {
+	packet := make([]byte, 240)
+	packet[0] = 1
+	packet[1] = 1
+	packet[2] = 6
+	copy(packet[4:8], xid[:])
+	copy(packet[28:34], mac)
+	packet[236], packet[237], packet[238], packet[239] = 99, 130, 83, 99
+	options := dhcpOptions{}
+	options.add(53, []byte{1})
+	options.add(55, []byte{1, 3, 6, 66, 67})
+	options.add(60, []byte("PXEClient"))
+	options.add(93, []byte{byte(arch >> 8), byte(arch)})
+	return append(packet, options.bytes()...)
+}
+
+func resolveDHCPProbeAddr(listenAddr string) (*net.UDPAddr, error) {
+	addr, err := net.ResolveUDPAddr("udp4", strings.TrimSpace(listenAddr))
+	if err != nil {
+		return nil, err
+	}
+	if addr.Port <= 0 {
+		return nil, errors.New("DHCP listen port is not configured")
+	}
+	if addr.IP == nil || addr.IP.IsUnspecified() {
+		addr.IP = net.ParseIP("127.0.0.1")
+	}
+	return addr, nil
+}
+
+func probeMAC(macText string) (net.HardwareAddr, error) {
+	value := strings.TrimSpace(macText)
+	if value == "" {
+		value = "52:54:00:00:00:fe"
+	}
+	mac, err := net.ParseMAC(value)
+	if err != nil {
+		return nil, err
+	}
+	if len(mac) != 6 {
+		return nil, errors.New("DHCP probe MAC must contain 6 bytes")
+	}
+	return mac, nil
+}
+
+func dhcpOptionIP(value []byte) string {
+	if len(value) < 4 {
+		return ""
+	}
+	return dhcpPacketIP(value[:4])
+}
+
+func dhcpPacketIP(value []byte) string {
+	if len(value) < 4 {
+		return ""
+	}
+	ip := net.IPv4(value[0], value[1], value[2], value[3])
+	if ip.Equal(net.IPv4zero) {
+		return ""
+	}
+	return ip.String()
+}
+
+func resolveTFTPProbeAddr(listenAddr string) (*net.UDPAddr, error) {
+	addr, err := net.ResolveUDPAddr("udp4", strings.TrimSpace(listenAddr))
+	if err != nil {
+		return nil, err
+	}
+	if addr.Port <= 0 {
+		return nil, errors.New("TFTP listen port is not configured")
+	}
+	if addr.IP == nil || addr.IP.IsUnspecified() {
+		addr.IP = net.ParseIP("127.0.0.1")
+	}
+	return addr, nil
+}
+
+func setProbeReadDeadline(ctx context.Context, conn *net.UDPConn, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return conn.SetReadDeadline(deadline)
+}
+
+func sendTFTPACK(conn *net.UDPConn, addr *net.UDPAddr, block uint16) error {
+	ack := []byte{0, 4, byte(block >> 8), byte(block)}
+	_, err := conn.WriteToUDP(ack, addr)
+	return err
 }
 
 func subnetMask(cidr string) net.IP {

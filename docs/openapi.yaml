@@ -60,6 +60,133 @@ components:
         config_issues:
           type: array
           items: { $ref: '#/components/schemas/ConfigIssue' }
+    LabValidationCheck:
+      type: object
+      properties:
+        name: { type: string }
+        status: { type: string, enum: [ok, warning, error] }
+        message: { type: string }
+    LabBootEvent:
+      type: object
+      properties:
+        id: { type: integer }
+        mac: { type: string }
+        architecture: { type: string }
+        firmware: { type: string }
+        remote_addr: { type: string }
+        server_id: { type: integer, nullable: true }
+        deployment_id: { type: integer, nullable: true }
+        created_at: { type: string, format: date-time }
+    LabBMCRef:
+      type: object
+      properties:
+        server_id: { type: integer }
+        hostname: { type: string }
+        asset_no: { type: string }
+        type: { type: string }
+        protocol: { type: string }
+        endpoint: { type: string }
+        status: { type: string }
+        power_state: { type: string }
+        last_checked_at: { type: string, format: date-time, nullable: true }
+        updated_at: { type: string, format: date-time }
+    LabSSHRef:
+      type: object
+      properties:
+        server_id: { type: integer }
+        hostname: { type: string }
+        asset_no: { type: string }
+        host: { type: string }
+        port: { type: integer }
+        username: { type: string }
+        auth_type: { type: string, enum: [password, private_key] }
+        status: { type: string }
+        last_checked_at: { type: string, format: date-time, nullable: true }
+        updated_at: { type: string, format: date-time }
+    LabValidationRunResult:
+      type: object
+      properties:
+        kind: { type: string, enum: [pxe_http, pxe_dhcp, pxe_tftp, bmc, ssh] }
+        server_id: { type: integer }
+        hostname: { type: string }
+        asset_no: { type: string }
+        status: { type: string, enum: [success, failed, skipped] }
+        message: { type: string }
+        checked_at: { type: string, format: date-time, nullable: true }
+    LabValidationReport:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, warning, error] }
+        generated_at: { type: string, format: date-time }
+        environment:
+          type: object
+          properties:
+            app_env: { type: string }
+            boot_base_url: { type: string }
+            bmc_adapter: { type: string }
+            collector_mode: { type: string }
+            ssh_operations_mode: { type: string }
+        checks:
+          type: array
+          items: { $ref: '#/components/schemas/LabValidationCheck' }
+        pxe:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            mode: { type: string, enum: [proxy, builtin, external] }
+            bind_interface: { type: string }
+            dhcp_listen_addr: { type: string }
+            dhcp_server_ip: { type: string }
+            dhcp_lease_start: { type: string }
+            dhcp_lease_end: { type: string }
+            tftp_listen_addr: { type: string }
+            tftp_root: { type: string }
+            bootfile_uefi: { type: string }
+            bootfile_bios: { type: string }
+            deployment_networks: { type: integer }
+            boot_events: { type: integer }
+            recent_boot_events:
+              type: array
+              items: { $ref: '#/components/schemas/LabBootEvent' }
+            runtime_issues:
+              type: array
+              items: { $ref: '#/components/schemas/ConfigIssue' }
+        bmc:
+          type: object
+          properties:
+            adapter: { type: string }
+            total: { type: integer }
+            ok: { type: integer }
+            error: { type: integer }
+            unknown: { type: integer }
+            last_checked_at: { type: string, format: date-time, nullable: true }
+            recent_endpoints:
+              type: array
+              items: { $ref: '#/components/schemas/LabBMCRef' }
+        ssh:
+          type: object
+          properties:
+            collector_mode: { type: string }
+            operations_mode: { type: string }
+            total: { type: integer }
+            ok: { type: integer }
+            error: { type: integer }
+            configured: { type: integer }
+            unknown: { type: integer }
+            last_checked_at: { type: string, format: date-time, nullable: true }
+            recent_ssh_accesses:
+              type: array
+              items: { $ref: '#/components/schemas/LabSSHRef' }
+        run_results:
+          type: array
+          items: { $ref: '#/components/schemas/LabValidationRunResult' }
+    LabValidationRunRequest:
+      type: object
+      properties:
+        check_pxe: { type: boolean, default: true }
+        check_bmc: { type: boolean, default: true }
+        check_ssh: { type: boolean, default: true }
+        limit: { type: integer, minimum: 1, maximum: 50, default: 20 }
     BackupValidationCheck:
       type: object
       properties:
@@ -1046,6 +1173,38 @@ paths:
       summary: Get dashboard aggregate counts and recent activity.
       responses:
         '200': { description: Dashboard payload. }
+  /system/lab-validation:
+    get:
+      summary: Get physical lab validation report.
+      description: Admin role required. Summarizes PXE/DHCP/TFTP runtime evidence, BMC endpoint status, SSH access status, and safe readiness checks for physical lab acceptance.
+      responses:
+        '200':
+          description: Lab validation report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LabValidationReport' }
+        '403': { description: Admin role required. }
+  /system/lab-validation/run:
+    post:
+      summary: Run safe physical lab connectivity checks.
+      description: Admin role and X-Confirm-Action system.lab-validation.run are required. Runs read-only PXE HTTP/DHCP/TFTP probes, BMC connectivity checks, and SSH lightweight checks for configured endpoints up to the requested limit. It does not perform power operations or enable DHCP/TFTP listeners.
+      parameters:
+        - name: X-Confirm-Action
+          in: header
+          required: true
+          schema: { type: string, enum: [system.lab-validation.run] }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LabValidationRunRequest' }
+      responses:
+        '200':
+          description: Updated lab validation report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LabValidationReport' }
+        '428': { description: Confirmation header is missing. }
   /users:
     get:
       summary: List users.
@@ -1537,7 +1696,11 @@ paths:
         '200': { description: Deployment array or paged result. }
     post:
       summary: Create deployment and start simulated workflow.
-      description: Requires X-Confirm-Action: deployment.create and erase_confirmed=true. erase_policy accepts none, quick, full, or external_verified and defaults to quick. variables must be a JSON object when provided; template_id, workflow_id, and network_id must be greater than 0 when provided. Preflight verifies deployable server state, BMC endpoint connectivity through the configured adapter, selected enabled deployment network when provided, at least one enabled deployment network, verified image, and enabled templates.
+      description: >-
+        Requires X-Confirm-Action: deployment.create and erase_confirmed=true.
+        erase_policy accepts none, quick, full, or external_verified and defaults to quick.
+        variables must be a JSON object when provided; template_id, workflow_id, and network_id must be greater than 0 when provided.
+        Preflight verifies deployable server state, BMC endpoint connectivity through the configured adapter, selected enabled deployment network when provided, at least one enabled deployment network, verified image, and enabled templates.
       requestBody:
         required: true
         content:
@@ -1552,7 +1715,10 @@ paths:
   /deployments/batch:
     post:
       summary: Create deployments for up to 20 servers.
-      description: Requires X-Confirm-Action: deployment.batch-create and erase_confirmed=true. Uses server_ids instead of server_id and may include network_id to bind every created deployment to the same enabled deployment network. The request is all-or-nothing: every target must pass preflight before any deployment is created.
+      description: >-
+        Requires X-Confirm-Action: deployment.batch-create and erase_confirmed=true.
+        Uses server_ids instead of server_id and may include network_id to bind every created deployment to the same enabled deployment network.
+        The request is all-or-nothing: every target must pass preflight before any deployment is created.
       requestBody:
         required: true
         content:
@@ -1589,7 +1755,10 @@ paths:
   /deployments/{id}/retry:
     post:
       summary: Retry a failed or cancelled deployment.
-      description: Requires X-Confirm-Action: deployment.retry. Reuses the original server, image, templates, workflow, and variables, reruns deployment preflight, clears the previous error, and creates a new workflow run. Deployment logs keep prior workflow run history and mark attempts.
+      description: >-
+        Requires X-Confirm-Action: deployment.retry.
+        Reuses the original server, image, templates, workflow, and variables, reruns deployment preflight, clears the previous error, and creates a new workflow run.
+        Deployment logs keep prior workflow run history and mark attempts.
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses:
         '200':
@@ -1745,6 +1914,16 @@ paths:
         '400': { description: Invalid SSH access configuration. }
         '404': { description: Server not found. }
         '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /servers/{id}/ssh/check:
+    post:
+      summary: Check SSH connectivity.
+      description: Server must exist and cannot be retired or scrapped. Uses stored SSHAccess credentials through the Go SSH executor, marks SSHAccess status ok or error, and writes an ssh.check audit record.
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        '200': { description: SSH check succeeded. }
+        '404': { description: Server or SSH access not found. }
+        '409': { description: Server is retired or scrapped. }
+        '502': { description: SSH connectivity check failed. }
   /servers/{id}/collections:
     get:
       summary: List collection jobs for one server.
@@ -1868,7 +2047,11 @@ paths:
         '200': { description: Script job array or paged result. }
     post:
       summary: Create simulated script job.
-      description: Requires X-Confirm-Action: ops.script.create. Targets must exist, be unique, and not be retired or scrapped. At most 100 servers; concurrency max 50; timeout max 3600 seconds. The MVP simulator advances executions in batches according to concurrency.
+      description: >-
+        Requires X-Confirm-Action: ops.script.create.
+        Targets must exist, be unique, and not be retired or scrapped.
+        At most 100 servers; concurrency max 50; timeout max 3600 seconds.
+        The MVP simulator advances executions in batches according to concurrency.
       requestBody:
         required: true
         content:
@@ -1906,7 +2089,10 @@ paths:
   /ops/log-collections:
     post:
       summary: Collect syslog, dmesg, and hardware logs.
-      description: Requires X-Confirm-Action: ops.logs.collect. Targets must be unique, cannot be retired or scrapped, and are limited to 100 servers. Default mode writes simulated LogEvent records; SSH_OPERATIONS_MODE=ssh reads logs from real hosts through the stored SSHAccess configuration.
+      description: >-
+        Requires X-Confirm-Action: ops.logs.collect.
+        Targets must be unique, cannot be retired or scrapped, and are limited to 100 servers.
+        Default mode writes simulated LogEvent records; SSH_OPERATIONS_MODE=ssh reads logs from real hosts through the stored SSHAccess configuration.
       requestBody:
         required: true
         content:
@@ -1954,7 +2140,11 @@ paths:
                       page_size: { type: integer }
     post:
       summary: Open terminal session.
-      description: Requires X-Confirm-Action: ops.terminal.open. Server must exist and not be retired or scrapped; reason max length is 255. Default mode opens a simulated transcript; SSH_OPERATIONS_MODE=ssh validates the real SSH host through stored SSHAccess. Active sessions are later auto-closed by TERMINAL_SESSION_TTL_MINUTES during list/detail reads.
+      description: >-
+        Requires X-Confirm-Action: ops.terminal.open.
+        Server must exist and not be retired or scrapped; reason max length is 255.
+        Default mode opens a simulated transcript; SSH_OPERATIONS_MODE=ssh validates the real SSH host through stored SSHAccess.
+        Active sessions are later auto-closed by TERMINAL_SESSION_TTL_MINUTES during list/detail reads.
       requestBody:
         required: true
         content:
@@ -1987,7 +2177,10 @@ paths:
   /ops/terminal-sessions/{id}/commands:
     post:
       summary: Run a command in a terminal session.
-      description: Requires X-Confirm-Action: ops.terminal.command. The session must be active. In SSH mode the command is executed on the real host through Go SSH; in simulated mode the command is appended to the transcript without remote execution.
+      description: >-
+        Requires X-Confirm-Action: ops.terminal.command.
+        The session must be active.
+        In SSH mode the command is executed on the real host through Go SSH; in simulated mode the command is appended to the transcript without remote execution.
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       requestBody:
         required: true
@@ -2005,7 +2198,7 @@ paths:
   /ops/terminal-sessions/{id}/close:
     post:
       summary: Close terminal session.
-      description: Requires X-Confirm-Action: ops.terminal.close.
+      description: "Requires X-Confirm-Action: ops.terminal.close."
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses:
         '200':
@@ -2017,7 +2210,9 @@ paths:
   /ops/backup/export:
     get:
       summary: Export MVP backup JSON.
-      description: Requires admin role and X-Confirm-Action: ops.backup.export. Credentials, SSH access configs, BMC endpoints, boot events, and metadata tokens are intentionally excluded.
+      description: >-
+        Requires admin role and X-Confirm-Action: ops.backup.export.
+        Credentials, SSH access configs, BMC endpoints, boot events, and metadata tokens are intentionally excluded.
       responses:
         '200': { description: Backup JSON payload. }
         '428': { $ref: '#/components/responses/ConfirmationRequired' }
@@ -2041,7 +2236,10 @@ paths:
   /ops/backup/restore:
     post:
       summary: Restore a validated backup JSON into a fresh target database.
-      description: Requires admin role and X-Confirm-Action: ops.backup.restore. Reuses backup validation, rejects validation errors, and returns 409 unless the target is fresh. Runtime-only and sensitive tables are cleared, PostgreSQL/SQLite identity sequences are reset after import, ordinary restored users receive random disabled password hashes, and the current restore admin keeps the target-environment password as the recovery login.
+      description: >-
+        Requires admin role and X-Confirm-Action: ops.backup.restore.
+        Reuses backup validation, rejects validation errors, and returns 409 unless the target is fresh.
+        Runtime-only and sensitive tables are cleared, PostgreSQL/SQLite identity sequences are reset after import, ordinary restored users receive random disabled password hashes, and the current restore admin keeps the target-environment password as the recovery login.
       requestBody:
         required: true
         content:

@@ -13,6 +13,7 @@
 - 真实 PXE/DHCP/TFTP 服务可通过 `BOOT_SERVICES_ENABLED=true` 显式启用，支持 ProxyDHCP、内置 DHCP 和外部 DHCP + TFTP 三种模式；默认关闭 UDP 监听
 - 后端数据库初始化支持启动重试，Docker Compose 会等待 PostgreSQL/Redis 健康后再启动后端，降低冷启动竞态
 - 提供 `/readyz` 运行自检接口，汇总数据库、Redis、镜像目录和配置 warning/error，并在系统管理页展示
+- 提供 `/api/v1/system/lab-validation` 真实验收报告和受保护的安全检查执行入口，在系统管理页集中展示 PXE 启动事件、BMC 连通性和 SSH 主机状态
 - 系统管理页支持网络配置只读检查，展示 CIDR、网关、DNS、DHCP/ProxyDHCP 和部署网可用性结果
 - 管理员用户管理、角色调整和密码重置
 - 管理员租户台账、状态和基础配额字段管理
@@ -98,6 +99,7 @@ docker compose up -d --build
 
 `/healthz` 会检查数据库连接；当 `REDIS_ADDR` 已配置时也会执行 Redis `PING`，Docker Compose 环境默认检查 `redis:6379`。
 `/readyz` 会返回数据库、Redis、镜像存储目录和配置校验结果；部署前建议确认 `status` 为 `ok`，或处理 `config_issues` 中的 warning/error。
+系统管理页“真实验收”会调用 `/api/v1/system/lab-validation` 汇总 PXE/BMC/SSH 验收状态；执行检查需要管理员角色和 `X-Confirm-Action: system.lab-validation.run`，会只读探测 `BOOT_BASE_URL/boot/ipxe`、已启用的 DHCP/ProxyDHCP bootfile 响应、已启用的 TFTP `boot.ipxe`、BMC/SSH 连通性，不执行电源动作，也不动态启用 DHCP/TFTP。
 Docker Compose 为 PostgreSQL、Redis、后端和前端配置了容器健康检查；后端会等待 PostgreSQL/Redis healthy 后启动，前端会等待后端 `/healthz` healthy 后启动。后端自身也会按 `DB_CONNECT_MAX_ATTEMPTS` 和 `DB_CONNECT_RETRY_DELAY_MS` 重试数据库初始化，避免数据库冷启动时短暂不可用导致容器直接退出。
 Docker Compose 会把后端 `/app/data` 挂载到 `backend-data` 卷，用于持久化 demo 镜像和上传镜像文件。
 前端镜像构建时可通过 `VITE_API_BASE_URL` 和 `VITE_API_ROOT_URL` 覆盖浏览器访问后端的地址；默认值适配本机 `localhost:8080` 演示。
@@ -169,7 +171,7 @@ Docker Compose 会把后端 `/app/data` 挂载到 `backend-data` 卷，用于持
 - Metadata network 响应会合并服务器主网卡和部署任务绑定的部署网 CIDR、网关、DNS、VLAN、DHCP/ProxyDHCP 字段；旧部署未绑定网络时回退到最新启用的部署网，便于安装环境生成网络配置。`ssh-keys` 会从部署变量 `ssh_authorized_keys`、`ssh_keys` 或 `ssh_public_key` 输出公钥数组。
 - `BOOT_BASE_URL` 用于生成 iPXE 脚本中的平台、镜像和 metadata 地址。
 - BMC 默认使用 `BMC_ADAPTER=simulated`；配置 BMC 前会校验资产存在、端点类型、协议和主机/URL 格式，保存或更新后状态为 `unknown`，连通性检查成功后变为 `ok`、失败后变为 `error`，并拒绝对 `retired`/`scrapped` 资产执行 BMC 配置、连通性检查和电源变更；电源状态和固件信息是只读查询，终态资产仍可用于排障查看；资产表支持多选后批量开机、关机、重启，批量接口单次最多 50 台并对每个目标写高风险审计；`redfish` 仅允许 `http/https` URL，`ipmi` 仅允许合法 host 或 host:port；配置为 `redfish` 后会通过 Redfish HTTP Basic Auth 调用 `/redfish/v1`、`Systems/1`、`Managers/1` 和 ComputerSystem Reset 接口，开机、关机、重启分别映射为 `On`、`ForceOff`、`ForceRestart`；配置为 `ipmi` 后会通过系统 `ipmitool` 执行 `power status/on/off/reset` 和 `mc info`，运行环境需预装 `ipmitool`。
-- 监控采集默认使用 `COLLECTOR_MODE=simulated`；SSH 配置、单机采集和指标查询都会校验资产存在，SSH 配置和单机采集会拒绝 `retired`/`scrapped` 资产，SSH host 必须是合法主机名或 IP，端口必须为 1-65535，`auth_type` 支持 `password` 或 `private_key`；配置为 `ssh` 后会调用系统 `ssh` 命令执行只读指标采集，支持本机 ssh 配置/agent 或已保存的 `private_key` 凭据，单次采集默认 30 秒超时。内置采集器不直接注入 password 凭据，生产 password 采集建议后续切换 Go SSH 执行器或受控凭据代理。MVP 采集指标包括 `host_up`、`cpu_usage`、`memory_usage`、`disk_usage`、`disk_smart_health`、`network_rx_mbps`、`network_tx_mbps`、`process_count`、`process_zombie_count`；`disk_smart_health=0` 表示健康，`1` 表示异常，进程指标用于展示基础进程状态。指标查询和告警评估只读取 7 天保留窗口内的样本，成功采集后会清理更早的历史指标。
+- 监控采集默认使用 `COLLECTOR_MODE=simulated`；SSH 配置、单机采集和指标查询都会校验资产存在，SSH 配置和单机采集会拒绝 `retired`/`scrapped` 资产，SSH host 必须是合法主机名或 IP，端口必须为 1-65535，`auth_type` 支持 `password` 或 `private_key`；配置为 `ssh` 后会通过内置 Go SSH 执行器执行只读指标采集，支持已保存的 password 或 `private_key` 凭据，单次采集默认 30 秒超时。MVP 采集指标包括 `host_up`、`cpu_usage`、`memory_usage`、`disk_usage`、`disk_smart_health`、`network_rx_mbps`、`network_tx_mbps`、`process_count`、`process_zombie_count`；`disk_smart_health=0` 表示健康，`1` 表示异常，进程指标用于展示基础进程状态。指标查询和告警评估只读取 7 天保留窗口内的样本，成功采集后会清理更早的历史指标。
 - 全局采集任务接口为 `GET /api/v1/collections`，前端“监控告警”页面的“采集任务”页签可按服务器、状态、模式和发起人查询。
 - 日志事件接口为 `GET /api/v1/log-events`，MVP 使用演示种子数据并记录 Metadata API 访问事件，后续可接入 syslog、journald、BMC SEL 或 Agent 日志。
 - 告警规则接口为 `/api/v1/alert-rules`，MVP 支持对 7 天保留窗口内的最新指标做阈值评估并生成 firing 告警；同一服务器同一规则的未关闭告警会去重并刷新最新指标说明，关闭后再次命中会重新触发新告警；规则写入时会校验规则 ID、指标名、操作符、级别和状态。
@@ -190,4 +192,4 @@ Docker Compose 会把后端 `/app/data` 挂载到 `backend-data` 卷，用于持
 
 ## 真实能力验证
 
-真实 PXE、Redfish/IPMI、SSH Agentless 采集、远程脚本、日志采集和终端命令的接入边界与实验网验收说明见 `docs/integration-notes.md`。
+真实 PXE、Redfish/IPMI、SSH Agentless 采集、远程脚本、日志采集和终端命令的接入边界与实验网验收说明见 `docs/integration-notes.md`。管理员也可以在系统管理页“真实验收”查看 `pxe_boot_events`、`bmc_connectivity`、`ssh_connectivity` 等检查结果，并执行安全连通性检查。

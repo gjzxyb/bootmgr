@@ -6,8 +6,13 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"baremetal-platform/backend/internal/config"
+	"baremetal-platform/backend/internal/models"
+
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
 )
 
 func TestPXETFTPDataServesDynamicIPXEScriptAndRejectsTraversal(t *testing.T) {
@@ -47,6 +52,61 @@ func TestPXEServiceStartsListenersOnEphemeralPorts(t *testing.T) {
 	}
 }
 
+func TestPXETFTPListenerServesBootIPXEOverUDP(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("listen test TFTP: %v", err)
+	}
+	defer conn.Close()
+	service := PXEService{cfg: config.Config{BootBaseURL: "http://boot.example.com", BootTFTPRoot: t.TempDir()}}
+	go service.serveTFTP(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	data, err := ProbeTFTPFile(ctx, conn.LocalAddr().String(), "boot.ipxe", 64*1024)
+	if err != nil {
+		t.Fatalf("probe TFTP boot.ipxe: %v", err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "#!ipxe") || !strings.Contains(text, "set base-url http://boot.example.com") {
+		t.Fatalf("unexpected TFTP boot script: %s", text)
+	}
+}
+
+func TestPXEDHCPListenerRespondsToPXEProbeOverUDP(t *testing.T) {
+	db := newPXETestDB(t)
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("listen test DHCP: %v", err)
+	}
+	defer conn.Close()
+	service := NewPXEService(db, config.Config{
+		BootServiceMode:      "proxy",
+		BootDHCPServerIP:     "192.168.100.10",
+		BootTFTPBootfileUEFI: "ipxe.efi",
+		BootTFTPBootfileBIOS: "undionly.kpxe",
+		BootBaseURL:          "http://boot.example.com",
+	}, t.Logf)
+	go service.serveDHCP(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := ProbePXEDHCP(ctx, conn.LocalAddr().String(), "52:54:00:aa:bb:ee", 9)
+	if err != nil {
+		t.Fatalf("probe DHCP listener: %v", err)
+	}
+	if result.MessageType != 2 || result.Bootfile != "ipxe.efi" || result.ServerIP != "192.168.100.10" {
+		t.Fatalf("unexpected DHCP probe result: %#v", result)
+	}
+	var bootEvents int64
+	if err := db.Model(&models.BootEvent{}).Where("mac = ?", "52:54:00:aa:bb:ee").Count(&bootEvents).Error; err != nil {
+		t.Fatalf("count boot events: %v", err)
+	}
+	if bootEvents != 1 {
+		t.Fatalf("expected DHCP probe to record one boot event, got %d", bootEvents)
+	}
+}
+
 func TestParseDHCPPacketAndBootfileSelection(t *testing.T) {
 	packetBytes := minimalDHCPDiscover(t, []byte{0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc}, 9)
 	packet, err := parseDHCPPacket(packetBytes)
@@ -75,6 +135,19 @@ func TestParseDHCPPacketAndBootfileSelection(t *testing.T) {
 	if got := service.bootfile(biosPacket); got != "undionly.kpxe" {
 		t.Fatalf("expected BIOS bootfile, got %q", got)
 	}
+}
+
+func newPXETestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&models.Server{}, &models.ServerStatusHistory{}, &models.BootEvent{}, &models.Deployment{}, &models.MetadataToken{}, &models.NetworkConfig{}); err != nil {
+		t.Fatalf("migrate PXE test DB: %v", err)
+	}
+	return db
 }
 
 func minimalDHCPDiscover(t *testing.T, mac []byte, arch uint16) []byte {

@@ -1,10 +1,12 @@
-import { EditOutlined, LockOutlined, PlusOutlined, ReloadOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
-import { Button, Form, Input, InputNumber, Modal, Select, Space, Table, Tabs, Tag, Typography, message } from 'antd';
+import { EditOutlined, ExperimentOutlined, LockOutlined, PlayCircleOutlined, PlusOutlined, ReloadOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
+import { Button, Descriptions, Form, Input, InputNumber, Modal, Select, Space, Table, Tabs, Tag, Typography, message } from 'antd';
 import { useEffect, useState } from 'react';
-import { api, ConfigIssue, NetworkCheck, NetworkCheckReport, NetworkConfig, PageResult, ReadinessCheck, ReadinessStatus, rootApi, Tenant, User } from '../api/client';
+import { api, ConfigIssue, LabBMCRef, LabBootEvent, LabSSHRef, LabValidationCheck, LabValidationReport, LabValidationRunResult, NetworkCheck, NetworkCheckReport, NetworkConfig, PageResult, ReadinessCheck, ReadinessStatus, rootApi, Tenant, User } from '../api/client';
 
 const roleColor = (role: string) => role === 'admin' ? 'red' : role === 'operator' ? 'blue' : 'default';
 const readinessColor = (status: string) => status === 'ok' ? 'green' : status === 'warning' ? 'orange' : 'red';
+const runResultColor = (status: string) => status === 'success' ? 'green' : status === 'skipped' ? 'default' : 'red';
+const serverLabel = (row: { hostname?: string; asset_no?: string; server_id: number }) => row.hostname || row.asset_no || `server-${row.server_id}`;
 const quotaToText = (quota: unknown) => {
   if (quota === undefined || quota === null || quota === '') return '';
   try {
@@ -20,6 +22,9 @@ export function SystemPage() {
   const [networks, setNetworks] = useState<NetworkConfig[]>([]);
   const [readiness, setReadiness] = useState<ReadinessStatus | null>(null);
   const [readinessLoading, setReadinessLoading] = useState(false);
+  const [labValidation, setLabValidation] = useState<LabValidationReport | null>(null);
+  const [labValidationLoading, setLabValidationLoading] = useState(false);
+  const [labValidationRunLoading, setLabValidationRunLoading] = useState(false);
   const [total, setTotal] = useState(0);
   const [tenantTotal, setTenantTotal] = useState(0);
   const [networkTotal, setNetworkTotal] = useState(0);
@@ -89,7 +94,30 @@ export function SystemPage() {
     }
   };
 
-  useEffect(() => { void loadUsers(1, pageSize); void loadTenants(1, tenantPageSize); void loadNetworks(1, networkPageSize); void loadReadiness(); }, []);
+  const loadLabValidation = async () => {
+    setLabValidationLoading(true);
+    try {
+      const { data } = await api.get<LabValidationReport>('/system/lab-validation');
+      setLabValidation(data);
+    } finally {
+      setLabValidationLoading(false);
+    }
+  };
+
+  const runLabValidation = async () => {
+    setLabValidationRunLoading(true);
+    try {
+      const { data } = await api.post<LabValidationReport>('/system/lab-validation/run', { check_pxe: true, check_bmc: true, check_ssh: true, limit: 20 }, { headers: { 'X-Confirm-Action': 'system.lab-validation.run' } });
+      setLabValidation(data);
+      if (data.status === 'ok') msg.success('真实验收检查通过');
+      else if (data.status === 'warning') msg.warning('真实验收检查存在 warning');
+      else msg.error('真实验收检查存在 error');
+    } finally {
+      setLabValidationRunLoading(false);
+    }
+  };
+
+  useEffect(() => { void loadUsers(1, pageSize); void loadTenants(1, tenantPageSize); void loadNetworks(1, networkPageSize); void loadReadiness(); void loadLabValidation(); }, []);
 
   const createUser = async () => {
     const values = await createForm.validateFields();
@@ -306,6 +334,90 @@ export function SystemPage() {
           { title: '级别', dataIndex: 'level', render: value => <Tag color={readinessColor(value)}>{value}</Tag> },
           { title: '配置项', dataIndex: 'key' },
           { title: '说明', dataIndex: 'message' }
+        ]} />
+      </>
+    }, {
+      key: 'lab-validation',
+      label: <span><ExperimentOutlined />真实验收</span>,
+      children: <>
+        <div className="toolbar">
+          <Space>
+            <Tag color={readinessColor(labValidation?.status || 'warning')}>总体 {labValidation?.status || '-'}</Tag>
+            <Button icon={<ReloadOutlined />} loading={labValidationLoading} onClick={() => loadLabValidation()}>刷新</Button>
+            <Button type="primary" icon={<PlayCircleOutlined />} loading={labValidationRunLoading} onClick={runLabValidation}>执行检查</Button>
+          </Space>
+        </div>
+        <Descriptions bordered size="small" column={{ xs: 1, md: 2 }} style={{ marginBottom: 16 }}>
+          <Descriptions.Item label="环境">{labValidation?.environment.app_env || '-'}</Descriptions.Item>
+          <Descriptions.Item label="生成时间">{labValidation?.generated_at || '-'}</Descriptions.Item>
+          <Descriptions.Item label="BMC 适配器">{labValidation?.environment.bmc_adapter || '-'}</Descriptions.Item>
+          <Descriptions.Item label="启动 URL">{labValidation?.environment.boot_base_url || '-'}</Descriptions.Item>
+          <Descriptions.Item label="采集模式">{labValidation?.environment.collector_mode || '-'}</Descriptions.Item>
+          <Descriptions.Item label="SSH 运维模式">{labValidation?.environment.ssh_operations_mode || '-'}</Descriptions.Item>
+        </Descriptions>
+        <Table<LabValidationCheck> rowKey="name" dataSource={labValidation?.checks || []} loading={labValidationLoading || labValidationRunLoading} pagination={false} columns={[
+          { title: '检查项', dataIndex: 'name' },
+          { title: '状态', dataIndex: 'status', render: value => <Tag color={readinessColor(value)}>{value}</Tag> },
+          { title: '结果', dataIndex: 'message' }
+        ]} />
+        <Typography.Title level={5} style={{ marginTop: 18 }}>PXE/DHCP/TFTP</Typography.Title>
+        <Descriptions bordered size="small" column={{ xs: 1, md: 2 }} style={{ marginBottom: 12 }}>
+          <Descriptions.Item label="服务">{labValidation?.pxe.enabled ? <Tag color="green">enabled</Tag> : <Tag>disabled</Tag>}</Descriptions.Item>
+          <Descriptions.Item label="模式">{labValidation?.pxe.mode || '-'}</Descriptions.Item>
+          <Descriptions.Item label="网卡/VLAN">{labValidation?.pxe.bind_interface || '-'}</Descriptions.Item>
+          <Descriptions.Item label="DHCP 监听">{labValidation?.pxe.dhcp_listen_addr || '-'}</Descriptions.Item>
+          <Descriptions.Item label="DHCP Server IP">{labValidation?.pxe.dhcp_server_ip || '-'}</Descriptions.Item>
+          <Descriptions.Item label="TFTP 监听">{labValidation?.pxe.tftp_listen_addr || '-'}</Descriptions.Item>
+          <Descriptions.Item label="TFTP 根目录">{labValidation?.pxe.tftp_root || '-'}</Descriptions.Item>
+          <Descriptions.Item label="部署网段">{labValidation?.pxe.deployment_networks ?? '-'}</Descriptions.Item>
+          <Descriptions.Item label="启动事件">{labValidation?.pxe.boot_events ?? '-'}</Descriptions.Item>
+          <Descriptions.Item label="启动文件">{`${labValidation?.pxe.bootfile_uefi || '-'} / ${labValidation?.pxe.bootfile_bios || '-'}`}</Descriptions.Item>
+        </Descriptions>
+        <Table<LabBootEvent> rowKey="id" dataSource={labValidation?.pxe.recent_boot_events || []} loading={labValidationLoading} pagination={false} size="small" locale={{ emptyText: '暂无启动事件' }} columns={[
+          { title: 'MAC', dataIndex: 'mac' },
+          { title: '固件', dataIndex: 'firmware' },
+          { title: '架构', dataIndex: 'architecture' },
+          { title: '来源', dataIndex: 'remote_addr' },
+          { title: '资产', dataIndex: 'server_id', render: value => value || '-' },
+          { title: '时间', dataIndex: 'created_at' }
+        ]} />
+        <Typography.Title level={5} style={{ marginTop: 18 }}>BMC</Typography.Title>
+        <Descriptions bordered size="small" column={{ xs: 1, md: 4 }} style={{ marginBottom: 12 }}>
+          <Descriptions.Item label="适配器">{labValidation?.bmc.adapter || '-'}</Descriptions.Item>
+          <Descriptions.Item label="总数">{labValidation?.bmc.total ?? '-'}</Descriptions.Item>
+          <Descriptions.Item label="ok">{labValidation?.bmc.ok ?? '-'}</Descriptions.Item>
+          <Descriptions.Item label="error">{labValidation?.bmc.error ?? '-'}</Descriptions.Item>
+        </Descriptions>
+        <Table<LabBMCRef> rowKey="server_id" dataSource={labValidation?.bmc.recent_endpoints || []} loading={labValidationLoading || labValidationRunLoading} pagination={false} size="small" locale={{ emptyText: '暂无 BMC 端点' }} columns={[
+          { title: '资产', render: (_, row) => serverLabel(row) },
+          { title: '类型', dataIndex: 'type' },
+          { title: '端点', dataIndex: 'endpoint' },
+          { title: '状态', dataIndex: 'status', render: value => <Tag color={readinessColor(value === 'ok' ? 'ok' : value === 'error' ? 'error' : 'warning')}>{value || 'unknown'}</Tag> },
+          { title: '电源', dataIndex: 'power_state' },
+          { title: '最近检查', dataIndex: 'last_checked_at', render: value => value || '-' }
+        ]} />
+        <Typography.Title level={5} style={{ marginTop: 18 }}>SSH</Typography.Title>
+        <Descriptions bordered size="small" column={{ xs: 1, md: 4 }} style={{ marginBottom: 12 }}>
+          <Descriptions.Item label="采集">{labValidation?.ssh.collector_mode || '-'}</Descriptions.Item>
+          <Descriptions.Item label="运维">{labValidation?.ssh.operations_mode || '-'}</Descriptions.Item>
+          <Descriptions.Item label="总数">{labValidation?.ssh.total ?? '-'}</Descriptions.Item>
+          <Descriptions.Item label="ok">{labValidation?.ssh.ok ?? '-'}</Descriptions.Item>
+        </Descriptions>
+        <Table<LabSSHRef> rowKey="server_id" dataSource={labValidation?.ssh.recent_ssh_accesses || []} loading={labValidationLoading || labValidationRunLoading} pagination={false} size="small" locale={{ emptyText: '暂无 SSH 配置' }} columns={[
+          { title: '资产', render: (_, row) => serverLabel(row) },
+          { title: '主机', render: (_, row) => `${row.host}:${row.port || 22}` },
+          { title: '用户', dataIndex: 'username' },
+          { title: '认证', dataIndex: 'auth_type' },
+          { title: '状态', dataIndex: 'status', render: value => <Tag color={readinessColor(value === 'ok' ? 'ok' : value === 'error' ? 'error' : 'warning')}>{value || 'unknown'}</Tag> },
+          { title: '最近检查', dataIndex: 'last_checked_at', render: value => value || '-' }
+        ]} />
+        <Typography.Title level={5} style={{ marginTop: 18 }}>执行结果</Typography.Title>
+        <Table<LabValidationRunResult> rowKey={record => `${record.kind}-${record.server_id}-${record.message}`} dataSource={labValidation?.run_results || []} loading={labValidationRunLoading} pagination={false} size="small" locale={{ emptyText: '暂无执行结果' }} columns={[
+          { title: '类型', dataIndex: 'kind' },
+          { title: '资产', render: (_, row) => serverLabel(row) },
+          { title: '状态', dataIndex: 'status', render: value => <Tag color={runResultColor(value)}>{value}</Tag> },
+          { title: '结果', dataIndex: 'message' },
+          { title: '时间', dataIndex: 'checked_at', render: value => value || '-' }
         ]} />
       </>
     }, {

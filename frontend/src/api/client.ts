@@ -120,6 +120,37 @@ export type TerminalSession = { id: number; server_id: number; status: string; m
 export type ReadinessCheck = { name: string; status: 'ok' | 'warning' | 'error'; message: string };
 export type ConfigIssue = { level: 'error' | 'warning'; key: string; message: string };
 export type ReadinessStatus = { status: 'ok' | 'degraded'; checks: ReadinessCheck[]; config_issues: ConfigIssue[] };
+export type LabValidationCheck = { name: string; status: 'ok' | 'warning' | 'error'; message: string };
+export type LabBootEvent = { id: number; mac: string; architecture: string; firmware: string; remote_addr: string; server_id?: number; deployment_id?: number; created_at: string };
+export type LabBMCRef = { server_id: number; hostname: string; asset_no: string; type: string; protocol: string; endpoint: string; status: string; power_state: string; last_checked_at?: string; updated_at: string };
+export type LabSSHRef = { server_id: number; hostname: string; asset_no: string; host: string; port: number; username: string; auth_type: string; status: string; last_checked_at?: string; updated_at: string };
+export type LabValidationRunResult = { kind: 'pxe_http' | 'pxe_dhcp' | 'pxe_tftp' | 'bmc' | 'ssh'; server_id: number; hostname: string; asset_no: string; status: 'success' | 'failed' | 'skipped'; message: string; checked_at?: string };
+export type LabValidationReport = {
+  status: 'ok' | 'warning' | 'error';
+  generated_at: string;
+  environment: { app_env: string; boot_base_url: string; bmc_adapter: string; collector_mode: string; ssh_operations_mode: string };
+  checks: LabValidationCheck[];
+  pxe: {
+    enabled: boolean;
+    mode: string;
+    bind_interface: string;
+    dhcp_listen_addr: string;
+    dhcp_server_ip: string;
+    dhcp_lease_start: string;
+    dhcp_lease_end: string;
+    tftp_listen_addr: string;
+    tftp_root: string;
+    bootfile_uefi: string;
+    bootfile_bios: string;
+    deployment_networks: number;
+    boot_events: number;
+    recent_boot_events: LabBootEvent[];
+    runtime_issues: ConfigIssue[];
+  };
+  bmc: { adapter: string; total: number; ok: number; error: number; unknown: number; last_checked_at?: string; recent_endpoints: LabBMCRef[] };
+  ssh: { collector_mode: string; operations_mode: string; total: number; ok: number; error: number; configured: number; unknown: number; last_checked_at?: string; recent_ssh_accesses: LabSSHRef[] };
+  run_results?: LabValidationRunResult[];
+};
 export type BackupValidationCheck = { name: string; status: 'ok' | 'warning' | 'error'; message: string };
 export type BackupValidationReport = { status: 'ok' | 'warning' | 'error'; version: string; generated_at?: string; totals: Record<string, number>; target_counts: Record<string, number>; checks: BackupValidationCheck[] };
 export type BackupRestoreResult = { status: 'restored'; imported: Record<string, number>; warnings?: BackupValidationCheck[] };

@@ -93,6 +93,8 @@ func NewRouter(db *gorm.DB, cfg config.Config) *gin.Engine {
 	protected.POST("/users", adminOnly, h.createUser)
 	protected.PATCH("/users/:id", adminOnly, h.updateUser)
 	protected.POST("/users/:id/reset-password", adminOnly, h.resetUserPassword)
+	protected.GET("/system/lab-validation", adminOnly, h.getLabValidation)
+	protected.POST("/system/lab-validation/run", adminOnly, middleware.RequireConfirmation("system.lab-validation.run"), h.runLabValidation)
 	protected.GET("/tenants", adminOnly, h.listTenants)
 	protected.POST("/tenants", adminOnly, h.createTenant)
 	protected.PATCH("/tenants/:id", adminOnly, h.updateTenant)
