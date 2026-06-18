@@ -152,6 +152,7 @@ func NewRouter(db *gorm.DB, cfg config.Config) *gin.Engine {
 	protected.GET("/servers/:id/metrics", h.serverMetrics)
 	protected.POST("/servers/:id/ssh", adminOnly, middleware.RequireConfirmation("ssh.upsert"), h.upsertSSHAccess)
 	protected.GET("/servers/:id/ssh", h.getSSHAccess)
+	protected.POST("/servers/:id/ssh/check", adminOrOps, h.checkSSHAccess)
 	protected.POST("/servers/:id/collections", adminOrOps, h.startCollection)
 	protected.GET("/servers/:id/collections", h.listCollections)
 	protected.GET("/collections", h.listCollectionJobs)

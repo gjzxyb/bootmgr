@@ -68,6 +68,28 @@ func (e SSHCommandExecutor) RunScriptForServer(ctx context.Context, serverID uin
 	return e.RunScript(ctx, target, script)
 }
 
+func (e SSHCommandExecutor) Check(ctx context.Context, serverID uint) (models.SSHAccess, error) {
+	target, err := e.TargetForServer(serverID)
+	if err != nil {
+		return target, err
+	}
+	result, err := e.Run(ctx, target, "printf 'ok '; hostname")
+	now := time.Now().UTC()
+	if err != nil || result.ExitCode != 0 {
+		_ = e.db.Model(&target).Updates(map[string]any{"status": "error", "last_checked_at": now}).Error
+		target.Status = "error"
+		target.LastCheckedAt = &now
+		if err != nil {
+			return target, err
+		}
+		return target, fmt.Errorf("ssh check command exited with code %d: %s", result.ExitCode, strings.TrimSpace(result.Stderr))
+	}
+	_ = e.db.Model(&target).Updates(map[string]any{"status": "ok", "last_checked_at": now}).Error
+	target.Status = "ok"
+	target.LastCheckedAt = &now
+	return target, nil
+}
+
 func (e SSHCommandExecutor) Run(ctx context.Context, target models.SSHAccess, command string) (RemoteCommandResult, error) {
 	if strings.TrimSpace(command) == "" {
 		return RemoteCommandResult{ExitCode: -1}, errors.New("ssh command cannot be empty")

@@ -110,6 +110,35 @@ func (h Handler) getSSHAccess(c *gin.Context) {
 	c.JSON(http.StatusOK, access)
 }
 
+func (h Handler) checkSSHAccess(c *gin.Context) {
+	serverID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid server id"})
+		return
+	}
+	var server models.Server
+	if notFound(c, h.db.First(&server, uint(serverID)).Error) {
+		return
+	}
+	if server.Status == "retired" || server.Status == "scrapped" {
+		c.JSON(http.StatusConflict, gin.H{"error": "server is retired or scrapped"})
+		return
+	}
+	actorID, actorEmail := middleware.Actor(c)
+	access, err := h.sshExecutor.Check(c.Request.Context(), uint(serverID))
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "ssh access not found"})
+			return
+		}
+		h.audit.Record(actorID, actorEmail, "ssh.check", "server", c.Param("id"), "medium", c.ClientIP(), c.Request.UserAgent(), c.GetString("request_id"))
+		c.JSON(http.StatusBadGateway, gin.H{"error": "ssh connectivity check failed", "detail": err.Error(), "status": access.Status, "checked_at": access.LastCheckedAt})
+		return
+	}
+	h.audit.Record(actorID, actorEmail, "ssh.check", "server", c.Param("id"), "medium", c.ClientIP(), c.Request.UserAgent(), c.GetString("request_id"))
+	c.JSON(http.StatusOK, gin.H{"status": access.Status, "checked_at": access.LastCheckedAt})
+}
+
 func (h Handler) serverMetrics(c *gin.Context) {
 	serverID, err := strconv.ParseUint(c.Param("id"), 10, 64)
 	if err != nil {
