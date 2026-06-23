@@ -3,6 +3,7 @@ package services
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"net"
 	"strings"
 	"testing"
@@ -73,6 +74,99 @@ func TestPXETFTPListenerServesBootIPXEOverUDP(t *testing.T) {
 	}
 }
 
+func TestPXETFTPListenerNegotiatesCommonOptions(t *testing.T) {
+	serverConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("listen test TFTP: %v", err)
+	}
+	defer serverConn.Close()
+	service := PXEService{cfg: config.Config{BootBaseURL: "http://boot.example.com", BootTFTPRoot: t.TempDir()}}
+	go service.serveTFTP(serverConn)
+
+	clientConn, err := net.ListenUDP("udp4", nil)
+	if err != nil {
+		t.Fatalf("listen client UDP: %v", err)
+	}
+	defer clientConn.Close()
+
+	req := []byte{0, 1}
+	for _, part := range []string{"boot.ipxe", "octet", "blksize", "1024", "timeout", "1", "tsize", "0"} {
+		req = append(req, []byte(part)...)
+		req = append(req, 0)
+	}
+	serverAddr, err := net.ResolveUDPAddr("udp4", serverConn.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("resolve TFTP server: %v", err)
+	}
+	if _, err := clientConn.WriteToUDP(req, serverAddr); err != nil {
+		t.Fatalf("send RRQ: %v", err)
+	}
+
+	buf := make([]byte, 1500)
+	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, transferAddr, err := clientConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("read OACK: %v", err)
+	}
+	if n < 2 || binary.BigEndian.Uint16(buf[:2]) != 6 {
+		t.Fatalf("expected OACK, got %v", buf[:n])
+	}
+	options := parseTFTPOACKOptions(t, buf[:n])
+	if options["blksize"] != "1024" || options["timeout"] != "1" {
+		t.Fatalf("expected blksize/timeout OACK options, got %#v", options)
+	}
+	if options["tsize"] == "" || options["tsize"] == "0" {
+		t.Fatalf("expected non-zero tsize OACK option, got %#v", options)
+	}
+	if err := sendTFTPACK(clientConn, transferAddr, 0); err != nil {
+		t.Fatalf("ack OACK: %v", err)
+	}
+
+	_ = clientConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, from, err := clientConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("read DATA: %v", err)
+	}
+	if from.String() != transferAddr.String() {
+		t.Fatalf("expected DATA from transfer addr %s, got %s", transferAddr, from)
+	}
+	if n < 4 || binary.BigEndian.Uint16(buf[:2]) != 3 || binary.BigEndian.Uint16(buf[2:4]) != 1 {
+		t.Fatalf("expected DATA block 1, got %v", buf[:n])
+	}
+	if len(buf[4:n]) > 1024 {
+		t.Fatalf("expected DATA payload within negotiated block size, got %d", len(buf[4:n]))
+	}
+	if !strings.Contains(string(buf[4:n]), "#!ipxe") {
+		t.Fatalf("expected boot.ipxe payload, got %q", string(buf[4:n]))
+	}
+	if err := sendTFTPACK(clientConn, transferAddr, 1); err != nil {
+		t.Fatalf("ack DATA: %v", err)
+	}
+}
+
+func TestProbeTFTPFileWithOptionsNegotiatesOACK(t *testing.T) {
+	serverConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("listen test TFTP: %v", err)
+	}
+	defer serverConn.Close()
+	service := PXEService{cfg: config.Config{BootBaseURL: "http://boot.example.com", BootTFTPRoot: t.TempDir()}}
+	go service.serveTFTP(serverConn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	data, options, err := ProbeTFTPFileWithOptions(ctx, serverConn.LocalAddr().String(), "boot.ipxe", 64*1024, map[string]string{"blksize": "1024", "timeout": "1", "tsize": "0"})
+	if err != nil {
+		t.Fatalf("probe TFTP boot.ipxe with options: %v", err)
+	}
+	if !strings.Contains(string(data), "#!ipxe") {
+		t.Fatalf("expected boot.ipxe payload, got %q", string(data))
+	}
+	if options["blksize"] != "1024" || options["timeout"] != "1" || options["tsize"] == "" || options["tsize"] == "0" {
+		t.Fatalf("expected negotiated OACK options, got %#v", options)
+	}
+}
+
 func TestPXEDHCPListenerRespondsToPXEProbeOverUDP(t *testing.T) {
 	db := newPXETestDB(t)
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
@@ -95,15 +189,23 @@ func TestPXEDHCPListenerRespondsToPXEProbeOverUDP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("probe DHCP listener: %v", err)
 	}
-	if result.MessageType != 2 || result.Bootfile != "ipxe.efi" || result.ServerIP != "192.168.100.10" {
+	if result.MessageType != 2 || result.Bootfile != "ipxe.efi" || result.ServerIP != "192.168.100.10" || result.NextServerIP != "192.168.100.10" || result.TFTPServerName != "192.168.100.10" {
 		t.Fatalf("unexpected DHCP probe result: %#v", result)
 	}
-	var bootEvents int64
-	if err := db.Model(&models.BootEvent{}).Where("mac = ?", "52:54:00:aa:bb:ee").Count(&bootEvents).Error; err != nil {
-		t.Fatalf("count boot events: %v", err)
+	if bootEvents := countBootEvents(t, db, "52:54:00:aa:bb:ee"); bootEvents != 0 {
+		t.Fatalf("synthetic DHCP probe should not record boot events, got %d", bootEvents)
 	}
-	if bootEvents != 1 {
-		t.Fatalf("expected DHCP probe to record one boot event, got %d", bootEvents)
+
+	sendRawDHCPDiscover(t, conn.LocalAddr().String(), minimalDHCPDiscover(t, []byte{0x52, 0x54, 0x00, 0xaa, 0xbb, 0xef}, 9))
+	if bootEvents := waitForBootEvents(t, db, "52:54:00:aa:bb:ef", 1); bootEvents != 1 {
+		t.Fatalf("expected real PXE DHCP request to record one boot event, got %d", bootEvents)
+	}
+	var event models.BootEvent
+	if err := db.Where("mac = ?", "52:54:00:aa:bb:ef").Order("id desc").First(&event).Error; err != nil {
+		t.Fatalf("load DHCP boot event: %v", err)
+	}
+	if event.Source != "pxe_dhcp" {
+		t.Fatalf("expected DHCP boot event source pxe_dhcp, got %#v", event)
 	}
 }
 
@@ -137,6 +239,92 @@ func TestParseDHCPPacketAndBootfileSelection(t *testing.T) {
 	}
 }
 
+func TestBuildDHCPResponseIncludesOption67AndBOOTPFile(t *testing.T) {
+	service := PXEService{cfg: config.Config{
+		BootDHCPServerIP:     "192.168.100.10",
+		BootTFTPBootfileUEFI: "ipxe.efi",
+		BootTFTPBootfileBIOS: "undionly.kpxe",
+	}}
+
+	tests := []struct {
+		name     string
+		arch     uint16
+		expected string
+	}{
+		{name: "uefi", arch: 9, expected: "ipxe.efi"},
+		{name: "bios", arch: 0, expected: "undionly.kpxe"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			packet, err := parseDHCPPacket(minimalDHCPDiscover(t, []byte{0x52, 0x54, 0x00, 0xaa, 0xbb, byte(tt.arch)}, tt.arch))
+			if err != nil {
+				t.Fatalf("parse dhcp packet: %v", err)
+			}
+			responseBytes := service.buildDHCPResponse(packet, net.IPv4zero, 2)
+			response, err := parseDHCPResponse(responseBytes)
+			if err != nil {
+				t.Fatalf("parse dhcp response: %v", err)
+			}
+			if got := string(response.options[67]); got != tt.expected {
+				t.Fatalf("expected option 67 bootfile %q, got %q", tt.expected, got)
+			}
+			if got := dhcpOptionIP(response.options[54]); got != "192.168.100.10" {
+				t.Fatalf("expected option 54 server identifier 192.168.100.10, got %q", got)
+			}
+			if got := dhcpPacketIP(response.siaddr[:]); got != "192.168.100.10" {
+				t.Fatalf("expected BOOTP next-server 192.168.100.10, got %q", got)
+			}
+			if got := string(response.options[66]); got != "192.168.100.10" {
+				t.Fatalf("expected option 66 TFTP server name 192.168.100.10, got %q", got)
+			}
+			if got := response.legacyBootfile(); got != tt.expected {
+				t.Fatalf("expected BOOTP file bootfile %q, got %q", tt.expected, got)
+			}
+			if got := bootpString(response.sname[:]); got != "192.168.100.10" {
+				t.Fatalf("expected BOOTP server name to carry server IP, got %q", got)
+			}
+		})
+	}
+}
+
+func TestProbePXEDHCPFallsBackToBOOTPFileField(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("listen test DHCP: %v", err)
+	}
+	defer conn.Close()
+	service := PXEService{cfg: config.Config{
+		BootServiceMode:      "proxy",
+		BootDHCPServerIP:     "192.168.100.10",
+		BootTFTPBootfileUEFI: "ipxe.efi",
+		BootTFTPBootfileBIOS: "undionly.kpxe",
+	}}
+	go func() {
+		buf := make([]byte, 1500)
+		n, addr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		packet, err := parseDHCPPacket(buf[:n])
+		if err != nil {
+			return
+		}
+		response := service.buildDHCPResponse(packet, net.IPv4zero, 2)
+		response = removeDHCPOptionForTest(response, 67)
+		_, _ = conn.WriteToUDP(response, addr)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := ProbePXEDHCP(ctx, conn.LocalAddr().String(), "52:54:00:aa:bb:fe", 0)
+	if err != nil {
+		t.Fatalf("probe DHCP listener: %v", err)
+	}
+	if result.Bootfile != "undionly.kpxe" || result.LegacyBootfile != "undionly.kpxe" {
+		t.Fatalf("expected probe to use BOOTP file fallback, got %#v", result)
+	}
+}
+
 func newPXETestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "_") + "?mode=memory&cache=shared"
@@ -148,6 +336,67 @@ func newPXETestDB(t *testing.T) *gorm.DB {
 		t.Fatalf("migrate PXE test DB: %v", err)
 	}
 	return db
+}
+
+func parseTFTPOACKOptions(t *testing.T, data []byte) map[string]string {
+	t.Helper()
+	if len(data) < 2 || binary.BigEndian.Uint16(data[:2]) != 6 {
+		t.Fatalf("not an OACK packet: %v", data)
+	}
+	parts := bytes.Split(data[2:], []byte{0})
+	options := map[string]string{}
+	for i := 0; i+1 < len(parts); i += 2 {
+		key := strings.ToLower(strings.TrimSpace(string(parts[i])))
+		if key == "" {
+			continue
+		}
+		options[key] = strings.TrimSpace(string(parts[i+1]))
+	}
+	return options
+}
+
+func countBootEvents(t *testing.T, db *gorm.DB, mac string) int64 {
+	t.Helper()
+	var bootEvents int64
+	if err := db.Model(&models.BootEvent{}).Where("mac = ?", mac).Count(&bootEvents).Error; err != nil {
+		t.Fatalf("count boot events: %v", err)
+	}
+	return bootEvents
+}
+
+func waitForBootEvents(t *testing.T, db *gorm.DB, mac string, expected int64) int64 {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var bootEvents int64
+	for time.Now().Before(deadline) {
+		bootEvents = countBootEvents(t, db, mac)
+		if bootEvents == expected {
+			return bootEvents
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return bootEvents
+}
+
+func sendRawDHCPDiscover(t *testing.T, addr string, packet []byte) {
+	t.Helper()
+	serverAddr, err := net.ResolveUDPAddr("udp4", addr)
+	if err != nil {
+		t.Fatalf("resolve DHCP server addr: %v", err)
+	}
+	conn, err := net.ListenUDP("udp4", nil)
+	if err != nil {
+		t.Fatalf("listen DHCP client socket: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.WriteToUDP(packet, serverAddr); err != nil {
+		t.Fatalf("send DHCP discover: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1500)
+	if _, _, err := conn.ReadFromUDP(buf); err != nil {
+		t.Fatalf("read DHCP response: %v", err)
+	}
 }
 
 func minimalDHCPDiscover(t *testing.T, mac []byte, arch uint16) []byte {
@@ -173,4 +422,37 @@ func minimalDHCPDiscover(t *testing.T, mac []byte, arch uint16) []byte {
 		t.Fatalf("test mac invalid: %v", err)
 	}
 	return packet
+}
+
+func removeDHCPOptionForTest(packet []byte, code byte) []byte {
+	if len(packet) < 240 {
+		return packet
+	}
+	out := append([]byte{}, packet[:240]...)
+	for i := 240; i < len(packet); {
+		option := packet[i]
+		i++
+		if option == 255 {
+			out = append(out, 255)
+			return out
+		}
+		if option == 0 {
+			out = append(out, 0)
+			continue
+		}
+		if i >= len(packet) {
+			break
+		}
+		length := int(packet[i])
+		i++
+		if i+length > len(packet) {
+			break
+		}
+		if option != code {
+			out = append(out, option, byte(length))
+			out = append(out, packet[i:i+length]...)
+		}
+		i += length
+	}
+	return append(out, 255)
 }

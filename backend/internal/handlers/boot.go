@@ -22,8 +22,10 @@ type metadataContext struct {
 	Token      models.MetadataToken
 }
 
+const labValidationHTTPProbeHeader = "X-Lab-Validation-Probe"
+
 func (h Handler) renderIPXE(c *gin.Context) {
-	req := services.BootRequest{MAC: c.Query("mac"), Architecture: c.DefaultQuery("arch", "x86_64"), Firmware: c.DefaultQuery("firmware", "uefi"), RemoteAddr: c.ClientIP()}
+	req := services.BootRequest{MAC: c.Query("mac"), Architecture: c.DefaultQuery("arch", "x86_64"), Firmware: c.DefaultQuery("firmware", "uefi"), RemoteAddr: c.ClientIP(), Source: h.httpIPXEBootEventSource(c)}
 	if req.MAC == "" {
 		c.String(http.StatusBadRequest, "missing mac")
 		return
@@ -35,6 +37,17 @@ func (h Handler) renderIPXE(c *gin.Context) {
 	}
 	c.Header("Content-Type", "text/plain; charset=utf-8")
 	c.String(http.StatusOK, script)
+}
+
+func (h Handler) httpIPXEBootEventSource(c *gin.Context) string {
+	if strings.EqualFold(strings.TrimSpace(c.GetHeader(labValidationHTTPProbeHeader)), "1") || strings.EqualFold(strings.TrimSpace(c.GetHeader(labValidationHTTPProbeHeader)), "true") {
+		return "api_event"
+	}
+	clientIP := net.ParseIP(c.ClientIP())
+	if clientIP != nil && h.clientInEnabledDeploymentNetwork(clientIP) {
+		return "http_ipxe"
+	}
+	return "api_event"
 }
 
 func (h Handler) discoveryIPXE(c *gin.Context) {
@@ -56,7 +69,7 @@ func (h Handler) recordBootEvent(c *gin.Context) {
 	if !bind(c, &req) {
 		return
 	}
-	_, event, err := h.boot.RenderIPXEScript(services.BootRequest{MAC: req.MAC, Architecture: req.Architecture, Firmware: req.Firmware, RemoteAddr: c.ClientIP()})
+	_, event, err := h.boot.RenderIPXEScript(services.BootRequest{MAC: req.MAC, Architecture: req.Architecture, Firmware: req.Firmware, RemoteAddr: c.ClientIP(), Source: "api_event"})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

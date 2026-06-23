@@ -34,6 +34,7 @@ type BootRequest struct {
 	Architecture string
 	Firmware     string
 	RemoteAddr   string
+	Source       string
 }
 
 func (s BootService) RenderIPXEScript(req BootRequest) (string, models.BootEvent, error) {
@@ -76,7 +77,11 @@ func (s BootService) RenderIPXEScript(req BootRequest) (string, models.BootEvent
 		}
 	}
 
-	event := models.BootEvent{MAC: mac, Architecture: req.Architecture, Firmware: req.Firmware, RemoteAddr: req.RemoteAddr, ServerID: serverID, DeploymentID: deploymentID, Script: redactMetadataTokens(script)}
+	source := strings.TrimSpace(req.Source)
+	if source == "" {
+		source = "unknown"
+	}
+	event := models.BootEvent{MAC: mac, Architecture: req.Architecture, Firmware: req.Firmware, RemoteAddr: req.RemoteAddr, Source: source, ServerID: serverID, DeploymentID: deploymentID, Script: redactMetadataTokens(script)}
 	if err := s.db.Create(&event).Error; err != nil {
 		return "", event, err
 	}

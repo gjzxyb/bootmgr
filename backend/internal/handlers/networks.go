@@ -3,11 +3,13 @@ package handlers
 import (
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/netip"
 	"strings"
 	"time"
 
+	"baremetal-platform/backend/internal/config"
 	"baremetal-platform/backend/internal/middleware"
 	"baremetal-platform/backend/internal/models"
 
@@ -177,17 +179,31 @@ func (h Handler) checkNetworkConfig(c *gin.Context) {
 	switch copy.DHCPMode {
 	case "proxy":
 		if copy.ProxyDHCP {
-			add("dhcp", "ok", "ProxyDHCP mode is recorded; no DHCP/TFTP service is started by the MVP backend")
+			if h.cfg.BootServicesEnabled && strings.ToLower(strings.TrimSpace(h.cfg.BootServiceMode)) == "proxy" {
+				add("dhcp", "ok", fmt.Sprintf("ProxyDHCP mode matches BOOT_SERVICE_MODE=proxy; DHCP listens on %s and TFTP listens on %s", h.cfg.BootDHCPListenAddr, h.cfg.BootTFTPListenAddr))
+			} else {
+				add("dhcp", "warning", "network expects ProxyDHCP; set BOOT_SERVICES_ENABLED=true and BOOT_SERVICE_MODE=proxy before physical PXE validation")
+			}
 		} else {
 			add("dhcp", "warning", "dhcp_mode is proxy but proxy_dhcp is disabled")
 		}
 	case "builtin":
-		add("dhcp", "warning", "builtin DHCP is configuration-only in MVP; the backend does not start DHCP/TFTP services")
+		if h.cfg.BootServicesEnabled && strings.ToLower(strings.TrimSpace(h.cfg.BootServiceMode)) == "builtin" {
+			add("dhcp", "ok", fmt.Sprintf("builtin DHCP mode matches BOOT_SERVICE_MODE=builtin; lease range %s-%s", h.cfg.BootDHCPLeaseStart, h.cfg.BootDHCPLeaseEnd))
+		} else {
+			add("dhcp", "warning", "network expects builtin DHCP; set BOOT_SERVICES_ENABLED=true and BOOT_SERVICE_MODE=builtin on an isolated deployment network")
+		}
 	case "external":
-		add("dhcp", "ok", "external DHCP mode is recorded; ensure the external DHCP service points PXE clients to the platform")
+		if h.cfg.BootServicesEnabled && strings.ToLower(strings.TrimSpace(h.cfg.BootServiceMode)) != "external" {
+			add("dhcp", "warning", fmt.Sprintf("network expects external DHCP but platform DHCP listener mode is %s", h.cfg.BootServiceMode))
+		} else {
+			add("dhcp", "ok", "external DHCP mode is recorded; ensure the external DHCP service points PXE clients to the platform TFTP/HTTP endpoints")
+		}
 	default:
 		add("dhcp", "error", "dhcp_mode must be one of proxy, builtin, external")
 	}
+	status, message := networkBootRuntimeStatus(h.cfg, copy)
+	add("pxe_runtime", status, message)
 	if copy.Purpose == "deployment" && copy.Status == "enabled" {
 		add("deployment_usage", "ok", "deployment preflight can use this network as an enabled deployment network")
 	} else if copy.Purpose == "deployment" {
@@ -199,6 +215,102 @@ func (h Handler) checkNetworkConfig(c *gin.Context) {
 	actorID, actorEmail := middleware.Actor(c)
 	h.audit.Record(actorID, actorEmail, "network_config.check", "network_config", row.ID, "low", c.ClientIP(), c.Request.UserAgent(), c.GetString("request_id"))
 	c.JSON(http.StatusOK, report)
+}
+
+func networkBootRuntimeStatus(cfg config.Config, row models.NetworkConfig) (string, string) {
+	if row.Purpose != "deployment" {
+		return "ok", "PXE/DHCP/TFTP runtime checks apply to deployment networks"
+	}
+	if row.Status != "enabled" {
+		return "warning", "deployment network is disabled; PXE clients will not use it for platform deployment"
+	}
+	if !cfg.BootServicesEnabled {
+		return "warning", "BOOT_SERVICES_ENABLED=false; this deployment network is recorded but platform PXE/DHCP/TFTP listeners are disabled"
+	}
+	mode := strings.ToLower(strings.TrimSpace(cfg.BootServiceMode))
+	if mode == "" {
+		mode = "proxy"
+	}
+	issues := config.BootRuntimeIssues(cfg)
+	if len(issues) > 0 {
+		parts := make([]string, 0, len(issues))
+		status := "warning"
+		for _, issue := range issues {
+			if issue.Level == "error" {
+				status = "error"
+			}
+			parts = append(parts, fmt.Sprintf("%s: %s", issue.Key, issue.Message))
+		}
+		if status == "error" {
+			return status, "PXE runtime has blocking issue(s): " + strings.Join(parts, "; ")
+		}
+		return status, "PXE runtime has warning(s): " + strings.Join(parts, "; ")
+	}
+	switch mode {
+	case "proxy":
+		if row.DHCPMode != "proxy" || !row.ProxyDHCP {
+			return "warning", fmt.Sprintf("BOOT_SERVICE_MODE=proxy is active on %s, but this network is configured as dhcp_mode=%s proxy_dhcp=%t", cfg.BootDHCPListenAddr, row.DHCPMode, row.ProxyDHCP)
+		}
+		if status, message := networkPXERuntimeAddressStatus(cfg, row, mode); status != "ok" {
+			return status, message
+		}
+		return "ok", fmt.Sprintf("ProxyDHCP and TFTP runtime are enabled on %s/%s via interface %s", cfg.BootDHCPListenAddr, cfg.BootTFTPListenAddr, cfg.BootBindInterface)
+	case "builtin":
+		if row.DHCPMode != "builtin" {
+			return "warning", fmt.Sprintf("BOOT_SERVICE_MODE=builtin is active on %s, but this network is configured as dhcp_mode=%s", cfg.BootDHCPListenAddr, row.DHCPMode)
+		}
+		if status, message := networkPXERuntimeAddressStatus(cfg, row, mode); status != "ok" {
+			return status, message
+		}
+		return "ok", fmt.Sprintf("builtin DHCP and TFTP runtime are enabled on %s/%s via interface %s", cfg.BootDHCPListenAddr, cfg.BootTFTPListenAddr, cfg.BootBindInterface)
+	case "external":
+		if row.DHCPMode != "external" {
+			return "warning", fmt.Sprintf("BOOT_SERVICE_MODE=external starts only TFTP on %s, but this network is configured as dhcp_mode=%s", cfg.BootTFTPListenAddr, row.DHCPMode)
+		}
+		if status, message := networkPXERuntimeAddressStatus(cfg, row, mode); status != "ok" {
+			return status, message
+		}
+		return "ok", fmt.Sprintf("external DHCP is expected; platform TFTP runtime is enabled on %s via interface %s", cfg.BootTFTPListenAddr, cfg.BootBindInterface)
+	default:
+		return "error", fmt.Sprintf("unsupported BOOT_SERVICE_MODE %q", cfg.BootServiceMode)
+	}
+}
+
+func networkPXERuntimeAddressStatus(cfg config.Config, row models.NetworkConfig, mode string) (string, string) {
+	prefix, err := netip.ParsePrefix(row.CIDR)
+	if err != nil {
+		return "warning", "deployment network CIDR is invalid; PXE runtime address alignment cannot be checked"
+	}
+	prefix = prefix.Masked()
+	if mode != "external" {
+		serverIP, err := netip.ParseAddr(strings.TrimSpace(cfg.BootDHCPServerIP))
+		if err != nil || !prefix.Contains(serverIP.Unmap()) {
+			return "warning", fmt.Sprintf("BOOT_DHCP_SERVER_IP %q is not inside deployment network %s", cfg.BootDHCPServerIP, prefix.String())
+		}
+		if addr, ok := listenAddressIP(cfg.BootDHCPListenAddr); ok && !prefix.Contains(addr.Unmap()) {
+			return "warning", fmt.Sprintf("BOOT_DHCP_LISTEN_ADDR %q is not inside deployment network %s", cfg.BootDHCPListenAddr, prefix.String())
+		}
+	}
+	if addr, ok := listenAddressIP(cfg.BootTFTPListenAddr); ok && !prefix.Contains(addr.Unmap()) {
+		return "warning", fmt.Sprintf("BOOT_TFTP_LISTEN_ADDR %q is not inside deployment network %s", cfg.BootTFTPListenAddr, prefix.String())
+	}
+	return "ok", ""
+}
+
+func listenAddressIP(raw string) (netip.Addr, bool) {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(raw))
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return netip.Addr{}, false
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil || addr.IsUnspecified() {
+		return netip.Addr{}, false
+	}
+	return addr, true
 }
 
 func validateAndNormalizeNetworkConfig(row *models.NetworkConfig) error {

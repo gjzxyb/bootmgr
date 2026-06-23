@@ -32,12 +32,12 @@ func TestSpecIncludesLabValidation(t *testing.T) {
 	if doc.OpenAPI == "" {
 		t.Fatalf("openapi version is missing")
 	}
-	for _, path := range []string{"/system/lab-validation", "/system/lab-validation/run"} {
+	for _, path := range []string{"/system/lab-validation", "/system/lab-validation/runs/{id}", "/system/lab-validation/runs/{id}/evidence-bundle", "/system/lab-validation/evidence", "/system/lab-validation/run"} {
 		if _, ok := doc.Paths[path]; !ok {
 			t.Fatalf("expected OpenAPI path %s", path)
 		}
 	}
-	for _, schema := range []string{"LabValidationReport", "LabValidationRunRequest", "LabValidationRunResult"} {
+	for _, schema := range []string{"LabValidationReport", "LabValidationRunRequest", "LabValidationRunResult", "LabValidationRunSummary", "LabValidationRunDetail", "LabValidationEvidenceBundle", "LabOperatorChecklistItem", "LabValidationEvidence", "LabValidationEvidenceRequest", "LabValidationTarget"} {
 		if _, ok := doc.Components.Schemas[schema]; !ok {
 			t.Fatalf("expected OpenAPI schema %s", schema)
 		}

@@ -223,10 +223,63 @@ type BootEvent struct {
 	Architecture string    `json:"architecture" gorm:"size:40;index"`
 	Firmware     string    `json:"firmware" gorm:"size:40;index"`
 	RemoteAddr   string    `json:"remote_addr" gorm:"size:120"`
+	Source       string    `json:"source" gorm:"size:40;index"`
 	ServerID     *uint     `json:"server_id" gorm:"index"`
 	DeploymentID *uint     `json:"deployment_id" gorm:"index"`
 	Script       string    `json:"script"`
 	CreatedAt    time.Time `json:"created_at"`
+}
+
+type LabValidationEvidence struct {
+	ID            uint      `json:"id" gorm:"primaryKey"`
+	Kind          string    `json:"kind" gorm:"size:40;index;not null"`
+	Subject       string    `json:"subject" gorm:"size:160"`
+	Status        string    `json:"status" gorm:"size:40;index;not null;default:ok"`
+	Summary       string    `json:"summary" gorm:"size:500;not null"`
+	Details       string    `json:"details" gorm:"size:4000"`
+	ArtifactURL   string    `json:"artifact_url" gorm:"size:500"`
+	RunID         *uint     `json:"run_id" gorm:"index"`
+	ServerID      *uint     `json:"server_id" gorm:"index"`
+	BootEventID   *uint     `json:"boot_event_id" gorm:"index"`
+	BmcEndpointID *uint     `json:"bmc_endpoint_id" gorm:"index"`
+	SSHAccessID   *uint     `json:"ssh_access_id" gorm:"index"`
+	CreatedBy     string    `json:"created_by" gorm:"size:180;index"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+type LabValidationRun struct {
+	ID              uint           `json:"id" gorm:"primaryKey"`
+	Status          string         `json:"status" gorm:"size:40;index;not null;default:running"`
+	Strict          bool           `json:"strict" gorm:"not null;default:false"`
+	CheckPXE        bool           `json:"check_pxe" gorm:"not null;default:true"`
+	CheckBMC        bool           `json:"check_bmc" gorm:"not null;default:true"`
+	CheckSSH        bool           `json:"check_ssh" gorm:"not null;default:true"`
+	Limit           int            `json:"limit" gorm:"not null;default:20"`
+	ServerIDs       datatypes.JSON `json:"server_ids"`
+	PXEMACs         datatypes.JSON `json:"pxe_macs"`
+	PXEProbeMAC     string         `json:"pxe_probe_mac" gorm:"size:80"`
+	PXEArch         uint16         `json:"pxe_arch"`
+	SSHProbeCommand string         `json:"ssh_probe_command" gorm:"size:255"`
+	RequestedBy     string         `json:"requested_by" gorm:"size:180;index"`
+	RequestID       string         `json:"request_id" gorm:"size:120;index"`
+	StartedAt       time.Time      `json:"started_at" gorm:"index"`
+	FinishedAt      *time.Time     `json:"finished_at"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `json:"updated_at"`
+}
+
+type LabValidationRunResult struct {
+	ID        uint           `json:"id" gorm:"primaryKey"`
+	RunID     uint           `json:"run_id" gorm:"index;not null"`
+	Kind      string         `json:"kind" gorm:"size:60;index;not null"`
+	ServerID  uint           `json:"server_id" gorm:"index"`
+	Hostname  string         `json:"hostname" gorm:"size:120"`
+	AssetNo   string         `json:"asset_no" gorm:"size:80"`
+	Status    string         `json:"status" gorm:"size:40;index;not null"`
+	Message   string         `json:"message" gorm:"size:1000"`
+	Details   datatypes.JSON `json:"details"`
+	CheckedAt *time.Time     `json:"checked_at"`
+	CreatedAt time.Time      `json:"created_at"`
 }
 
 type MetadataToken struct {
@@ -409,6 +462,6 @@ type AuditLog struct {
 func All() []any {
 	return []any{
 		&User{}, &Server{}, &HardwareInventory{}, &ServerStatusHistory{}, &RetirementRecord{}, &Tenant{}, &NetworkConfig{}, &BmcEndpoint{}, &Credential{}, &SSHAccess{}, &Image{}, &InstallTemplate{}, &WorkflowTemplate{},
-		&Deployment{}, &BootEvent{}, &MetadataToken{}, &WorkflowRun{}, &TaskExecution{}, &MetricSample{}, &LogEvent{}, &CollectionJob{}, &ScriptJob{}, &ScriptExecution{}, &TerminalSession{}, &Alert{}, &AlertRule{}, &AlertEvent{}, &AuditLog{},
+		&Deployment{}, &BootEvent{}, &LabValidationEvidence{}, &LabValidationRun{}, &LabValidationRunResult{}, &MetadataToken{}, &WorkflowRun{}, &TaskExecution{}, &MetricSample{}, &LogEvent{}, &CollectionJob{}, &ScriptJob{}, &ScriptExecution{}, &TerminalSession{}, &Alert{}, &AlertRule{}, &AlertEvent{}, &AuditLog{},
 	}
 }

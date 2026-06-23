@@ -47,7 +47,7 @@ components:
     ReadinessCheck:
       type: object
       properties:
-        name: { type: string, enum: [database, redis, image_storage, pxe_services, config] }
+        name: { type: string, enum: [database, redis, image_storage, bmc_tooling, ssh_known_hosts, pxe_services, config] }
         status: { type: string, enum: [ok, warning, error] }
         message: { type: string }
     ReadinessStatus:
@@ -74,6 +74,7 @@ components:
         architecture: { type: string }
         firmware: { type: string }
         remote_addr: { type: string }
+        source: { type: string, enum: [http_ipxe, pxe_dhcp, api_event, unknown] }
         server_id: { type: integer, nullable: true }
         deployment_id: { type: integer, nullable: true }
         created_at: { type: string, format: date-time }
@@ -103,20 +104,261 @@ components:
         status: { type: string }
         last_checked_at: { type: string, format: date-time, nullable: true }
         updated_at: { type: string, format: date-time }
+    LabTerminalSessionRef:
+      type: object
+      properties:
+        id: { type: integer }
+        server_id: { type: integer }
+        hostname: { type: string }
+        asset_no: { type: string }
+        status: { type: string }
+        mode: { type: string, enum: [simulated, ssh] }
+        requested_by: { type: string }
+        reason: { type: string }
+        transcript: { type: string }
+        opened_at: { type: string, format: date-time }
+        closed_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+    LabScriptExecutionRef:
+      type: object
+      properties:
+        id: { type: integer }
+        script_job_id: { type: integer }
+        server_id: { type: integer }
+        hostname: { type: string }
+        asset_no: { type: string }
+        job_name: { type: string }
+        status: { type: string, enum: [pending, running, success, failed] }
+        exit_code: { type: integer }
+        stdout: { type: string }
+        stderr: { type: string }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+    LabLogEventRef:
+      type: object
+      properties:
+        id: { type: integer }
+        server_id: { type: integer }
+        hostname: { type: string }
+        asset_no: { type: string }
+        source: { type: string }
+        level: { type: string }
+        message: { type: string }
+        trace_id: { type: string }
+        occurred_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
     LabValidationRunResult:
       type: object
       properties:
-        kind: { type: string, enum: [pxe_http, pxe_dhcp, pxe_tftp, bmc, ssh] }
+        id: { type: integer }
+        run_id: { type: integer }
+        kind: { type: string, enum: [strict_physical_targets, full_chain_target, pxe_http, pxe_dhcp, pxe_tftp, pxe_boot_event, bmc, ssh] }
         server_id: { type: integer }
         hostname: { type: string }
         asset_no: { type: string }
         status: { type: string, enum: [success, failed, skipped] }
         message: { type: string }
+        details:
+          type: object
+          additionalProperties: true
+          description: Structured non-secret probe details such as adapter=redfish|ipmi and BMC manufacturer/model/serial/firmware identity fields.
         checked_at: { type: string, format: date-time, nullable: true }
+    LabValidationRunSummary:
+      type: object
+      properties:
+        id: { type: integer }
+        status: { type: string, enum: [ok, warning, error, running] }
+        strict: { type: boolean }
+        check_pxe: { type: boolean }
+        check_bmc: { type: boolean }
+        check_ssh: { type: boolean }
+        limit: { type: integer }
+        server_ids:
+          type: array
+          items: { type: integer }
+        pxe_macs:
+          type: array
+          items: { type: string }
+        pxe_probe_mac: { type: string }
+        pxe_arch: { type: integer, enum: [0, 7, 9, 11] }
+        ssh_probe_command: { type: string, maxLength: 255 }
+        requested_by: { type: string }
+        request_id: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time, nullable: true }
+        results: { type: integer }
+        failures: { type: integer }
+        skipped: { type: integer }
+    LabValidationRunDetail:
+      type: object
+      properties:
+        run: { $ref: '#/components/schemas/LabValidationRunSummary' }
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/LabValidationRunResult' }
+    LabOperatorChecklistItem:
+      type: object
+      properties:
+        subject: { type: string }
+        step: { type: string, enum: [pxe_boot_event, bmc_identity, ssh_command, full_chain_evidence] }
+        status: { type: string, enum: [ok, warning, pending, error] }
+        message: { type: string }
+        next_action: { type: string }
+        run_id: { type: integer }
+        server_id: { type: integer }
+        boot_event_id: { type: integer, nullable: true }
+        evidence_id: { type: integer, nullable: true }
+        blocking_reasons:
+          type: array
+          items: { type: string }
+    LabEvidenceCandidate:
+      type: object
+      description: Server-computed evidence payload draft that can be submitted to POST /system/lab-validation/evidence after operator review. Candidates are emitted only when the referenced run has enough physical PXE/BMC/SSH proof for that evidence kind.
+      properties:
+        kind: { type: string, enum: [pxe, bmc, ssh, full] }
+        status: { type: string, enum: [ok] }
+        subject: { type: string }
+        summary: { type: string }
+        details: { type: string }
+        run_id: { type: integer }
+        server_id: { type: integer }
+        boot_event_id: { type: integer }
+        source_step: { type: string, enum: [pxe_boot_event, bmc_identity, ssh_command, full_chain_evidence] }
+    LabValidationEvidenceBundle:
+      type: object
+      properties:
+        generated_at: { type: string, format: date-time }
+        run: { $ref: '#/components/schemas/LabValidationRunSummary' }
+        environment:
+          type: object
+          properties:
+            app_env: { type: string }
+            boot_base_url: { type: string }
+            bmc_adapter: { type: string }
+            collector_mode: { type: string }
+            ssh_operations_mode: { type: string }
+        checks:
+          type: array
+          items: { $ref: '#/components/schemas/LabValidationCheck' }
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/LabValidationRunResult' }
+        boot_events:
+          type: array
+          items: { $ref: '#/components/schemas/LabBootEvent' }
+        bmc_endpoints:
+          type: array
+          items: { $ref: '#/components/schemas/LabBMCRef' }
+        ssh_accesses:
+          type: array
+          items: { $ref: '#/components/schemas/LabSSHRef' }
+        terminal_sessions:
+          type: array
+          items: { $ref: '#/components/schemas/LabTerminalSessionRef' }
+        script_executions:
+          type: array
+          items: { $ref: '#/components/schemas/LabScriptExecutionRef' }
+        log_events:
+          type: array
+          items: { $ref: '#/components/schemas/LabLogEventRef' }
+        recent_evidence:
+          type: array
+          items: { $ref: '#/components/schemas/LabValidationEvidence' }
+        evidence_candidates:
+          type: array
+          description: Machine-readable candidate evidence records derived from the same operator checklist and proof rules used by the backend evidence validator.
+          items: { $ref: '#/components/schemas/LabEvidenceCandidate' }
+        targets:
+          type: array
+          items: { $ref: '#/components/schemas/LabValidationTarget' }
+        config_issues:
+          type: array
+          items: { $ref: '#/components/schemas/ConfigIssue' }
+        pxe_runtime_issues:
+          type: array
+          items: { $ref: '#/components/schemas/ConfigIssue' }
+        notes:
+          type: array
+          items: { type: string }
+        operator_checklist:
+          type: array
+          description: Machine-readable operator checklist for physical PXE, BMC identity, SSH command proof, and full-chain evidence references in this bundle. BMC checklist items are ok only when this run has a successful result with adapter=redfish|ipmi structured identity details; SSH checklist items are ok only when this run has known_hosts host key proof plus command/exit_code/stdout details.
+          items: { $ref: '#/components/schemas/LabOperatorChecklistItem' }
+    LabValidationEvidence:
+      type: object
+      properties:
+        id: { type: integer }
+        kind: { type: string, enum: [pxe, bmc, ssh, full] }
+        subject: { type: string }
+        status: { type: string, enum: [ok, warning, error] }
+        summary: { type: string }
+        details: { type: string }
+        artifact_url: { type: string, format: uri }
+        run_id: { type: integer, nullable: true }
+        server_id: { type: integer, nullable: true }
+        boot_event_id: { type: integer, nullable: true }
+        bmc_endpoint_id: { type: integer, nullable: true }
+        ssh_access_id: { type: integer, nullable: true }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+    LabValidationTarget:
+      type: object
+      properties:
+        server_id: { type: integer }
+        hostname: { type: string }
+        asset_no: { type: string }
+        primary_mac: { type: string }
+        server_status: { type: string }
+        pxe_status: { type: string, enum: [ok, stale, missing, api_only] }
+        pxe_boot_event_id: { type: integer, nullable: true }
+        pxe_boot_at: { type: string, format: date-time, nullable: true }
+        bmc_status: { type: string }
+        bmc_checked_at: { type: string, format: date-time, nullable: true }
+        ssh_status: { type: string }
+        ssh_checked_at: { type: string, format: date-time, nullable: true }
+        evidence_status: { type: string, enum: [ok, partial, stale, missing] }
+        evidence_id: { type: integer, nullable: true }
+        evidence_kinds:
+          type: array
+          items: { type: string, enum: [pxe, bmc, ssh, full] }
+        latest_run_id: { type: integer, nullable: true }
+        latest_run_status: { type: string, enum: [ok, warning, error, running] }
+        latest_run_strict: { type: boolean }
+        latest_run_kind: { type: string, enum: [strict_physical_targets, full_chain_target, pxe_http, pxe_dhcp, pxe_tftp, pxe_boot_event, bmc, ssh] }
+        latest_run_result_status: { type: string, enum: [success, failed, skipped] }
+        latest_run_at: { type: string, format: date-time, nullable: true }
+        full_chain_ready: { type: boolean }
+        blocking_reasons:
+          type: array
+          items: { type: string }
+    LabValidationEvidenceRequest:
+      type: object
+      required: [kind, subject, summary]
+      properties:
+        kind: { type: string, enum: [pxe, bmc, ssh, full] }
+        subject: { type: string, maxLength: 160 }
+        status: { type: string, enum: [ok, warning, error], default: ok }
+        summary: { type: string, maxLength: 500 }
+        details: { type: string, maxLength: 4000 }
+        artifact_url: { type: string, format: uri, maxLength: 500 }
+        run_id:
+          type: integer
+          minimum: 1
+          description: Optional for warning/error evidence. Required for ok BMC, ok SSH, and ok full-chain evidence. BMC/SSH evidence must reference a recent finished strict run that checked that capability and contains the target adapter=redfish|ipmi structured BMC identity proof details or SSH known_hosts host key proof plus command/exit_code/stdout proof details. SSH proof requires host_key_policy=known_hosts, host_key_verified=true, and host_key_sha256 in the referenced run details. Full-chain evidence must reference a recent finished strict run that checked PXE, BMC, and SSH and contains successful target PXE results plus adapter=redfish|ipmi BMC identity proof details and SSH known_hosts host key proof plus command/exit_code/stdout proof details; the referenced run may have overall status error if only full_chain_target failed because full-chain evidence had not been recorded yet.
+        server_id:
+          type: integer
+          minimum: 1
+          description: Required for ok BMC, ok SSH, and ok full-chain evidence. Optional for ok PXE evidence. When paired with boot_event_id, the BootEvent must either reference the same server_id or match the server primary_mac.
+        boot_event_id:
+          type: integer
+          minimum: 1
+          description: Required for ok PXE and ok full-chain evidence. The referenced BootEvent must be within the freshness window and can prove the server by direct server_id or MAC-to-primary_mac matching.
     LabValidationReport:
       type: object
       properties:
         status: { type: string, enum: [ok, warning, error] }
+        run_id: { type: integer }
         generated_at: { type: string, format: date-time }
         environment:
           type: object
@@ -177,6 +419,15 @@ components:
             recent_ssh_accesses:
               type: array
               items: { $ref: '#/components/schemas/LabSSHRef' }
+        recent_evidence:
+          type: array
+          items: { $ref: '#/components/schemas/LabValidationEvidence' }
+        targets:
+          type: array
+          items: { $ref: '#/components/schemas/LabValidationTarget' }
+        recent_runs:
+          type: array
+          items: { $ref: '#/components/schemas/LabValidationRunSummary' }
         run_results:
           type: array
           items: { $ref: '#/components/schemas/LabValidationRunResult' }
@@ -186,7 +437,35 @@ components:
         check_pxe: { type: boolean, default: true }
         check_bmc: { type: boolean, default: true }
         check_ssh: { type: boolean, default: true }
+        strict:
+          type: boolean
+          default: false
+          description: When true, requires real physical targets instead of synthetic-only checks. PXE checks require pxe_macs, BMC/SSH checks require server_ids, and BMC cannot use the simulated adapter.
         limit: { type: integer, minimum: 1, maximum: 50, default: 20 }
+        server_ids:
+          type: array
+          maxItems: 50
+          uniqueItems: true
+          description: Optional target server IDs. When present, BMC and SSH checks are limited to these physical assets and missing BMC/SSH configuration is returned as a failed target result.
+          items: { type: integer, minimum: 1 }
+        pxe_macs:
+          type: array
+          maxItems: 20
+          uniqueItems: true
+          description: Optional real PXE client MAC addresses. Each MAC must have a recorded BootEvent to pass the pxe_boot_event check. When server_ids are also supplied in strict validation, each BootEvent must either carry one of those server_ids or match a requested server primary_mac.
+          items: { type: string }
+        pxe_probe_mac:
+          type: string
+          description: Optional MAC address used by synthetic PXE HTTP and DHCP probes.
+        pxe_arch:
+          type: integer
+          enum: [0, 7, 9, 11]
+          default: 9
+          description: PXE architecture code used by the synthetic DHCP probe. 0 validates Legacy BIOS bootfile selection; 7, 9, and 11 validate common UEFI x86_64 paths.
+        ssh_probe_command:
+          type: string
+          maxLength: 255
+          description: Optional single-line command used for real SSH host proof. Defaults to a safe read-only hostname/user/kernel probe; stdout, stderr, and exit_code are summarized in the SSH run result.
     BackupValidationCheck:
       type: object
       properties:
@@ -576,7 +855,7 @@ components:
         protocol: { type: string, enum: [http, https, ipmi] }
         endpoint:
           type: string
-          description: Redfish requires an http/https URL; IPMI requires a valid host/IP or host:port.
+          description: Redfish requires an http/https URL and protocol must match the URL scheme; production Redfish rejects http:// endpoints and requires REDFISH_INSECURE_TLS=false with a trusted BMC certificate chain. IPMI requires a valid host/IP or host:port.
         username: { type: string }
         status: { type: string }
         power_state: { type: string }
@@ -585,13 +864,37 @@ components:
       properties:
         adapter: { type: string }
         endpoint_status: { type: string }
+        stage:
+          type: string
+          enum: [config, connectivity]
+          description: Failure stage on BMC check error responses.
         manufacturer: { type: string }
+        manufacturer_id: { type: string }
         model: { type: string }
+        product_id: { type: string }
+        device_id: { type: string }
+        device_revision: { type: string }
         serial_number: { type: string }
         firmware_version: { type: string }
         bios_version: { type: string }
         bmc_version: { type: string }
         last_checked_at: { type: string, format: date-time }
+    BMCCheckResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          description: Latest BMC endpoint status, usually ok on 200 or error on 502.
+        checked_at: { type: string, format: date-time }
+        proof:
+          $ref: '#/components/schemas/BMCFirmwareInfo'
+        proof_error:
+          type: string
+          description: Non-sensitive firmware or hardware identity probe error when connectivity succeeded but the identity probe was incomplete.
+        error: { type: string }
+        detail:
+          type: string
+          description: Non-secret adapter error detail on 502 responses.
     BatchBmcPowerResult:
       type: object
       properties:
@@ -619,6 +922,41 @@ components:
         username: { type: string }
         auth_type: { type: string, enum: [password, private_key], default: password }
         status: { type: string }
+    SSHCheckProof:
+      type: object
+      properties:
+        command:
+          type: string
+          description: Read-only command used for the connectivity proof.
+        exit_code: { type: integer }
+        stage:
+          type: string
+          enum: [lookup, request, config, dial, handshake, session, command]
+          description: Failure stage when the SSH check did not complete successfully.
+        stdout:
+          type: string
+          description: Truncated stdout from the proof command.
+        stderr:
+          type: string
+          description: Truncated stderr from the proof command.
+        host_key_policy: { type: string, enum: [insecure_ignore, known_hosts] }
+        host_key_verified:
+          type: boolean
+          description: true only when SSH_HOST_KEY_POLICY=known_hosts and the host key verifier accepted the key.
+        host_key_algorithm: { type: string }
+        host_key_sha256:
+          type: string
+          description: Non-secret SSH host key SHA256 fingerprint, for example SHA256:....
+        host_key_host: { type: string }
+        host_key_remote: { type: string }
+    SSHCheckResponse:
+      type: object
+      properties:
+        status: { type: string }
+        checked_at: { type: string, format: date-time }
+        proof: { $ref: '#/components/schemas/SSHCheckProof' }
+        error: { type: string }
+        detail: { type: string }
     TerminalCommandRequest:
       type: object
       required: [command]
@@ -774,7 +1112,7 @@ paths:
         - url: http://localhost:8080
       security: []
       summary: Check runtime readiness.
-      description: Checks database, Redis, image storage, PXE/TFTP runtime prerequisites, and configuration validation issues.
+      description: Checks database, Redis, image storage, BMC tooling, SSH known_hosts coverage, PXE/DHCP/TFTP runtime probes, and configuration validation issues. With BMC_ADAPTER=ipmi, the bmc_tooling check verifies ipmitool is available in PATH. With SSH_HOST_KEY_POLICY=known_hosts, ssh_known_hosts statically checks configured SSH targets against known_hosts patterns, including plain hostnames, [host]:port entries, wildcards, and OpenSSH |1|... hashed host patterns. When BOOT_SERVICES_ENABLED=true, pxe_services probes TFTP boot.ipxe over UDP using common RRQ options (blksize, timeout, tsize) and requires OACK negotiation, then in proxy/builtin mode sends a synthetic PXE DHCPDISCOVER to verify option 54 server_identifier, BOOTP next_server/siaddr, option 66 tftp_server_name, option 67 bootfile, and BOOTP file without recording a BootEvent.
       responses:
         '200':
           description: Readiness report.
@@ -787,6 +1125,7 @@ paths:
         - url: http://localhost:8080
       security: []
       summary: Render server-specific iPXE script and auto-discover unknown MACs.
+      description: Records BootEvent source as http_ipxe only when the client IP is inside an enabled deployment network CIDR; HTTP iPXE requests from outside deployment networks, or requests with X-Lab-Validation-Probe set to 1/true, are recorded as api_event for troubleshooting and do not prove physical PXE.
       parameters:
         - { name: mac, in: query, schema: { type: string } }
         - { name: arch, in: query, schema: { type: string } }
@@ -1176,7 +1515,7 @@ paths:
   /system/lab-validation:
     get:
       summary: Get physical lab validation report.
-      description: Admin role required. Summarizes PXE/DHCP/TFTP runtime evidence, BMC endpoint status, SSH access status, and safe readiness checks for physical lab acceptance.
+      description: Admin role required. Summarizes PXE/DHCP/TFTP runtime evidence, BMC endpoint status, SSH access status, safe readiness checks, recent validation runs, and recently recorded physical validation evidence for physical lab acceptance.
       responses:
         '200':
           description: Lab validation report.
@@ -1184,10 +1523,90 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/LabValidationReport' }
         '403': { description: Admin role required. }
+  /system/lab-validation/runs/{id}:
+    get:
+      summary: Get a persisted physical lab validation run.
+      description: Admin role required. Returns one persisted validation run batch and its per-check results for audit and replay review.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        '200':
+          description: Lab validation run detail.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LabValidationRunDetail' }
+        '400': { description: Invalid run id. }
+        '403': { description: Admin role required. }
+        '404': { description: Lab validation run not found. }
+  /system/lab-validation/runs/{id}/evidence-bundle:
+    get:
+      summary: Export a physical lab validation evidence bundle.
+      description: Admin role required. Returns one validation run, result rows, environment snapshot, readiness checks, related PXE BootEvents, BMC endpoints, SSH accesses, terminal transcripts, script executions, log events, recent physical evidence, a machine-readable operator checklist, and configuration/runtime issues. The bundle is read-only audit material and does not create physical evidence by itself.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        '200':
+          description: Lab validation evidence bundle.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LabValidationEvidenceBundle' }
+        '400': { description: Invalid run id. }
+        '403': { description: Admin role required. }
+        '404': { description: Lab validation run not found. }
+  /system/lab-validation/evidence:
+    post:
+      summary: Record physical lab validation evidence.
+      description: >-
+        Admin role and X-Confirm-Action system.lab-validation.evidence are required.
+        Stores a non-secret summary that a real PXE client, physical BMC, real SSH host,
+        or full-chain lab run was validated. subject identifies the MAC, BMC endpoint,
+        SSH host, or lab run batch. Optional run_id links the evidence to a finished
+        validation run from the freshness window; ok BMC and ok SSH evidence require
+        run_id from a recent finished strict run that checked the corresponding
+        capability and contains adapter=redfish|ipmi structured BMC identity proof details or SSH
+        known_hosts host key proof plus command/exit_code/stdout proof details. SSH
+        proof requires host_key_policy=known_hosts, host_key_verified=true, and
+        host_key_sha256 in the referenced run details.
+        ok full-chain evidence requires run_id
+        from a recent finished strict run that checked PXE, BMC, and SSH and has
+        successful target PXE/BMC/SSH results with those proof details. The
+        referenced run may have overall status error when full_chain_target failed
+        only because full-chain evidence had not been recorded yet. Ok evidence
+        must include platform references:
+        PXE uses boot_event_id from a real http_ipxe or pxe_dhcp source; http_ipxe
+        is only assigned to HTTP iPXE requests whose client IP is inside an
+        enabled deployment network CIDR. BMC uses server_id with a current recent
+        ok endpoint check whose type matches the current BMC_ADAPTER, SSH uses
+        server_id with a current recent ok access check and production-safe host
+        key verification, and full-chain evidence uses both server_id and a
+        same-server real-source boot_event_id with current recent ok BMC/SSH
+        checks. api_event boot events are accepted for troubleshooting history
+        but cannot produce ok physical evidence. physical_evidence only treats
+        referenced ok evidence from the last 7 days as current proof, and in
+        production only counts SSH evidence whose host key policy is valid.
+      parameters:
+        - name: X-Confirm-Action
+          in: header
+          required: true
+          schema: { type: string, enum: [system.lab-validation.evidence] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LabValidationEvidenceRequest' }
+      responses:
+        '201':
+          description: Evidence recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LabValidationEvidence' }
+        '400': { description: Invalid evidence payload. }
+        '403': { description: Admin role required. }
+        '428': { $ref: '#/components/responses/ConfirmationRequired' }
   /system/lab-validation/run:
     post:
       summary: Run safe physical lab connectivity checks.
-      description: Admin role and X-Confirm-Action system.lab-validation.run are required. Runs read-only PXE HTTP/DHCP/TFTP probes, BMC connectivity checks, and SSH lightweight checks for configured endpoints up to the requested limit. It does not perform power operations or enable DHCP/TFTP listeners.
+      description: Admin role and X-Confirm-Action system.lab-validation.run are required. Runs read-only PXE HTTP/DHCP/TFTP probes, BMC connectivity checks, BMC tooling checks, and SSH lightweight checks for configured endpoints up to the requested limit. Synthetic DHCP probes do not create BootEvent evidence, and the HTTP iPXE probe sends X-Lab-Validation-Probe so it is recorded as api_event instead of physical http_ipxe evidence; pass pxe_macs to verify physical PXE client boot events. Strict PXE validation accepts fresh http_ipxe or pxe_dhcp events from the last 7 days, and when server_ids are also supplied each PXE BootEvent must either carry one of those server_ids or match a requested server primary_mac. The target matrix prefers the latest physical PXE event over later api_event troubleshooting records. Set strict=true for a physical acceptance gate that requires pxe_macs, server_ids for BMC/SSH targets, a non-simulated BMC adapter, and in production SSH_HOST_KEY_POLICY=known_hosts with a readable SSH_KNOWN_HOSTS_PATH. It does not perform power operations or enable DHCP/TFTP listeners.
       parameters:
         - name: X-Confirm-Action
           in: header
@@ -1308,7 +1727,7 @@ paths:
   /network-configs/{id}/check:
     post:
       summary: Check network configuration.
-      description: Admin role required. Runs static deployment-network readiness checks for CIDR format, overlap, gateway, DNS, status, DHCP mode, and deployment usage without starting DHCP/TFTP services.
+      description: Admin role required. Runs read-only deployment-network readiness checks for CIDR format, overlap, gateway, DNS, status, DHCP mode, PXE/DHCP/TFTP runtime configuration match, runtime address alignment with the deployment CIDR, and deployment usage without starting or stopping DHCP/TFTP services.
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses:
         '200':
@@ -1809,7 +2228,7 @@ paths:
   /servers/{id}/bmc:
     post:
       summary: Configure BMC endpoint.
-      description: Requires an existing non-retired, non-scrapped server. Redfish endpoints require an http/https URL; IPMI endpoints require protocol=ipmi and a valid host/IP or host:port. Saving or updating resets status to unknown until the next connectivity check.
+      description: Requires an existing non-retired, non-scrapped server. Redfish endpoints require an http/https URL and protocol must match the URL scheme; production Redfish rejects http:// endpoints and requires REDFISH_INSECURE_TLS=false with a trusted BMC certificate chain. IPMI endpoints require protocol=ipmi and a valid host/IP or host:port. Saving or updating resets status to unknown until the next connectivity check.
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       requestBody:
         required: true
@@ -1878,13 +2297,21 @@ paths:
   /servers/{id}/bmc/check:
     post:
       summary: Check BMC connectivity.
-      description: Rejected for retired or scrapped servers. Adapter failures mark the endpoint as error and return 502.
+      description: Rejected for retired or scrapped servers. Adapter failures mark the endpoint as error and return 502. On success, the response includes non-secret Redfish/IPMI firmware and hardware identity proof when available.
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses:
-        '200': { description: Check result. }
+        '200':
+          description: Check result with optional physical identity proof.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BMCCheckResponse' }
         '404': { description: BMC endpoint not found. }
         '409': { description: BMC operation is not allowed for retired or scrapped server. }
-        '502': { description: BMC adapter connectivity check failed. }
+        '502':
+          description: BMC adapter connectivity check failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BMCCheckResponse' }
   /servers/{id}/metrics:
     get:
       summary: List recent metric samples.
@@ -1902,7 +2329,7 @@ paths:
         '404': { description: SSH access not found. }
     post:
       summary: Upsert SSH Agentless access configuration.
-      description: Requires an existing server that is not retired or scrapped. Host must be a valid hostname or IP; port must be 1-65535; auth_type must be password or private_key. In COLLECTOR_MODE=ssh and SSH_OPERATIONS_MODE=ssh the built-in Go SSH executor supports stored password and private_key credentials.
+      description: Requires an existing server that is not retired or scrapped. Host must be a valid hostname or IP; port must be 1-65535; auth_type must be password or private_key. In COLLECTOR_MODE=ssh and SSH_OPERATIONS_MODE=ssh the built-in Go SSH executor supports stored password and private_key credentials. SSH_HOST_KEY_POLICY supports insecure_ignore and known_hosts; production SSH modes require known_hosts with a readable SSH_KNOWN_HOSTS_PATH.
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       requestBody:
         required: true
@@ -1917,13 +2344,21 @@ paths:
   /servers/{id}/ssh/check:
     post:
       summary: Check SSH connectivity.
-      description: Server must exist and cannot be retired or scrapped. Uses stored SSHAccess credentials through the Go SSH executor, marks SSHAccess status ok or error, and writes an ssh.check audit record.
+      description: Server must exist and cannot be retired or scrapped. Uses stored SSHAccess credentials through the Go SSH executor, marks SSHAccess status ok or error, writes an ssh.check audit record, and returns non-secret proof fields for the command and SSH host key. When SSH_HOST_KEY_POLICY=known_hosts succeeds, proof.host_key_verified is true and proof.host_key_sha256 contains the verified host key fingerprint. Failed checks include proof.stage such as config, dial, handshake, session, or command when that stage can be identified.
       parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
       responses:
-        '200': { description: SSH check succeeded. }
+        '200':
+          description: SSH check succeeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SSHCheckResponse' }
         '404': { description: Server or SSH access not found. }
         '409': { description: Server is retired or scrapped. }
-        '502': { description: SSH connectivity check failed. }
+        '502':
+          description: SSH connectivity check failed; response may include partial proof fields such as host key policy/fingerprint when the handshake reached that step.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SSHCheckResponse' }
   /servers/{id}/collections:
     get:
       summary: List collection jobs for one server.
@@ -2042,11 +2477,11 @@ paths:
         '200': { description: Alert event array. }
   /ops/script-jobs:
     get:
-      summary: List simulated script jobs.
+      summary: List script jobs.
       responses:
         '200': { description: Script job array or paged result. }
     post:
-      summary: Create simulated script job.
+      summary: Create script job.
       description: >-
         Requires X-Confirm-Action: ops.script.create.
         Targets must exist, be unique, and not be retired or scrapped.
@@ -2212,14 +2647,15 @@ paths:
       summary: Export MVP backup JSON.
       description: >-
         Requires admin role and X-Confirm-Action: ops.backup.export.
-        Credentials, SSH access configs, BMC endpoints, boot events, and metadata tokens are intentionally excluded.
+        Credentials, SSH access configs, BMC endpoints, boot events, metadata tokens, and physical evidence records are intentionally excluded.
+        Lab validation run batches and per-check results are included because they are non-sensitive audit history.
       responses:
         '200': { description: Backup JSON payload. }
         '428': { $ref: '#/components/responses/ConfirmationRequired' }
   /ops/backup/validate:
     post:
       summary: Validate a backup JSON before restore.
-      description: Admin-only dry run. Checks backup schema, version, row format, key uniqueness, references, tenant server quota usage, network configuration validity and overlap, deployment networks, alert rules, and target database state, including sensitive and runtime-only tables, without writing data.
+      description: Admin-only dry run. Checks backup schema, version, row format, key uniqueness, references, lab validation run history references, tenant server quota usage, network configuration validity and overlap, deployment networks, alert rules, and target database state, including sensitive and runtime-only tables, without writing data.
       requestBody:
         required: true
         content:

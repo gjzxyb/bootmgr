@@ -1,0 +1,82 @@
+# Linux production example for real PXE/DHCP/TFTP validation.
+# Run with:
+#   docker compose --env-file ../.env.production -f docker-compose.production.yml up -d --build
+#
+# The backend uses host networking so DHCP/ProxyDHCP broadcast traffic and TFTP
+# can bind the deployment VLAN interface directly. Do not use this file on a
+# shared or unisolated network.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-baremetal} -d ${POSTGRES_DB:-baremetal}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  backend:
+    build: ../backend
+    env_file:
+      - ../.env.production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    network_mode: host
+    cap_add:
+      - NET_BIND_SERVICE
+    volumes:
+      - backend-data:/app/data
+      - ./tftp:/app/data/tftp
+      - ./certs:/etc/baremetal/certs:ro
+      - ./known_hosts:/etc/baremetal/known_hosts:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/readyz | grep -q '\"status\":\"ok\"'"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ../frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:?set VITE_API_BASE_URL}
+        VITE_API_ROOT_URL: ${VITE_API_ROOT_URL:?set VITE_API_ROOT_URL}
+        VITE_SHOW_DEMO_CREDENTIALS: ${VITE_SHOW_DEMO_CREDENTIALS:-false}
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "8081:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+volumes:
+  postgres-data:
+  backend-data:

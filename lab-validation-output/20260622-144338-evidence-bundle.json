@@ -1,0 +1,1498 @@
+{
+  "generated_at": "2026-06-22T06:43:39.0169102Z",
+  "run": {
+    "id": 3,
+    "status": "error",
+    "strict": true,
+    "check_pxe": true,
+    "check_bmc": true,
+    "check_ssh": true,
+    "limit": 20,
+    "server_ids": [
+      1,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "pxe_macs": [
+      "52:54:00:12:34:56",
+      "52:54:00:00:00:fe",
+      "52:54:00:ee:50:32",
+      "52:54:00:5a:9e:02",
+      "52:54:00:5a:9e:03",
+      "52:54:00:5a:9e:04",
+      "52:54:00:5a:9e:05"
+    ],
+    "pxe_arch": 9,
+    "ssh_probe_command": "printf 'ok '; hostname; id -un; uname -srm",
+    "requested_by": "admin@example.com",
+    "request_id": "physical-validation-20260622-144338",
+    "started_at": "2026-06-22T06:43:38.9729979Z",
+    "finished_at": "2026-06-22T06:43:38.9948632Z",
+    "results": 32,
+    "failures": 26,
+    "skipped": 5
+  },
+  "environment": {
+    "app_env": "development",
+    "boot_base_url": "http://localhost:8080",
+    "bmc_adapter": "simulated",
+    "collector_mode": "simulated",
+    "ssh_operations_mode": "simulated"
+  },
+  "checks": [
+    {
+      "name": "pxe_services",
+      "status": "warning",
+      "message": "PXE/DHCP/TFTP listeners are disabled"
+    },
+    {
+      "name": "deployment_network",
+      "status": "ok",
+      "message": "1 enabled deployment network(s)"
+    },
+    {
+      "name": "pxe_boot_events",
+      "status": "ok",
+      "message": "4 PXE boot event(s) recorded"
+    },
+    {
+      "name": "bmc_adapter",
+      "status": "warning",
+      "message": "BMC_ADAPTER=simulated; physical Redfish/IPMI checks are not active"
+    },
+    {
+      "name": "bmc_tooling",
+      "status": "ok",
+      "message": "BMC_ADAPTER does not require external tooling"
+    },
+    {
+      "name": "bmc_connectivity",
+      "status": "error",
+      "message": "1 BMC endpoint(s) are in error"
+    },
+    {
+      "name": "ssh_modes",
+      "status": "warning",
+      "message": "COLLECTOR_MODE and SSH_OPERATIONS_MODE are not using ssh"
+    },
+    {
+      "name": "ssh_known_hosts",
+      "status": "ok",
+      "message": "SSH known_hosts coverage is not required while SSH modes are simulated"
+    },
+    {
+      "name": "ssh_connectivity",
+      "status": "error",
+      "message": "2 SSH target(s) are in error"
+    },
+    {
+      "name": "physical_evidence",
+      "status": "warning",
+      "message": "no physical lab validation evidence has been recorded"
+    },
+    {
+      "name": "physical_targets",
+      "status": "warning",
+      "message": "7 physical validation target(s) found, none are full-chain ready"
+    },
+    {
+      "name": "lab_validation_runs",
+      "status": "error",
+      "message": "latest lab validation run 3 completed with errors"
+    },
+    {
+      "name": "strict_physical_targets",
+      "status": "error",
+      "message": "strict physical validation requires BMC_ADAPTER=redfish or ipmi"
+    },
+    {
+      "name": "pxe_http",
+      "status": "ok",
+      "message": "BOOT_BASE_URL /boot/ipxe returned a valid iPXE script"
+    },
+    {
+      "name": "pxe_dhcp",
+      "status": "warning",
+      "message": "BOOT_SERVICES_ENABLED=false; DHCP/ProxyDHCP listener is not expected to be active"
+    },
+    {
+      "name": "pxe_tftp",
+      "status": "warning",
+      "message": "BOOT_SERVICES_ENABLED=false; TFTP listener is not expected to be active"
+    },
+    {
+      "name": "pxe_boot_event",
+      "status": "error",
+      "message": "no PXE boot event recorded for 52:54:00:12:34:56"
+    },
+    {
+      "name": "pxe_boot_event",
+      "status": "error",
+      "message": "latest boot event for 52:54:00:00:00:fe was recorded via api_event; strict PXE validation requires http_ipxe or pxe_dhcp source"
+    },
+    {
+      "name": "pxe_boot_event",
+      "status": "error",
+      "message": "no PXE boot event recorded for 52:54:00:ee:50:32"
+    },
+    {
+      "name": "pxe_boot_event",
+      "status": "error",
+      "message": "no PXE boot event recorded for 52:54:00:5a:9e:02"
+    },
+    {
+      "name": "pxe_boot_event",
+      "status": "error",
+      "message": "no PXE boot event recorded for 52:54:00:5a:9e:03"
+    },
+    {
+      "name": "pxe_boot_event",
+      "status": "error",
+      "message": "no PXE boot event recorded for 52:54:00:5a:9e:04"
+    },
+    {
+      "name": "pxe_boot_event",
+      "status": "error",
+      "message": "no PXE boot event recorded for 52:54:00:5a:9e:05"
+    },
+    {
+      "name": "bmc",
+      "status": "warning",
+      "message": "BMC_ADAPTER=simulated; set redfish or ipmi before running physical validation"
+    },
+    {
+      "name": "bmc",
+      "status": "warning",
+      "message": "BMC_ADAPTER=simulated; set redfish or ipmi before running physical validation"
+    },
+    {
+      "name": "bmc",
+      "status": "warning",
+      "message": "BMC_ADAPTER=simulated; set redfish or ipmi before running physical validation"
+    },
+    {
+      "name": "bmc",
+      "status": "error",
+      "message": "BMC endpoint is not configured for requested server"
+    },
+    {
+      "name": "bmc",
+      "status": "error",
+      "message": "BMC endpoint is not configured for requested server"
+    },
+    {
+      "name": "bmc",
+      "status": "error",
+      "message": "BMC endpoint is not configured for requested server"
+    },
+    {
+      "name": "bmc",
+      "status": "error",
+      "message": "BMC endpoint is not configured for requested server"
+    },
+    {
+      "name": "ssh",
+      "status": "error",
+      "message": "SSH probe failed: exit_code=-1; stage=dial; host_key_policy=insecure_ignore; error=dial tcp 127.0.0.1:1: connectex: No connection could be made because the target machine actively refused it."
+    },
+    {
+      "name": "ssh",
+      "status": "error",
+      "message": "SSH probe failed: exit_code=-1; stage=dial; host_key_policy=insecure_ignore; error=dial tcp 127.0.0.1:1: connectex: No connection could be made because the target machine actively refused it."
+    },
+    {
+      "name": "ssh",
+      "status": "error",
+      "message": "SSH access is not configured for requested server"
+    },
+    {
+      "name": "ssh",
+      "status": "error",
+      "message": "SSH access is not configured for requested server"
+    },
+    {
+      "name": "ssh",
+      "status": "error",
+      "message": "SSH access is not configured for requested server"
+    },
+    {
+      "name": "ssh",
+      "status": "error",
+      "message": "SSH access is not configured for requested server"
+    },
+    {
+      "name": "ssh",
+      "status": "error",
+      "message": "SSH access is not configured for requested server"
+    },
+    {
+      "name": "full_chain_target",
+      "status": "error",
+      "message": "full-chain target is not ready: PXE boot event is not fresh; BMC adapter is simulated; SSH check is not fresh ok; full-chain evidence is not fresh ok"
+    },
+    {
+      "name": "full_chain_target",
+      "status": "error",
+      "message": "full-chain target is not ready: PXE boot event source is not HTTP iPXE or PXE DHCP; BMC adapter is simulated; SSH check is not fresh ok; full-chain evidence is not fresh ok"
+    },
+    {
+      "name": "full_chain_target",
+      "status": "error",
+      "message": "full-chain target is not ready: PXE boot event is not fresh; BMC adapter is simulated; SSH check is not fresh ok; full-chain evidence is not fresh ok"
+    },
+    {
+      "name": "full_chain_target",
+      "status": "error",
+      "message": "full-chain target is not ready: PXE boot event is not fresh; BMC adapter is simulated; SSH check is not fresh ok; full-chain evidence is not fresh ok"
+    },
+    {
+      "name": "full_chain_target",
+      "status": "error",
+      "message": "full-chain target is not ready: PXE boot event is not fresh; BMC adapter is simulated; SSH check is not fresh ok; full-chain evidence is not fresh ok"
+    },
+    {
+      "name": "full_chain_target",
+      "status": "error",
+      "message": "full-chain target is not ready: PXE boot event is not fresh; BMC adapter is simulated; SSH check is not fresh ok; full-chain evidence is not fresh ok"
+    },
+    {
+      "name": "full_chain_target",
+      "status": "error",
+      "message": "full-chain target is not ready: PXE boot event is not fresh; BMC adapter is simulated; SSH check is not fresh ok; full-chain evidence is not fresh ok"
+    }
+  ],
+  "results": [
+    {
+      "id": 40,
+      "run_id": 3,
+      "kind": "strict_physical_targets",
+      "server_id": 0,
+      "hostname": "Strict physical validation",
+      "asset_no": "system",
+      "status": "failed",
+      "message": "strict physical validation requires BMC_ADAPTER=redfish or ipmi",
+      "checked_at": "2026-06-22T06:43:38.9757015Z"
+    },
+    {
+      "id": 41,
+      "run_id": 3,
+      "kind": "pxe_http",
+      "server_id": 0,
+      "hostname": "PXE HTTP",
+      "asset_no": "system",
+      "status": "success",
+      "message": "BOOT_BASE_URL /boot/ipxe returned a valid iPXE script",
+      "checked_at": "2026-06-22T06:43:38.9757015Z"
+    },
+    {
+      "id": 42,
+      "run_id": 3,
+      "kind": "pxe_dhcp",
+      "server_id": 0,
+      "hostname": "PXE DHCP",
+      "asset_no": "system",
+      "status": "skipped",
+      "message": "BOOT_SERVICES_ENABLED=false; DHCP/ProxyDHCP listener is not expected to be active",
+      "checked_at": "2026-06-22T06:43:38.9811131Z"
+    },
+    {
+      "id": 43,
+      "run_id": 3,
+      "kind": "pxe_tftp",
+      "server_id": 0,
+      "hostname": "PXE TFTP",
+      "asset_no": "system",
+      "status": "skipped",
+      "message": "BOOT_SERVICES_ENABLED=false; TFTP listener is not expected to be active",
+      "checked_at": "2026-06-22T06:43:38.9811131Z"
+    },
+    {
+      "id": 44,
+      "run_id": 3,
+      "kind": "pxe_boot_event",
+      "server_id": 0,
+      "hostname": "PXE Boot Event",
+      "asset_no": "52:54:00:12:34:56",
+      "status": "failed",
+      "message": "no PXE boot event recorded for 52:54:00:12:34:56",
+      "checked_at": "2026-06-22T06:43:38.9811131Z"
+    },
+    {
+      "id": 45,
+      "run_id": 3,
+      "kind": "pxe_boot_event",
+      "server_id": 0,
+      "hostname": "PXE Boot Event",
+      "asset_no": "52:54:00:00:00:fe",
+      "status": "failed",
+      "message": "latest boot event for 52:54:00:00:00:fe was recorded via api_event; strict PXE validation requires http_ipxe or pxe_dhcp source",
+      "checked_at": "2026-06-22T06:43:38.9816308Z"
+    },
+    {
+      "id": 46,
+      "run_id": 3,
+      "kind": "pxe_boot_event",
+      "server_id": 0,
+      "hostname": "PXE Boot Event",
+      "asset_no": "52:54:00:ee:50:32",
+      "status": "failed",
+      "message": "no PXE boot event recorded for 52:54:00:ee:50:32",
+      "checked_at": "2026-06-22T06:43:38.9816308Z"
+    },
+    {
+      "id": 47,
+      "run_id": 3,
+      "kind": "pxe_boot_event",
+      "server_id": 0,
+      "hostname": "PXE Boot Event",
+      "asset_no": "52:54:00:5a:9e:02",
+      "status": "failed",
+      "message": "no PXE boot event recorded for 52:54:00:5a:9e:02",
+      "checked_at": "2026-06-22T06:43:38.9821477Z"
+    },
+    {
+      "id": 48,
+      "run_id": 3,
+      "kind": "pxe_boot_event",
+      "server_id": 0,
+      "hostname": "PXE Boot Event",
+      "asset_no": "52:54:00:5a:9e:03",
+      "status": "failed",
+      "message": "no PXE boot event recorded for 52:54:00:5a:9e:03",
+      "checked_at": "2026-06-22T06:43:38.9826604Z"
+    },
+    {
+      "id": 49,
+      "run_id": 3,
+      "kind": "pxe_boot_event",
+      "server_id": 0,
+      "hostname": "PXE Boot Event",
+      "asset_no": "52:54:00:5a:9e:04",
+      "status": "failed",
+      "message": "no PXE boot event recorded for 52:54:00:5a:9e:04",
+      "checked_at": "2026-06-22T06:43:38.9831734Z"
+    },
+    {
+      "id": 50,
+      "run_id": 3,
+      "kind": "pxe_boot_event",
+      "server_id": 0,
+      "hostname": "PXE Boot Event",
+      "asset_no": "52:54:00:5a:9e:05",
+      "status": "failed",
+      "message": "no PXE boot event recorded for 52:54:00:5a:9e:05",
+      "checked_at": "2026-06-22T06:43:38.9831734Z"
+    },
+    {
+      "id": 51,
+      "run_id": 3,
+      "kind": "bmc",
+      "server_id": 8,
+      "hostname": "bmc-stage-smoke-143155",
+      "asset_no": "BM-BMC-STAGE-SMOKE-143155",
+      "status": "skipped",
+      "message": "BMC_ADAPTER=simulated; set redfish or ipmi before running physical validation"
+    },
+    {
+      "id": 52,
+      "run_id": 3,
+      "kind": "bmc",
+      "server_id": 4,
+      "hostname": "bmc-proof-smoke-135032",
+      "asset_no": "BM-BMC-PROOF-SMOKE-135032",
+      "status": "skipped",
+      "message": "BMC_ADAPTER=simulated; set redfish or ipmi before running physical validation"
+    },
+    {
+      "id": 53,
+      "run_id": 3,
+      "kind": "bmc",
+      "server_id": 1,
+      "hostname": "demo-node-01",
+      "asset_no": "BM-0001",
+      "status": "skipped",
+      "message": "BMC_ADAPTER=simulated; set redfish or ipmi before running physical validation"
+    },
+    {
+      "id": 54,
+      "run_id": 3,
+      "kind": "bmc",
+      "server_id": 3,
+      "hostname": "discovered-52-54-00-00-00-fe",
+      "asset_no": "",
+      "status": "failed",
+      "message": "BMC endpoint is not configured for requested server"
+    },
+    {
+      "id": 55,
+      "run_id": 3,
+      "kind": "bmc",
+      "server_id": 5,
+      "hostname": "ssh-stage-smoke-141428",
+      "asset_no": "BM-SSH-STAGE-SMOKE-141428",
+      "status": "failed",
+      "message": "BMC endpoint is not configured for requested server"
+    },
+    {
+      "id": 56,
+      "run_id": 3,
+      "kind": "bmc",
+      "server_id": 6,
+      "hostname": "ssh-stage-smoke-141450",
+      "asset_no": "BM-SSH-STAGE-SMOKE-141450",
+      "status": "failed",
+      "message": "BMC endpoint is not configured for requested server"
+    },
+    {
+      "id": 57,
+      "run_id": 3,
+      "kind": "bmc",
+      "server_id": 7,
+      "hostname": "config-smoke-142107",
+      "asset_no": "BM-CONFIG-SMOKE-142107",
+      "status": "failed",
+      "message": "BMC endpoint is not configured for requested server"
+    },
+    {
+      "id": 58,
+      "run_id": 3,
+      "kind": "ssh",
+      "server_id": 5,
+      "hostname": "ssh-stage-smoke-141428",
+      "asset_no": "BM-SSH-STAGE-SMOKE-141428",
+      "status": "failed",
+      "message": "SSH probe failed: exit_code=-1; stage=dial; host_key_policy=insecure_ignore; error=dial tcp 127.0.0.1:1: connectex: No connection could be made because the target machine actively refused it.",
+      "details": {
+        "command": "printf 'ok '; hostname; id -un; uname -srm",
+        "error": "dial tcp 127.0.0.1:1: connectex: No connection could be made because the target machine actively refused it.",
+        "exit_code": -1,
+        "host_key_policy": "insecure_ignore",
+        "host_key_verified": false,
+        "stage": "dial"
+      },
+      "checked_at": "2026-06-22T06:43:38.9842587Z"
+    },
+    {
+      "id": 59,
+      "run_id": 3,
+      "kind": "ssh",
+      "server_id": 6,
+      "hostname": "ssh-stage-smoke-141450",
+      "asset_no": "BM-SSH-STAGE-SMOKE-141450",
+      "status": "failed",
+      "message": "SSH probe failed: exit_code=-1; stage=dial; host_key_policy=insecure_ignore; error=dial tcp 127.0.0.1:1: connectex: No connection could be made because the target machine actively refused it.",
+      "details": {
+        "command": "printf 'ok '; hostname; id -un; uname -srm",
+        "error": "dial tcp 127.0.0.1:1: connectex: No connection could be made because the target machine actively refused it.",
+        "exit_code": -1,
+        "host_key_policy": "insecure_ignore",
+        "host_key_verified": false,
+        "stage": "dial"
+      },
+      "checked_at": "2026-06-22T06:43:38.9868238Z"
+    },
+    {
+      "id": 60,
+      "run_id": 3,
+      "kind": "ssh",
+      "server_id": 1,
+      "hostname": "demo-node-01",
+      "asset_no": "BM-0001",
+      "status": "failed",
+      "message": "SSH access is not configured for requested server"
+    },
+    {
+      "id": 61,
+      "run_id": 3,
+      "kind": "ssh",
+      "server_id": 3,
+      "hostname": "discovered-52-54-00-00-00-fe",
+      "asset_no": "",
+      "status": "failed",
+      "message": "SSH access is not configured for requested server"
+    },
+    {
+      "id": 62,
+      "run_id": 3,
+      "kind": "ssh",
+      "server_id": 4,
+      "hostname": "bmc-proof-smoke-135032",
+      "asset_no": "BM-BMC-PROOF-SMOKE-135032",
+      "status": "failed",
+      "message": "SSH access is not configured for requested server"
+    },
+    {
+      "id": 63,
+      "run_id": 3,
+      "kind": "ssh",
+      "server_id": 7,
+      "hostname": "config-smoke-142107",
+      "asset_no": "BM-CONFIG-SMOKE-142107",
+      "status": "failed",
+      "message": "SSH access is not configured for requested server"
+    },
+    {
+      "id": 64,
+      "run_id": 3,
+      "kind": "ssh",
+      "server_id": 8,
+      "hostname": "bmc-stage-smoke-143155",
+      "asset_no": "BM-BMC-STAGE-SMOKE-143155",
+      "status": "failed",
+      "message": "SSH access is not configured for requested server"
+    },
+    {
+      "id": 65,
+      "run_id": 3,
+      "kind": "full_chain_target",
+      "server_id": 1,
+      "hostname": "demo-node-01",
+      "asset_no": "BM-0001",
+      "status": "failed",
+      "message": "full-chain target is not ready: PXE boot event is not fresh; BMC adapter is simulated; SSH check is not fresh ok; full-chain evidence is not fresh ok",
+      "checked_at": "2026-06-22T06:43:38.9899934Z"
+    },
+    {
+      "id": 66,
+      "run_id": 3,
+      "kind": "full_chain_target",
+      "server_id": 3,
+      "hostname": "discovered-52-54-00-00-00-fe",
+      "asset_no": "",
+      "status": "failed",
+      "message": "full-chain target is not ready: PXE boot event source is not HTTP iPXE or PXE DHCP; BMC adapter is simulated; SSH check is not fresh ok; full-chain evidence is not fresh ok",
+      "checked_at": "2026-06-22T06:43:38.9899934Z"
+    },
+    {
+      "id": 67,
+      "run_id": 3,
+      "kind": "full_chain_target",
+      "server_id": 4,
+      "hostname": "bmc-proof-smoke-135032",
+      "asset_no": "BM-BMC-PROOF-SMOKE-135032",
+      "status": "failed",
+      "message": "full-chain target is not ready: PXE boot event is not fresh; BMC adapter is simulated; SSH check is not fresh ok; full-chain evidence is not fresh ok",
+      "checked_at": "2026-06-22T06:43:38.9899934Z"
+    },
+    {
+      "id": 68,
+      "run_id": 3,
+      "kind": "full_chain_target",
+      "server_id": 5,
+      "hostname": "ssh-stage-smoke-141428",
+      "asset_no": "BM-SSH-STAGE-SMOKE-141428",
+      "status": "failed",
+      "message": "full-chain target is not ready: PXE boot event is not fresh; BMC adapter is simulated; SSH check is not fresh ok; full-chain evidence is not fresh ok",
+      "checked_at": "2026-06-22T06:43:38.9899934Z"
+    },
+    {
+      "id": 69,
+      "run_id": 3,
+      "kind": "full_chain_target",
+      "server_id": 6,
+      "hostname": "ssh-stage-smoke-141450",
+      "asset_no": "BM-SSH-STAGE-SMOKE-141450",
+      "status": "failed",
+      "message": "full-chain target is not ready: PXE boot event is not fresh; BMC adapter is simulated; SSH check is not fresh ok; full-chain evidence is not fresh ok",
+      "checked_at": "2026-06-22T06:43:38.9899934Z"
+    },
+    {
+      "id": 70,
+      "run_id": 3,
+      "kind": "full_chain_target",
+      "server_id": 7,
+      "hostname": "config-smoke-142107",
+      "asset_no": "BM-CONFIG-SMOKE-142107",
+      "status": "failed",
+      "message": "full-chain target is not ready: PXE boot event is not fresh; BMC adapter is simulated; SSH check is not fresh ok; full-chain evidence is not fresh ok",
+      "checked_at": "2026-06-22T06:43:38.9899934Z"
+    },
+    {
+      "id": 71,
+      "run_id": 3,
+      "kind": "full_chain_target",
+      "server_id": 8,
+      "hostname": "bmc-stage-smoke-143155",
+      "asset_no": "BM-BMC-STAGE-SMOKE-143155",
+      "status": "failed",
+      "message": "full-chain target is not ready: PXE boot event is not fresh; BMC adapter is simulated; SSH check is not fresh ok; full-chain evidence is not fresh ok",
+      "checked_at": "2026-06-22T06:43:38.9899934Z"
+    }
+  ],
+  "boot_events": [
+    {
+      "id": 4,
+      "mac": "52:54:00:00:00:fe",
+      "architecture": "x86_64",
+      "firmware": "uefi",
+      "remote_addr": "127.0.0.1",
+      "source": "api_event",
+      "server_id": 3,
+      "created_at": "2026-06-22T14:43:38.97854+08:00"
+    },
+    {
+      "id": 3,
+      "mac": "52:54:00:00:00:fe",
+      "architecture": "x86_64",
+      "firmware": "uefi",
+      "remote_addr": "127.0.0.1",
+      "source": "api_event",
+      "server_id": 3,
+      "created_at": "2026-06-22T14:40:36.2482722+08:00"
+    },
+    {
+      "id": 2,
+      "mac": "52:54:00:00:00:fe",
+      "architecture": "x86_64",
+      "firmware": "uefi",
+      "remote_addr": "127.0.0.1",
+      "source": "api_event",
+      "server_id": 3,
+      "created_at": "2026-06-22T13:34:43.7168126+08:00"
+    },
+    {
+      "id": 1,
+      "mac": "52:54:00:00:00:fe",
+      "architecture": "x86_64",
+      "firmware": "uefi",
+      "remote_addr": "127.0.0.1",
+      "source": "",
+      "server_id": 3,
+      "created_at": "2026-06-18T15:46:17.679868+08:00"
+    }
+  ],
+  "bmc_endpoints": [
+    {
+      "server_id": 8,
+      "hostname": "bmc-stage-smoke-143155",
+      "asset_no": "BM-BMC-STAGE-SMOKE-143155",
+      "type": "redfish",
+      "protocol": "http",
+      "endpoint": "http://127.0.0.1:18080",
+      "status": "error",
+      "power_state": "off",
+      "last_checked_at": "2026-06-22T06:31:55.5572045Z",
+      "updated_at": "2026-06-22T14:31:55.5572045+08:00"
+    },
+    {
+      "server_id": 4,
+      "hostname": "bmc-proof-smoke-135032",
+      "asset_no": "BM-BMC-PROOF-SMOKE-135032",
+      "type": "redfish",
+      "protocol": "https",
+      "endpoint": "https://bmc-smoke.test",
+      "status": "ok",
+      "power_state": "off",
+      "last_checked_at": "2026-06-22T05:51:31.65455Z",
+      "updated_at": "2026-06-22T13:51:31.655052+08:00"
+    },
+    {
+      "server_id": 1,
+      "hostname": "demo-node-01",
+      "asset_no": "BM-0001",
+      "type": "ipmi",
+      "protocol": "ipmi",
+      "endpoint": "192.0.2.88:623",
+      "status": "ok",
+      "power_state": "off",
+      "last_checked_at": "2026-06-17T18:54:56.9096598Z",
+      "updated_at": "2026-06-18T02:54:56.9096598+08:00"
+    }
+  ],
+  "ssh_accesses": [
+    {
+      "server_id": 6,
+      "hostname": "ssh-stage-smoke-141450",
+      "asset_no": "BM-SSH-STAGE-SMOKE-141450",
+      "host": "127.0.0.1",
+      "port": 1,
+      "username": "root",
+      "auth_type": "password",
+      "status": "error",
+      "last_checked_at": "2026-06-22T06:43:38.9868238Z",
+      "updated_at": "2026-06-22T14:43:38.9868238+08:00"
+    },
+    {
+      "server_id": 5,
+      "hostname": "ssh-stage-smoke-141428",
+      "asset_no": "BM-SSH-STAGE-SMOKE-141428",
+      "host": "127.0.0.1",
+      "port": 1,
+      "username": "root",
+      "auth_type": "password",
+      "status": "error",
+      "last_checked_at": "2026-06-22T06:43:38.9842587Z",
+      "updated_at": "2026-06-22T14:43:38.9847759+08:00"
+    }
+  ],
+  "terminal_sessions": [
+    {
+      "id": 1,
+      "server_id": 1,
+      "hostname": "demo-node-01",
+      "asset_no": "BM-0001",
+      "status": "closed",
+      "mode": "simulated",
+      "requested_by": "admin@example.com",
+      "reason": "break-glass inspection",
+      "transcript": "Simulated terminal session opened for server 1 (demo-node-01).\nNo real SSH connection is established in simulated mode.\nTerminal session closed by operator.",
+      "opened_at": "2026-06-18T04:34:31.3763891Z",
+      "closed_at": "2026-06-18T04:34:41.1061736Z",
+      "created_at": "2026-06-18T12:34:31.3770681+08:00"
+    }
+  ],
+  "script_executions": [],
+  "log_events": [
+    {
+      "id": 11,
+      "server_id": 1,
+      "hostname": "demo-node-01",
+      "asset_no": "BM-0001",
+      "source": "metadata",
+      "level": "info",
+      "message": "metadata access endpoint=ssh-keys mode=by-ip client_ip=::1",
+      "trace_id": "c142b6ff706be3b7413b1319f4f05aa3",
+      "occurred_at": "2026-06-17T21:31:50.1517657Z",
+      "created_at": "2026-06-18T05:31:50.1517657+08:00"
+    },
+    {
+      "id": 10,
+      "server_id": 1,
+      "hostname": "demo-node-01",
+      "asset_no": "BM-0001",
+      "source": "metadata",
+      "level": "info",
+      "message": "metadata access endpoint=hostname mode=by-mac client_ip=::1",
+      "trace_id": "fa2b44483f1d7833546a8d5188388c98",
+      "occurred_at": "2026-06-17T21:31:50.1420623Z",
+      "created_at": "2026-06-18T05:31:50.1420623+08:00"
+    },
+    {
+      "id": 9,
+      "server_id": 1,
+      "hostname": "demo-node-01",
+      "asset_no": "BM-0001",
+      "source": "metadata",
+      "level": "info",
+      "message": "metadata access endpoint=ssh-keys mode=by-mac client_ip=::1",
+      "trace_id": "e0e1aeda246f752b3738949911c2c905",
+      "occurred_at": "2026-06-17T21:25:53.4755439Z",
+      "created_at": "2026-06-18T05:25:53.4755439+08:00"
+    },
+    {
+      "id": 8,
+      "server_id": 1,
+      "hostname": "demo-node-01",
+      "asset_no": "BM-0001",
+      "source": "metadata",
+      "level": "info",
+      "message": "metadata access endpoint=network mode=by-ip client_ip=::1",
+      "trace_id": "38250aa4dca62ae8618b9e8aa9d64383",
+      "occurred_at": "2026-06-17T21:25:53.4583069Z",
+      "created_at": "2026-06-18T05:25:53.4583069+08:00"
+    },
+    {
+      "id": 7,
+      "server_id": 1,
+      "hostname": "demo-node-01",
+      "asset_no": "BM-0001",
+      "source": "metadata",
+      "level": "info",
+      "message": "metadata access endpoint=hostname mode=by-mac client_ip=::1",
+      "trace_id": "2b22b33e0f97e405f052c4943e77e487",
+      "occurred_at": "2026-06-17T21:25:53.4098934Z",
+      "created_at": "2026-06-18T05:25:53.4098934+08:00"
+    },
+    {
+      "id": 4,
+      "server_id": 1,
+      "hostname": "demo-node-01",
+      "asset_no": "BM-0001",
+      "source": "hardware",
+      "level": "info",
+      "message": "Simulated hardware log collection captured SMART, PCI, and inventory summaries for demo-node-01 by admin@example.com",
+      "trace_id": "logs-smoke-002",
+      "occurred_at": "2026-06-17T18:14:08.5510392Z",
+      "created_at": "2026-06-18T02:14:08.5566691+08:00"
+    },
+    {
+      "id": 3,
+      "server_id": 1,
+      "hostname": "demo-node-01",
+      "asset_no": "BM-0001",
+      "source": "dmesg",
+      "level": "warning",
+      "message": "Simulated dmesg collection captured kernel, driver, and boot diagnostics for demo-node-01 by admin@example.com",
+      "trace_id": "logs-smoke-002",
+      "occurred_at": "2026-06-17T18:14:08.5510392Z",
+      "created_at": "2026-06-18T02:14:08.5546197+08:00"
+    },
+    {
+      "id": 2,
+      "server_id": 1,
+      "hostname": "demo-node-01",
+      "asset_no": "BM-0001",
+      "source": "syslog",
+      "level": "info",
+      "message": "Simulated syslog collection captured service and auth summaries for demo-node-01 by admin@example.com",
+      "trace_id": "logs-smoke-002",
+      "occurred_at": "2026-06-17T18:14:08.5510392Z",
+      "created_at": "2026-06-18T02:14:08.5510392+08:00"
+    },
+    {
+      "id": 1,
+      "server_id": 1,
+      "hostname": "demo-node-01",
+      "asset_no": "BM-0001",
+      "source": "agentless",
+      "level": "warning",
+      "message": "Demo kernel disk latency spike detected",
+      "trace_id": "demo-log-0001",
+      "occurred_at": "2026-06-09T02:29:13.5863622Z",
+      "created_at": "2026-06-09T10:29:13.6104002+08:00"
+    }
+  ],
+  "recent_evidence": [],
+  "targets": [
+    {
+      "server_id": 1,
+      "hostname": "demo-node-01",
+      "asset_no": "BM-0001",
+      "primary_mac": "52:54:00:12:34:56",
+      "server_status": "running",
+      "pxe_status": "missing",
+      "bmc_status": "adapter_mismatch",
+      "bmc_checked_at": "2026-06-17T18:54:56.9096598Z",
+      "ssh_status": "missing",
+      "evidence_status": "missing",
+      "evidence_kinds": [],
+      "latest_run_id": 3,
+      "latest_run_status": "error",
+      "latest_run_strict": true,
+      "latest_run_kind": "full_chain_target",
+      "latest_run_result_status": "failed",
+      "latest_run_at": "2026-06-22T06:43:38.9899934Z",
+      "full_chain_ready": false,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "server_id": 3,
+      "hostname": "discovered-52-54-00-00-00-fe",
+      "asset_no": "",
+      "primary_mac": "52:54:00:00:00:fe",
+      "server_status": "discovered",
+      "pxe_status": "api_only",
+      "pxe_boot_event_id": 4,
+      "pxe_boot_at": "2026-06-22T14:43:38.97854+08:00",
+      "bmc_status": "missing",
+      "ssh_status": "missing",
+      "evidence_status": "missing",
+      "evidence_kinds": [],
+      "latest_run_id": 3,
+      "latest_run_status": "error",
+      "latest_run_strict": true,
+      "latest_run_kind": "full_chain_target",
+      "latest_run_result_status": "failed",
+      "latest_run_at": "2026-06-22T06:43:38.9899934Z",
+      "full_chain_ready": false,
+      "blocking_reasons": [
+        "PXE boot event source is not HTTP iPXE or PXE DHCP",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "server_id": 4,
+      "hostname": "bmc-proof-smoke-135032",
+      "asset_no": "BM-BMC-PROOF-SMOKE-135032",
+      "primary_mac": "52:54:00:ee:50:32",
+      "server_status": "ready",
+      "pxe_status": "missing",
+      "bmc_status": "adapter_mismatch",
+      "bmc_checked_at": "2026-06-22T05:51:31.65455Z",
+      "ssh_status": "missing",
+      "evidence_status": "missing",
+      "evidence_kinds": [],
+      "latest_run_id": 3,
+      "latest_run_status": "error",
+      "latest_run_strict": true,
+      "latest_run_kind": "full_chain_target",
+      "latest_run_result_status": "failed",
+      "latest_run_at": "2026-06-22T06:43:38.9899934Z",
+      "full_chain_ready": false,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "server_id": 5,
+      "hostname": "ssh-stage-smoke-141428",
+      "asset_no": "BM-SSH-STAGE-SMOKE-141428",
+      "primary_mac": "52:54:00:5a:9e:02",
+      "server_status": "ready",
+      "pxe_status": "missing",
+      "bmc_status": "missing",
+      "ssh_status": "error",
+      "ssh_checked_at": "2026-06-22T06:43:38.9842587Z",
+      "evidence_status": "missing",
+      "evidence_kinds": [],
+      "latest_run_id": 3,
+      "latest_run_status": "error",
+      "latest_run_strict": true,
+      "latest_run_kind": "full_chain_target",
+      "latest_run_result_status": "failed",
+      "latest_run_at": "2026-06-22T06:43:38.9899934Z",
+      "full_chain_ready": false,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "server_id": 6,
+      "hostname": "ssh-stage-smoke-141450",
+      "asset_no": "BM-SSH-STAGE-SMOKE-141450",
+      "primary_mac": "52:54:00:5a:9e:03",
+      "server_status": "ready",
+      "pxe_status": "missing",
+      "bmc_status": "missing",
+      "ssh_status": "error",
+      "ssh_checked_at": "2026-06-22T06:43:38.9868238Z",
+      "evidence_status": "missing",
+      "evidence_kinds": [],
+      "latest_run_id": 3,
+      "latest_run_status": "error",
+      "latest_run_strict": true,
+      "latest_run_kind": "full_chain_target",
+      "latest_run_result_status": "failed",
+      "latest_run_at": "2026-06-22T06:43:38.9899934Z",
+      "full_chain_ready": false,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "server_id": 7,
+      "hostname": "config-smoke-142107",
+      "asset_no": "BM-CONFIG-SMOKE-142107",
+      "primary_mac": "52:54:00:5a:9e:04",
+      "server_status": "ready",
+      "pxe_status": "missing",
+      "bmc_status": "missing",
+      "ssh_status": "missing",
+      "evidence_status": "missing",
+      "evidence_kinds": [],
+      "latest_run_id": 3,
+      "latest_run_status": "error",
+      "latest_run_strict": true,
+      "latest_run_kind": "full_chain_target",
+      "latest_run_result_status": "failed",
+      "latest_run_at": "2026-06-22T06:43:38.9899934Z",
+      "full_chain_ready": false,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "server_id": 8,
+      "hostname": "bmc-stage-smoke-143155",
+      "asset_no": "BM-BMC-STAGE-SMOKE-143155",
+      "primary_mac": "52:54:00:5a:9e:05",
+      "server_status": "ready",
+      "pxe_status": "missing",
+      "bmc_status": "error",
+      "bmc_checked_at": "2026-06-22T06:31:55.5572045Z",
+      "ssh_status": "missing",
+      "evidence_status": "missing",
+      "evidence_kinds": [],
+      "latest_run_id": 3,
+      "latest_run_status": "error",
+      "latest_run_strict": true,
+      "latest_run_kind": "full_chain_target",
+      "latest_run_result_status": "failed",
+      "latest_run_at": "2026-06-22T06:43:38.9899934Z",
+      "full_chain_ready": false,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    }
+  ],
+  "config_issues": [
+    {
+      "level": "warning",
+      "key": "JWT_SECRET",
+      "message": "JWT_SECRET must be changed from the development default and contain at least 32 characters"
+    },
+    {
+      "level": "warning",
+      "key": "CREDENTIAL_KEY",
+      "message": "CREDENTIAL_KEY must be changed from the development default and contain at least 32 characters"
+    },
+    {
+      "level": "warning",
+      "key": "ADMIN_PASSWORD",
+      "message": "ADMIN_PASSWORD must be changed from the development default"
+    }
+  ],
+  "pxe_runtime_issues": [
+    {
+      "level": "warning",
+      "key": "BOOT_SERVICES_ENABLED",
+      "message": "real PXE/DHCP/TFTP listeners are disabled"
+    }
+  ],
+  "notes": [
+    "strict mode was enabled for this run",
+    "run status is not ok; inspect failed and skipped results before accepting physical validation",
+    "BMC_ADAPTER=simulated cannot prove physical Redfish/IPMI validation"
+  ],
+  "operator_checklist": [
+    {
+      "subject": "BM-0001",
+      "step": "pxe_boot_event",
+      "status": "pending",
+      "message": "waiting for physical PXE client boot event from http_ipxe or pxe_dhcp",
+      "next_action": "boot the physical server from the isolated PXE network, then rerun strict lab validation with this server_id and pxe_macs",
+      "run_id": 3,
+      "server_id": 1,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-0001",
+      "step": "bmc_identity",
+      "status": "pending",
+      "message": "waiting for physical Redfish/IPMI identity probe",
+      "next_action": "configure a matching BMC endpoint, run strict lab validation, and verify BMC result details contain non-secret identity fields",
+      "run_id": 3,
+      "server_id": 1,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-0001",
+      "step": "ssh_command",
+      "status": "error",
+      "message": "SSH check failed in this run: SSH access is not configured for requested server",
+      "next_action": "configure SSH access with SSH_HOST_KEY_POLICY=known_hosts, run strict lab validation, and verify SSH result details include host key proof, command, exit_code, and stdout",
+      "run_id": 3,
+      "server_id": 1,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-0001",
+      "step": "full_chain_evidence",
+      "status": "warning",
+      "message": "full-chain physical validation is not ready for this target",
+      "next_action": "record ok full evidence with this run_id, server_id, and boot_event_id after PXE, BMC, and SSH target results are successful",
+      "run_id": 3,
+      "server_id": 1,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "discovered-52-54-00-00-00-fe",
+      "step": "pxe_boot_event",
+      "status": "pending",
+      "message": "waiting for physical PXE client boot event from http_ipxe or pxe_dhcp",
+      "next_action": "boot the physical server from the isolated PXE network, then rerun strict lab validation with this server_id and pxe_macs",
+      "run_id": 3,
+      "server_id": 3,
+      "boot_event_id": 4,
+      "blocking_reasons": [
+        "PXE boot event source is not HTTP iPXE or PXE DHCP",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "discovered-52-54-00-00-00-fe",
+      "step": "bmc_identity",
+      "status": "error",
+      "message": "BMC check failed in this run: BMC endpoint is not configured for requested server",
+      "next_action": "configure a matching BMC endpoint, run strict lab validation, and verify BMC result details contain non-secret identity fields",
+      "run_id": 3,
+      "server_id": 3,
+      "blocking_reasons": [
+        "PXE boot event source is not HTTP iPXE or PXE DHCP",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "discovered-52-54-00-00-00-fe",
+      "step": "ssh_command",
+      "status": "error",
+      "message": "SSH check failed in this run: SSH access is not configured for requested server",
+      "next_action": "configure SSH access with SSH_HOST_KEY_POLICY=known_hosts, run strict lab validation, and verify SSH result details include host key proof, command, exit_code, and stdout",
+      "run_id": 3,
+      "server_id": 3,
+      "blocking_reasons": [
+        "PXE boot event source is not HTTP iPXE or PXE DHCP",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "discovered-52-54-00-00-00-fe",
+      "step": "full_chain_evidence",
+      "status": "warning",
+      "message": "full-chain physical validation is not ready for this target",
+      "next_action": "record ok full evidence with this run_id, server_id, and boot_event_id after PXE, BMC, and SSH target results are successful",
+      "run_id": 3,
+      "server_id": 3,
+      "boot_event_id": 4,
+      "blocking_reasons": [
+        "PXE boot event source is not HTTP iPXE or PXE DHCP",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-BMC-PROOF-SMOKE-135032",
+      "step": "pxe_boot_event",
+      "status": "pending",
+      "message": "waiting for physical PXE client boot event from http_ipxe or pxe_dhcp",
+      "next_action": "boot the physical server from the isolated PXE network, then rerun strict lab validation with this server_id and pxe_macs",
+      "run_id": 3,
+      "server_id": 4,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-BMC-PROOF-SMOKE-135032",
+      "step": "bmc_identity",
+      "status": "pending",
+      "message": "waiting for physical Redfish/IPMI identity probe",
+      "next_action": "configure a matching BMC endpoint, run strict lab validation, and verify BMC result details contain non-secret identity fields",
+      "run_id": 3,
+      "server_id": 4,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-BMC-PROOF-SMOKE-135032",
+      "step": "ssh_command",
+      "status": "error",
+      "message": "SSH check failed in this run: SSH access is not configured for requested server",
+      "next_action": "configure SSH access with SSH_HOST_KEY_POLICY=known_hosts, run strict lab validation, and verify SSH result details include host key proof, command, exit_code, and stdout",
+      "run_id": 3,
+      "server_id": 4,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-BMC-PROOF-SMOKE-135032",
+      "step": "full_chain_evidence",
+      "status": "warning",
+      "message": "full-chain physical validation is not ready for this target",
+      "next_action": "record ok full evidence with this run_id, server_id, and boot_event_id after PXE, BMC, and SSH target results are successful",
+      "run_id": 3,
+      "server_id": 4,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-SSH-STAGE-SMOKE-141428",
+      "step": "pxe_boot_event",
+      "status": "pending",
+      "message": "waiting for physical PXE client boot event from http_ipxe or pxe_dhcp",
+      "next_action": "boot the physical server from the isolated PXE network, then rerun strict lab validation with this server_id and pxe_macs",
+      "run_id": 3,
+      "server_id": 5,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-SSH-STAGE-SMOKE-141428",
+      "step": "bmc_identity",
+      "status": "error",
+      "message": "BMC check failed in this run: BMC endpoint is not configured for requested server",
+      "next_action": "configure a matching BMC endpoint, run strict lab validation, and verify BMC result details contain non-secret identity fields",
+      "run_id": 3,
+      "server_id": 5,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-SSH-STAGE-SMOKE-141428",
+      "step": "ssh_command",
+      "status": "error",
+      "message": "SSH check failed in this run: SSH probe failed: exit_code=-1; stage=dial; host_key_policy=insecure_ignore; error=dial tcp 127.0.0.1:1: connectex: No connection could be made because the target machine actively refused it.",
+      "next_action": "configure SSH access with SSH_HOST_KEY_POLICY=known_hosts, run strict lab validation, and verify SSH result details include host key proof, command, exit_code, and stdout",
+      "run_id": 3,
+      "server_id": 5,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-SSH-STAGE-SMOKE-141428",
+      "step": "full_chain_evidence",
+      "status": "warning",
+      "message": "full-chain physical validation is not ready for this target",
+      "next_action": "record ok full evidence with this run_id, server_id, and boot_event_id after PXE, BMC, and SSH target results are successful",
+      "run_id": 3,
+      "server_id": 5,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-SSH-STAGE-SMOKE-141450",
+      "step": "pxe_boot_event",
+      "status": "pending",
+      "message": "waiting for physical PXE client boot event from http_ipxe or pxe_dhcp",
+      "next_action": "boot the physical server from the isolated PXE network, then rerun strict lab validation with this server_id and pxe_macs",
+      "run_id": 3,
+      "server_id": 6,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-SSH-STAGE-SMOKE-141450",
+      "step": "bmc_identity",
+      "status": "error",
+      "message": "BMC check failed in this run: BMC endpoint is not configured for requested server",
+      "next_action": "configure a matching BMC endpoint, run strict lab validation, and verify BMC result details contain non-secret identity fields",
+      "run_id": 3,
+      "server_id": 6,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-SSH-STAGE-SMOKE-141450",
+      "step": "ssh_command",
+      "status": "error",
+      "message": "SSH check failed in this run: SSH probe failed: exit_code=-1; stage=dial; host_key_policy=insecure_ignore; error=dial tcp 127.0.0.1:1: connectex: No connection could be made because the target machine actively refused it.",
+      "next_action": "configure SSH access with SSH_HOST_KEY_POLICY=known_hosts, run strict lab validation, and verify SSH result details include host key proof, command, exit_code, and stdout",
+      "run_id": 3,
+      "server_id": 6,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-SSH-STAGE-SMOKE-141450",
+      "step": "full_chain_evidence",
+      "status": "warning",
+      "message": "full-chain physical validation is not ready for this target",
+      "next_action": "record ok full evidence with this run_id, server_id, and boot_event_id after PXE, BMC, and SSH target results are successful",
+      "run_id": 3,
+      "server_id": 6,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-CONFIG-SMOKE-142107",
+      "step": "pxe_boot_event",
+      "status": "pending",
+      "message": "waiting for physical PXE client boot event from http_ipxe or pxe_dhcp",
+      "next_action": "boot the physical server from the isolated PXE network, then rerun strict lab validation with this server_id and pxe_macs",
+      "run_id": 3,
+      "server_id": 7,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-CONFIG-SMOKE-142107",
+      "step": "bmc_identity",
+      "status": "error",
+      "message": "BMC check failed in this run: BMC endpoint is not configured for requested server",
+      "next_action": "configure a matching BMC endpoint, run strict lab validation, and verify BMC result details contain non-secret identity fields",
+      "run_id": 3,
+      "server_id": 7,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-CONFIG-SMOKE-142107",
+      "step": "ssh_command",
+      "status": "error",
+      "message": "SSH check failed in this run: SSH access is not configured for requested server",
+      "next_action": "configure SSH access with SSH_HOST_KEY_POLICY=known_hosts, run strict lab validation, and verify SSH result details include host key proof, command, exit_code, and stdout",
+      "run_id": 3,
+      "server_id": 7,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-CONFIG-SMOKE-142107",
+      "step": "full_chain_evidence",
+      "status": "warning",
+      "message": "full-chain physical validation is not ready for this target",
+      "next_action": "record ok full evidence with this run_id, server_id, and boot_event_id after PXE, BMC, and SSH target results are successful",
+      "run_id": 3,
+      "server_id": 7,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-BMC-STAGE-SMOKE-143155",
+      "step": "pxe_boot_event",
+      "status": "pending",
+      "message": "waiting for physical PXE client boot event from http_ipxe or pxe_dhcp",
+      "next_action": "boot the physical server from the isolated PXE network, then rerun strict lab validation with this server_id and pxe_macs",
+      "run_id": 3,
+      "server_id": 8,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-BMC-STAGE-SMOKE-143155",
+      "step": "bmc_identity",
+      "status": "error",
+      "message": "BMC check is failing for this target",
+      "next_action": "configure a matching BMC endpoint, run strict lab validation, and verify BMC result details contain non-secret identity fields",
+      "run_id": 3,
+      "server_id": 8,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-BMC-STAGE-SMOKE-143155",
+      "step": "ssh_command",
+      "status": "error",
+      "message": "SSH check failed in this run: SSH access is not configured for requested server",
+      "next_action": "configure SSH access with SSH_HOST_KEY_POLICY=known_hosts, run strict lab validation, and verify SSH result details include host key proof, command, exit_code, and stdout",
+      "run_id": 3,
+      "server_id": 8,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    },
+    {
+      "subject": "BM-BMC-STAGE-SMOKE-143155",
+      "step": "full_chain_evidence",
+      "status": "warning",
+      "message": "full-chain physical validation is not ready for this target",
+      "next_action": "record ok full evidence with this run_id, server_id, and boot_event_id after PXE, BMC, and SSH target results are successful",
+      "run_id": 3,
+      "server_id": 8,
+      "blocking_reasons": [
+        "PXE boot event is not fresh",
+        "BMC adapter is simulated",
+        "SSH check is not fresh ok",
+        "full-chain evidence is not fresh ok"
+      ]
+    }
+  ],
+  "evidence_candidates": []
+}

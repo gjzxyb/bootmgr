@@ -15,19 +15,30 @@ import (
 	"baremetal-platform/backend/internal/models"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 	"gorm.io/gorm"
 )
 
 type RemoteCommandResult struct {
-	Stdout   string
-	Stderr   string
-	ExitCode int
+	Stdout           string
+	Stderr           string
+	ExitCode         int
+	FailureStage     string
+	HostKeyPolicy    string
+	HostKeyVerified  bool
+	HostKeyAlgorithm string
+	HostKeySHA256    string
+	HostKeyHost      string
+	HostKeyRemote    string
 }
+
+const DefaultSSHCheckCommand = "printf 'ok '; hostname; id -un; uname -srm"
 
 type SSHCommandExecutor struct {
 	db             *gorm.DB
 	credentials    CredentialService
 	hostKeyPolicy  string
+	knownHostsPath string
 	connectTimeout time.Duration
 }
 
@@ -40,6 +51,7 @@ func NewSSHCommandExecutor(db *gorm.DB, cfg config.Config) SSHCommandExecutor {
 		db:             db,
 		credentials:    NewCredentialService(db, cfg),
 		hostKeyPolicy:  strings.ToLower(strings.TrimSpace(cfg.SSHHostKeyPolicy)),
+		knownHostsPath: strings.TrimSpace(cfg.SSHKnownHostsPath),
 		connectTimeout: timeout,
 	}
 }
@@ -55,7 +67,7 @@ func (e SSHCommandExecutor) TargetForServer(serverID uint) (models.SSHAccess, er
 func (e SSHCommandExecutor) RunForServer(ctx context.Context, serverID uint, command string) (RemoteCommandResult, error) {
 	target, err := e.TargetForServer(serverID)
 	if err != nil {
-		return RemoteCommandResult{ExitCode: -1}, err
+		return e.failureResult("lookup", nil), err
 	}
 	return e.Run(ctx, target, command)
 }
@@ -63,36 +75,44 @@ func (e SSHCommandExecutor) RunForServer(ctx context.Context, serverID uint, com
 func (e SSHCommandExecutor) RunScriptForServer(ctx context.Context, serverID uint, script string) (RemoteCommandResult, error) {
 	target, err := e.TargetForServer(serverID)
 	if err != nil {
-		return RemoteCommandResult{ExitCode: -1}, err
+		return e.failureResult("lookup", nil), err
 	}
 	return e.RunScript(ctx, target, script)
 }
 
 func (e SSHCommandExecutor) Check(ctx context.Context, serverID uint) (models.SSHAccess, error) {
+	target, _, err := e.CheckWithCommand(ctx, serverID, DefaultSSHCheckCommand)
+	return target, err
+}
+
+func (e SSHCommandExecutor) CheckWithCommand(ctx context.Context, serverID uint, command string) (models.SSHAccess, RemoteCommandResult, error) {
 	target, err := e.TargetForServer(serverID)
 	if err != nil {
-		return target, err
+		return target, e.failureResult("lookup", nil), err
 	}
-	result, err := e.Run(ctx, target, "printf 'ok '; hostname")
+	if strings.TrimSpace(command) == "" {
+		command = DefaultSSHCheckCommand
+	}
+	result, err := e.Run(ctx, target, command)
 	now := time.Now().UTC()
 	if err != nil || result.ExitCode != 0 {
 		_ = e.db.Model(&target).Updates(map[string]any{"status": "error", "last_checked_at": now}).Error
 		target.Status = "error"
 		target.LastCheckedAt = &now
 		if err != nil {
-			return target, err
+			return target, result, err
 		}
-		return target, fmt.Errorf("ssh check command exited with code %d: %s", result.ExitCode, strings.TrimSpace(result.Stderr))
+		return target, result, fmt.Errorf("ssh check command exited with code %d: %s", result.ExitCode, strings.TrimSpace(result.Stderr))
 	}
 	_ = e.db.Model(&target).Updates(map[string]any{"status": "ok", "last_checked_at": now}).Error
 	target.Status = "ok"
 	target.LastCheckedAt = &now
-	return target, nil
+	return target, result, nil
 }
 
 func (e SSHCommandExecutor) Run(ctx context.Context, target models.SSHAccess, command string) (RemoteCommandResult, error) {
 	if strings.TrimSpace(command) == "" {
-		return RemoteCommandResult{ExitCode: -1}, errors.New("ssh command cannot be empty")
+		return e.failureResult("request", nil), errors.New("ssh command cannot be empty")
 	}
 	return e.runSession(ctx, target, func(session *ssh.Session, stdout, stderr *bytes.Buffer) error {
 		return session.Run(command)
@@ -101,7 +121,7 @@ func (e SSHCommandExecutor) Run(ctx context.Context, target models.SSHAccess, co
 
 func (e SSHCommandExecutor) RunScript(ctx context.Context, target models.SSHAccess, script string) (RemoteCommandResult, error) {
 	if strings.TrimSpace(script) == "" {
-		return RemoteCommandResult{ExitCode: -1}, errors.New("ssh script cannot be empty")
+		return e.failureResult("request", nil), errors.New("ssh script cannot be empty")
 	}
 	return e.runSession(ctx, target, func(session *ssh.Session, stdout, stderr *bytes.Buffer) error {
 		stdin, err := session.StdinPipe()
@@ -127,14 +147,14 @@ func (e SSHCommandExecutor) RunScript(ctx context.Context, target models.SSHAcce
 }
 
 func (e SSHCommandExecutor) runSession(ctx context.Context, target models.SSHAccess, run func(*ssh.Session, *bytes.Buffer, *bytes.Buffer) error) (RemoteCommandResult, error) {
-	cfg, address, err := e.clientConfig(target)
+	cfg, address, hostKeyProof, err := e.clientConfig(target)
 	if err != nil {
-		return RemoteCommandResult{ExitCode: -1}, err
+		return e.failureResult("config", hostKeyProof), err
 	}
 	dialer := net.Dialer{Timeout: e.connectTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
-		return RemoteCommandResult{ExitCode: -1}, err
+		return e.failureResult("dial", hostKeyProof), err
 	}
 	defer conn.Close()
 
@@ -150,14 +170,14 @@ func (e SSHCommandExecutor) runSession(ctx context.Context, target models.SSHAcc
 
 	sshConn, chans, reqs, err := ssh.NewClientConn(conn, address, cfg)
 	if err != nil {
-		return RemoteCommandResult{ExitCode: -1}, err
+		return e.failureResult("handshake", hostKeyProof), err
 	}
 	client := ssh.NewClient(sshConn, chans, reqs)
 	defer client.Close()
 
 	session, err := client.NewSession()
 	if err != nil {
-		return RemoteCommandResult{ExitCode: -1}, err
+		return e.failureResult("session", hostKeyProof), err
 	}
 	defer session.Close()
 
@@ -167,10 +187,12 @@ func (e SSHCommandExecutor) runSession(ctx context.Context, target models.SSHAcc
 	session.Stderr = &stderr
 	runErr := run(session, &stdout, &stderr)
 	result := RemoteCommandResult{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: 0}
+	applyHostKeyProof(&result, hostKeyProof)
 	if runErr == nil {
 		return result, nil
 	}
 	result.ExitCode = 1
+	result.FailureStage = "command"
 	var exitErr *ssh.ExitError
 	if errors.As(runErr, &exitErr) {
 		result.ExitCode = exitErr.ExitStatus()
@@ -178,36 +200,76 @@ func (e SSHCommandExecutor) runSession(ctx context.Context, target models.SSHAcc
 	return result, runErr
 }
 
-func (e SSHCommandExecutor) clientConfig(target models.SSHAccess) (*ssh.ClientConfig, string, error) {
+type sshHostKeyProof struct {
+	Policy    string
+	Verified  bool
+	Algorithm string
+	SHA256    string
+	Host      string
+	Remote    string
+}
+
+func (e SSHCommandExecutor) normalizedHostKeyPolicy() string {
+	policy := strings.ToLower(strings.TrimSpace(e.hostKeyPolicy))
+	if policy == "" {
+		return "insecure_ignore"
+	}
+	return policy
+}
+
+func (e SSHCommandExecutor) newHostKeyProof() *sshHostKeyProof {
+	return &sshHostKeyProof{Policy: e.normalizedHostKeyPolicy()}
+}
+
+func (e SSHCommandExecutor) failureResult(stage string, proof *sshHostKeyProof) RemoteCommandResult {
+	result := RemoteCommandResult{ExitCode: -1, FailureStage: stage, HostKeyPolicy: e.normalizedHostKeyPolicy()}
+	applyHostKeyProof(&result, proof)
+	return result
+}
+
+func applyHostKeyProof(result *RemoteCommandResult, proof *sshHostKeyProof) {
+	if result == nil || proof == nil {
+		return
+	}
+	result.HostKeyPolicy = proof.Policy
+	result.HostKeyVerified = proof.Verified
+	result.HostKeyAlgorithm = proof.Algorithm
+	result.HostKeySHA256 = proof.SHA256
+	result.HostKeyHost = proof.Host
+	result.HostKeyRemote = proof.Remote
+}
+
+func (e SSHCommandExecutor) clientConfig(target models.SSHAccess) (*ssh.ClientConfig, string, *sshHostKeyProof, error) {
+	proof := e.newHostKeyProof()
 	host := strings.TrimSpace(target.Host)
 	if host == "" {
-		return nil, "", errors.New("ssh target host is not configured")
+		return nil, "", proof, errors.New("ssh target host is not configured")
 	}
 	port := target.Port
 	if port == 0 {
 		port = 22
 	}
 	if port < 1 || port > 65535 {
-		return nil, "", errors.New("ssh target port is invalid")
+		return nil, "", proof, errors.New("ssh target port is invalid")
 	}
 	username := strings.TrimSpace(target.Username)
 	if username == "" {
-		return nil, "", errors.New("ssh target username is not configured")
+		return nil, "", proof, errors.New("ssh target username is not configured")
+	}
+	hostKeyCallback, proof, err := e.hostKeyCallback()
+	if err != nil {
+		return nil, "", proof, err
 	}
 	auth, err := e.authMethods(target)
 	if err != nil {
-		return nil, "", err
-	}
-	hostKeyCallback, err := e.hostKeyCallback()
-	if err != nil {
-		return nil, "", err
+		return nil, "", proof, err
 	}
 	return &ssh.ClientConfig{
 		User:            username,
 		Auth:            auth,
 		HostKeyCallback: hostKeyCallback,
 		Timeout:         e.connectTimeout,
-	}, net.JoinHostPort(host, strconv.Itoa(port)), nil
+	}, net.JoinHostPort(host, strconv.Itoa(port)), proof, nil
 }
 
 func (e SSHCommandExecutor) authMethods(target models.SSHAccess) ([]ssh.AuthMethod, error) {
@@ -240,12 +302,41 @@ func (e SSHCommandExecutor) authMethods(target models.SSHAccess) ([]ssh.AuthMeth
 	}
 }
 
-func (e SSHCommandExecutor) hostKeyCallback() (ssh.HostKeyCallback, error) {
-	switch strings.ToLower(strings.TrimSpace(e.hostKeyPolicy)) {
+func (e SSHCommandExecutor) hostKeyCallback() (ssh.HostKeyCallback, *sshHostKeyProof, error) {
+	policy := e.normalizedHostKeyPolicy()
+	proof := e.newHostKeyProof()
+	record := func(hostname string, remote net.Addr, key ssh.PublicKey, verified bool) {
+		proof.Host = hostname
+		if remote != nil {
+			proof.Remote = remote.String()
+		}
+		if key != nil {
+			proof.Algorithm = key.Type()
+			proof.SHA256 = ssh.FingerprintSHA256(key)
+		}
+		proof.Verified = verified
+	}
+	switch policy {
 	case "", "insecure_ignore":
-		return ssh.InsecureIgnoreHostKey(), nil
+		return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			record(hostname, remote, key, false)
+			return nil
+		}, proof, nil
+	case "known_hosts":
+		if strings.TrimSpace(e.knownHostsPath) == "" {
+			return nil, proof, errors.New("SSH_KNOWN_HOSTS_PATH is required when SSH_HOST_KEY_POLICY=known_hosts")
+		}
+		callback, err := knownhosts.New(e.knownHostsPath)
+		if err != nil {
+			return nil, proof, fmt.Errorf("load SSH known_hosts file: %w", err)
+		}
+		return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			err := callback(hostname, remote, key)
+			record(hostname, remote, key, err == nil)
+			return err
+		}, proof, nil
 	default:
-		return nil, fmt.Errorf("unsupported SSH_HOST_KEY_POLICY %q", e.hostKeyPolicy)
+		return nil, proof, fmt.Errorf("unsupported SSH_HOST_KEY_POLICY %q", e.hostKeyPolicy)
 	}
 }
 

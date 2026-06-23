@@ -160,7 +160,7 @@ func (s ScriptService) run(jobID uint) {
 	errorMessage := ""
 	if jobFailed {
 		status = "failed"
-		errorMessage = "one or more script executions timed out"
+		errorMessage = "one or more script executions failed"
 	}
 	s.db.Model(&job).Updates(map[string]any{"status": status, "error_message": errorMessage, "finished_at": finish})
 }

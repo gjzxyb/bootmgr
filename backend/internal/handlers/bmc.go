@@ -12,8 +12,10 @@ import (
 	"strings"
 	"time"
 
+	"baremetal-platform/backend/internal/config"
 	"baremetal-platform/backend/internal/middleware"
 	"baremetal-platform/backend/internal/models"
+	"baremetal-platform/backend/internal/services"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -87,6 +89,17 @@ func (h Handler) upsertBMC(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if req.Type == "redfish" {
+		parsed, _ := url.Parse(req.Endpoint)
+		if req.Protocol != parsed.Scheme {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "redfish protocol must match endpoint URL scheme"})
+			return
+		}
+		if config.IsProduction(h.cfg.AppEnv) && parsed.Scheme != "https" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "production redfish endpoint must use https"})
+			return
+		}
+	}
 	if endpoint.PowerState == "" {
 		endpoint.PowerState = "off"
 	}
@@ -128,6 +141,15 @@ type batchBMCResult struct {
 	Status     string `json:"status"`
 	PowerState string `json:"power_state,omitempty"`
 	Error      string `json:"error,omitempty"`
+}
+
+type bmcCheckResponse struct {
+	Status     string                    `json:"status"`
+	CheckedAt  *time.Time                `json:"checked_at,omitempty"`
+	Proof      *services.BMCFirmwareInfo `json:"proof,omitempty"`
+	ProofError string                    `json:"proof_error,omitempty"`
+	Error      string                    `json:"error,omitempty"`
+	Detail     string                    `json:"detail,omitempty"`
 }
 
 func (h Handler) batchPower(c *gin.Context) {
@@ -240,11 +262,56 @@ func (h Handler) checkBMC(c *gin.Context) {
 			return
 		}
 		h.audit.Record(id, email, "bmc.check", "server", c.Param("id"), "medium", c.ClientIP(), c.Request.UserAgent(), c.GetString("request_id"))
-		c.JSON(http.StatusBadGateway, gin.H{"error": "bmc connectivity check failed", "detail": err.Error(), "status": endpoint.Status, "checked_at": endpoint.LastCheckedAt})
+		proof := bmcFailureProof(h.bmc.AdapterName(), endpoint, err)
+		c.JSON(http.StatusBadGateway, bmcCheckResponse{Error: "bmc connectivity check failed", Detail: err.Error(), Status: endpoint.Status, CheckedAt: endpoint.LastCheckedAt, Proof: &proof})
 		return
 	}
+	resp := bmcCheckResponse{Status: endpoint.Status, CheckedAt: endpoint.LastCheckedAt}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	_, proof, proofErr := h.bmc.FirmwareInfo(ctx, c.Param("id"))
+	cancel()
+	if proofErr == nil || labBMCFirmwareHasAnyField(proof) {
+		resp.Proof = &proof
+	}
+	if proofErr != nil {
+		resp.ProofError = proofErr.Error()
+	} else if !labBMCFirmwareHasIdentity(proof) {
+		resp.ProofError = "firmware identity probe returned no manufacturer, model, device/product ID, serial, BIOS, firmware, or BMC version"
+	}
 	h.audit.Record(id, email, "bmc.check", "server", c.Param("id"), "medium", c.ClientIP(), c.Request.UserAgent(), c.GetString("request_id"))
-	c.JSON(http.StatusOK, gin.H{"status": endpoint.Status, "checked_at": endpoint.LastCheckedAt})
+	c.JSON(http.StatusOK, resp)
+}
+
+func bmcFailureProof(adapter string, endpoint models.BmcEndpoint, err error) services.BMCFirmwareInfo {
+	return services.BMCFirmwareInfo{
+		Adapter:        strings.TrimSpace(adapter),
+		EndpointStatus: endpoint.Status,
+		Stage:          bmcFailureStage(err),
+		LastCheckedAt:  endpoint.LastCheckedAt,
+	}
+}
+
+func bmcFailureStage(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := strings.ToLower(err.Error())
+	configFragments := []string{
+		"does not match bmc_adapter",
+		"endpoint must",
+		"endpoint host",
+		"endpoint port",
+		"protocol must",
+		"username is required",
+		"credential",
+		"production redfish endpoint",
+	}
+	for _, fragment := range configFragments {
+		if strings.Contains(message, fragment) {
+			return "config"
+		}
+	}
+	return "connectivity"
 }
 
 func (h Handler) getBMCFirmware(c *gin.Context) {
@@ -330,11 +397,29 @@ func validateBMCEndpoint(kind, endpoint string) error {
 		}
 		host = parsed.Host
 	}
-	if splitHost, _, err := net.SplitHostPort(host); err == nil {
+	if splitHost, port, err := net.SplitHostPort(host); err == nil {
+		if err := validatePort(port, "ipmi endpoint port"); err != nil {
+			return err
+		}
 		host = splitHost
+	} else if strings.Count(host, ":") == 1 && net.ParseIP(host) == nil {
+		_, port, cut := strings.Cut(host, ":")
+		if cut {
+			if err := validatePort(port, "ipmi endpoint port"); err != nil {
+				return err
+			}
+		}
 	}
 	if !validHostOrIP(host) {
 		return fmt.Errorf("ipmi endpoint host is invalid")
+	}
+	return nil
+}
+
+func validatePort(raw string, label string) error {
+	port, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("%s must be between 1 and 65535", label)
 	}
 	return nil
 }

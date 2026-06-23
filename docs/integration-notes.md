@@ -2,23 +2,39 @@
 
 平台默认使用安全的本地/演示配置；真实 PXE/DHCP/TFTP、物理 Redfish/IPMI 和真实 SSH 主机能力已经接入，但必须在隔离实验网或生产部署网中显式启用和验证。
 
+## 生产部署样例
+
+- `deploy/docker-compose.yml` 仍用于本机演示，默认读取 `.env.example`，不会启动真实 DHCP/TFTP UDP 监听。
+- `.env.production.example` 是真实 PXE/BMC/SSH 验收模板，复制为 `.env.production` 后必须替换 `REPLACE_ME`、示例域名、部署 VLAN IP、BMC/SSH 策略和数据库密码。模板中保留默认管理员密码和短密钥是刻意的，生产启动校验会阻止未修改配置启动。
+- `deploy/docker-compose.production.yml` 是 Linux 实验网/生产网独立 Compose 文件。后端使用 `network_mode: host`，让 DHCP/ProxyDHCP 广播和 TFTP 直接绑定 `BOOT_DHCP_LISTEN_ADDR`/`BOOT_TFTP_LISTEN_ADDR` 指向的部署网接口 IP；该模式不适合普通办公网或未隔离共享网络。
+- 启动前在 `deploy/tftp` 放入真实 `ipxe.efi`、`undionly.kpxe` 等 bootloader，并写好包含真实主机 host key 的 `deploy/known_hosts`，例如用 `ssh-keyscan <host>` 或 `ssh-keyscan -H <host>` 采集后人工核对指纹。覆盖文件会把它们挂载到 `/app/data/tftp` 和 `/etc/baremetal/known_hosts`，供 `/readyz`、PXE 服务和生产 SSH 验证使用；`/readyz` 支持普通主机名、`[host]:port`、通配 pattern 和 OpenSSH `|1|...` 哈希 pattern 的静态覆盖检查。Redfish BMC 使用私有 CA 时，可把 PEM 放入 `deploy/certs`，并设置 `REDFISH_CA_CERT_PATH=/etc/baremetal/certs/redfish-ca.pem`。
+- 生产覆盖文件的后端 healthcheck 会调用 `/readyz` 并要求 `status=ok`。如果 TFTP bootloader 缺失、PXE 监听地址不在部署网、`ipmitool` 缺失、known_hosts 缺失/为空/不可解析或配置仍是演示值，容器会保持 unhealthy，便于上线前发现问题。
+- 真实验收仍必须由外部物理设备闭环：物理 PXE 客户端产生 `source=http_ipxe|pxe_dhcp` 的 BootEvent，真实 Redfish/IPMI Endpoint 返回身份/固件字段，真实 SSH 主机在 known_hosts 策略下完成 host key 校验并执行只读探针。没有这些外部证据时，平台只能证明接入能力和内部探针通过，不能证明现场已验收完成。
+
 ## 实验室验收接口
 
-- `GET /api/v1/system/lab-validation` 汇总真实能力验收状态，管理员可用。报告包含 PXE/DHCP/TFTP 配置和最近启动事件、启用的部署网段数量、BMC 适配器和端点状态、SSH 模式和 SSH Access 状态。
-- `POST /api/v1/system/lab-validation/run` 需要 `X-Confirm-Action: system.lab-validation.run`，默认执行 PXE HTTP/DHCP/TFTP 只读探测，并对最近 20 个 BMC 端点和 SSH Access 执行安全检查，可用 `{ "check_pxe": true, "check_bmc": true, "check_ssh": true, "limit": 20 }` 调整，最大 50。
-- BMC 验收只调用当前 `BMC_ADAPTER` 的连通性检查，不执行开机、关机或重启；当 `BMC_ADAPTER=simulated` 时会跳过物理 BMC 检查，避免把模拟结果误判为真实通过。
-- SSH 验收使用保存的 SSH 配置和加密凭据执行轻量只读命令，成功后把 SSHAccess 标记为 `ok`，失败标记为 `error`。
-- PXE 验收不会动态启用 DHCP/TFTP；执行检查会请求 `BOOT_BASE_URL/boot/ipxe`，在 `BOOT_SERVICES_ENABLED=true` 且模式不是 `external` 时向当前监听地址发送合成 PXE DHCPDISCOVER 校验 bootfile 响应，并在 `BOOT_SERVICES_ENABLED=true` 时通过 UDP TFTP 拉取 `boot.ipxe`。真实物理启动证据仍来自 `BootEvent`，需要物理客户端经 DHCP/TFTP/iPXE 访问平台后才会出现。
+- `GET /api/v1/system/lab-validation` 汇总真实能力验收状态，管理员可用。报告包含 PXE/DHCP/TFTP 配置和最近启动事件、启用的部署网段数量、BMC 适配器和端点状态、SSH 模式、SSH Access 状态、按资产聚合的目标矩阵、最近验收运行批次和最近记录的物理验收证据。`targets` 会列出每台候选物理资产的 PXE、BMC、SSH、证据状态、最近验收批次/结果、全链路 ready 标记和缺口原因；有 `primary_mac` 的库存资产和已有验收执行结果的资产都会进入候选目标，用于逐台收敛真实验收。PXE BootEvent 可通过 `server_id` 或事件 MAC 匹配库存 `primary_mac` 计入目标，覆盖首次实机启动尚未显式绑定资产的场景。
+- BootEvent 会记录 `source`：`http_ipxe` 表示来自已启用 `deployment` 网络 CIDR 的客户端请求 iPXE 脚本，`pxe_dhcp` 表示内置 DHCP/ProxyDHCP 收到真实 PXE 请求，`api_event` 表示手工 API 补录、部署网段外的 HTTP iPXE 请求或带 `X-Lab-Validation-Probe: 1` 的内部验收 HTTP 探测。严格 PXE 检查、`ok` 级 PXE/full 证据和全链路 ready 只接受 7 天内 `http_ipxe`/`pxe_dhcp` 等真实启动链路来源；目标矩阵会优先采用最新真实 PXE 事件，后续 `api_event` 不会覆盖已有真实启动证据；`api_event`、空来源和 `unknown` 可用于兼容历史、补录和排障，但不会单独证明物理 PXE 成功。
+- `POST /api/v1/system/lab-validation/run` 需要 `X-Confirm-Action: system.lab-validation.run`，默认执行 PXE HTTP/DHCP/TFTP 只读探测，并对最近 20 个 BMC 端点和 SSH Access 执行安全检查，可用 `{ "strict": true, "check_pxe": true, "check_bmc": true, "check_ssh": true, "limit": 20, "server_ids": [1,2], "pxe_macs": ["52:54:00:aa:bb:cc"], "pxe_probe_mac": "52:54:00:00:00:fe", "pxe_arch": 9, "ssh_probe_command": "printf 'ok '; hostname; id -un; uname -srm" }` 调整。`strict=true` 会启用物理验收闸门：PXE 检查必须提供真实 `pxe_macs`，BMC/SSH 检查必须提供真实 `server_ids`，且 BMC 不能使用模拟适配器。严格 BMC 检查会在连通性通过后执行只读固件/身份探针：Redfish 读取 Systems/Managers，IPMI 读取 `mc info`；批次结果会记录 `adapter=redfish|ipmi`、厂商、厂商 ID、型号、产品 ID、设备 ID、设备修订、序列号和版本摘要，并把这些非敏感身份字段写入 run result `details`，且至少需要一个身份字段才能通过。SSH 检查会在真实主机上执行单行探针命令，默认使用安全只读的 hostname/user/kernel 探针，批次结果会记录 stdout/stderr/exit_code 摘要，并把 command、exit_code、stdout、stderr 和错误摘要写入 run result `details`，便于证明不是仅做 TCP 连接。PXE HTTP 探测会带 `X-Lab-Validation-Probe: 1`，即使请求源 IP 位于部署网段，也只会记录为 `api_event`，不会作为物理 PXE 启动证据。当严格运行同时检查 PXE、BMC 和 SSH 且指定 `server_ids` 时，每台目标还会生成 `full_chain_target` 结果；只有该资产的新鲜 PXE BootEvent、BMC ok、SSH ok 和引用完整的新鲜物理证据都存在时才通过。`ok` full-chain 证据必须引用一次最近完成的严格 PXE+BMC+SSH `run_id`，且该运行包含目标 PXE/BMC/SSH 成功结果；如果该运行里的 `full_chain_target` 因缺少证据而失败，补录 full-chain 证据后再次执行严格运行即可让 `full_chain_target` 通过。`server_ids` 用于把 BMC/SSH 检查限定到指定真实资产；`pxe_macs` 用于校验指定真实 PXE 客户端是否已经产生启动事件；`pxe_arch=0` 可验证 Legacy BIOS bootfile，`7/9/11` 验证常见 UEFI x86_64 bootfile；最大 50 个资产、20 个 PXE MAC。每次运行都会生成 `run_id`，持久化批次、目标、请求人、Request ID 和单项结果，便于把真实实验室执行记录和审计日志对应起来。
+- 当严格运行同时传入 `server_ids` 和 `pxe_macs` 时，PXE BootEvent 不再只是全局按 MAC 通过：事件必须直接带有请求中的 `server_id`，或事件 MAC 必须匹配请求资产库存中的 `primary_mac`。这可以防止把同一实验网中另一台机器的启动事件误计入当前目标。
+- `GET /api/v1/system/lab-validation/runs/{id}/evidence-bundle` 返回某次运行的只读验收包，包含环境快照、检查项、现场检查清单、单项结果、目标矩阵、关联 BootEvent、BMC Endpoint、SSH Access、真实终端会话 transcript、相关物理证据和配置/运行问题，适合实验室交付和复核。现场检查清单会逐项标出 PXE BootEvent、BMC 身份探针、SSH 命令证明和 full-chain 证据引用的完成状态、下一步动作和阻塞原因；BMC/SSH 清单项只有在本次运行结果成功且 `details` 含结构化身份字段，或 SSH `details` 含 `host_key_policy=known_hosts`、`host_key_verified=true`、`host_key_sha256`、command/exit_code/stdout 命令证明时才标记为 `ok`。验收包本身不会自动创建 `ok` 证据；系统管理页可从验收包清单行预填 PXE/BMC/SSH 单项证据，且在同一资产 PXE/BMC/SSH 三项均为 `ok` 时预填 full-chain 证据，提交后仍由 `POST /api/v1/system/lab-validation/evidence` 做真实引用校验。
+- `POST /api/v1/system/lab-validation/evidence` 需要 `X-Confirm-Action: system.lab-validation.evidence`，用于把真实 PXE 客户端启动、物理 Redfish/IPMI 检查、真实 SSH 主机检查或全链路实验结果记录为非敏感证据摘要。`subject` 和 `summary` 必填；`subject` 建议填写 MAC、BMC endpoint、SSH host 或实验批次，PXE 证据会按常见 MAC 格式做规范化比对。可传 `run_id` 关联一次已完成且 7 天内的验收批次；`ok` BMC、SSH 和全链路证据必须传 `run_id`。BMC/SSH 单项证据引用的批次必须是最近完成的严格验收运行，并分别包含目标 `adapter=redfish|ipmi` 的结构化 BMC 身份 proof `details`，或 SSH known_hosts host key proof (`host_key_policy=known_hosts`、`host_key_verified=true`、`host_key_sha256`) 加 command/exit_code/stdout proof `details`；`ok` 全链路证据引用的批次必须为最近完成的严格 PXE+BMC+SSH 验收运行，并包含目标 PXE BootEvent、BMC、SSH 成功结果及上述结构化 proof，但不要求该批次整体为 `ok`。常见闭环是：第一次严格运行完成真实 PXE/BMC/SSH 单项验证，但 `full_chain_target` 因缺少 full evidence 为 `error`；补录 full evidence 后再次执行严格运行，`full_chain_target` 才会通过。`ok` 证据必须绑定平台内真实引用：PXE 证据传 7 天内且 `source=http_ipxe|pxe_dhcp` 的 `boot_event_id`，其中 `http_ipxe` 必须由部署网段内客户端 IP 自动分类产生；如传 `server_id`，BootEvent 可通过 `server_id` 或 MAC 匹配库存 `primary_mac` 证明同一资产；BMC/SSH 证据传 `server_id` 并要求对应最近检查为 `ok`，且 BMC Endpoint 类型匹配当前 `BMC_ADAPTER`，生产 Redfish Endpoint 必须使用 `https://`，生产 SSH 验证必须使用 `SSH_HOST_KEY_POLICY=known_hosts` 和可读 `SSH_KNOWN_HOSTS_PATH`；全链路证据传同资产的 `server_id` 与真实链路 `boot_event_id`，可用 BootEvent `server_id` 或 MAC 对 `primary_mac` 的匹配证明同资产，并要求 BMC/SSH 最近检查均为 `ok`。`physical_evidence` 只把 7 天内且引用完整的 `ok` 证据计入通过，历史证据仍展示但不证明当前实验室状态。不要写入明文密码、私钥、完整 token 或厂商控制台会话 cookie。
+- `tools/configure-physical-target.ps1` 是命令行真实目标配置辅助脚本。它会登录 API，按 `-ServerId` 查找现有资产，或按 `-AssetNo`/`-PXEMac` 查找并在不存在时创建资产，然后写入 Redfish/IPMI BMC Endpoint 和 SSH Access。管理员密码、BMC 密码、SSH 密码或私钥分别从 `BAREMETAL_ADMIN_PASSWORD`、`BAREMETAL_BMC_PASSWORD`、`BAREMETAL_SSH_SECRET` 读取，也可通过 `-PasswordEnvVar`、`-BMCPasswordEnvVar`、`-SSHSecretEnvVar` 改名，避免明文进入命令行历史。示例：`pwsh -File .\tools\configure-physical-target.ps1 -BaseUrl https://baremetal.example.com -Email admin@example.com -AssetNo BM-RACK1-001 -Hostname rack1-node1 -PXEMac "52:54:00:aa:bb:cc" -BMCEndpoint https://192.168.10.21 -BMCUsername root -SSHHost 192.168.20.21 -SSHUsername root -ValidateNow -RecordEvidence -RecordFullEvidence`。设置 `-ValidateNow` 后脚本会继续调用 `tools/physical-validation.ps1`，对同一 `server_id` 和 `PXEMac` 执行严格 PXE+BMC+SSH 验收；脚本仍不会启停 DHCP/TFTP，也不会执行电源动作。
+- `tools/physical-validation.ps1` 是命令行现场验收辅助脚本。它会检查 `/readyz`，登录后执行严格 PXE+BMC+SSH 验收，并导出 `readyz`、run result 和 evidence bundle JSON。默认交互读取管理员密码；自动化验收可设置 `BAREMETAL_ADMIN_PASSWORD`，或用 `-PasswordEnvVar` 指向其他环境变量，避免把密码写入命令行历史。示例：`pwsh -File .\tools\physical-validation.ps1 -BaseUrl http://127.0.0.1:8080 -Email admin@example.com -ServerId 1 -PXEMac "52:54:00:aa:bb:cc" -OutDir .\lab-validation-output`。多目标验收支持 PowerShell 数组或逗号分隔字符串，例如 `-ServerId 1,2,3 -PXEMac "52:54:00:aa:bb:01,52:54:00:aa:bb:02"`，便于 `pwsh -File`、CI 和远程执行器调用。默认脚本只读运行；显式追加 `-RecordEvidence` 时，脚本会从 evidence bundle 的 `operator_checklist` 或后端 `evidence_candidates` 中筛选状态为 `ok` 且属于本次 `-ServerId`/`-PXEMac` 的 PXE BootEvent、BMC identity 和 SSH command 清单项，分别调用受保护 evidence API 记录 `kind=pxe|bmc|ssh` 单项证据，导出 `*-item-evidence.json`。PXE 单项证据会反查 bundle 内 BootEvent 的真实 MAC 作为 `subject`，避免把资产号误写成 PXE subject；BMC/SSH 单项证据会携带本次严格运行的 `run_id` 和目标 `server_id`，继续受后端物理 proof 校验约束。显式追加 `-RecordFullEvidence` 时，脚本会筛选本次请求范围内 PXE BootEvent、BMC identity、SSH command 三项均为 `ok` 的目标，调用受保护 evidence API 记录 `kind=full` 证据，并自动复跑一次严格验收，导出 `*-full-evidence.json` 和 `*-rerun-*` 文件。两个开关可以一起使用。脚本不启停 DHCP/TFTP，也不执行电源动作；如果 `/readyz` 为 degraded，默认会停止，可显式传 `-AllowDegradedReadyz` 继续做排障运行。
+- BMC 验收只调用当前 `BMC_ADAPTER` 的连通性检查，不执行开机、关机或重启；当 `BMC_ADAPTER=simulated` 时会跳过物理 BMC 检查，避免把模拟结果误判为真实通过。真实 Redfish/IPMI 模式下，BMC Endpoint 的 `type` 必须匹配当前 `BMC_ADAPTER`，Redfish `protocol` 必须与 URL scheme 一致，生产 Redfish Endpoint 必须使用 `https://`，否则检查、目标矩阵和物理证据都会失败。BMC 检查失败时 API 会返回 partial `proof.stage`：`config` 表示适配器、端点、协议、凭据等本地配置不满足要求，`connectivity` 表示已经进入 Redfish/IPMI 连通性或协议执行阶段但失败。`/readyz` 和真实验收报告都会返回 `bmc_tooling` 检查项；`BMC_ADAPTER=ipmi` 时必须能在 PATH 中找到 `ipmitool`。
+- SSH 验收使用保存的 SSH 配置和加密凭据执行轻量只读命令，成功后把 SSHAccess 标记为 `ok`，失败标记为 `error`；run result `details` 会记录非敏感的 `stage`、`host_key_policy`、`host_key_verified`、`host_key_algorithm`、`host_key_sha256`、command、exit_code、stdout/stderr 摘要。`stage=config` 常见于 known_hosts/凭据配置错误，`stage=dial` 表示 TCP 未连通，`stage=handshake` 常见于 host key 不匹配或认证握手失败，`stage=command` 表示命令已执行但退出非 0。生产环境必须使用 `SSH_HOST_KEY_POLICY=known_hosts` 和可读、可解析且非空的 `SSH_KNOWN_HOSTS_PATH`；如果仍使用 `insecure_ignore`，历史 `SSHAccess.status=ok`、严格 SSH run 和 `ok` 级 SSH/full 证据都会被标记为不满足真实主机证明策略。
+- PXE 验收不会动态启用 DHCP/TFTP；执行检查会请求 `BOOT_BASE_URL/boot/ipxe`，在 `BOOT_SERVICES_ENABLED=true` 且模式不是 `external` 时向当前监听地址发送合成 PXE DHCPDISCOVER 校验 bootfile 响应，并在 `BOOT_SERVICES_ENABLED=true` 时通过 UDP TFTP 拉取 `boot.ipxe`。合成 DHCP 探测带内部 marker，listener 会返回并报告 option 54 `server_identifier`、BOOTP `next_server`(`siaddr`)、option 66 `tftp_server_name`、option 67 和 BOOTP file，不写入 `BootEvent`，避免污染物理启动证据。真实物理启动证据仍来自 `BootEvent`，需要物理客户端经 DHCP/TFTP/iPXE 访问平台后才会出现。
 
 ## PXE/iPXE
 
 - 后端 `PXEService` 负责 DHCP/ProxyDHCP 响应、TFTP 文件和动态 iPXE chain 脚本。
 - 大文件下载走 HTTP，TFTP 只承载启动加载器和最小脚本。
 - 默认不启动 UDP 监听；设置 `BOOT_SERVICES_ENABLED=true` 后才启用。`BOOT_SERVICE_MODE=proxy` 提供 ProxyDHCP 响应，`builtin` 提供内置 DHCP 地址分配，`external` 只启动 TFTP，供外部 DHCP 使用。
-- 启用时必须配置 `BOOT_BIND_INTERFACE`、`BOOT_DHCP_SERVER_IP`、`BOOT_TFTP_ROOT`、`BOOT_TFTP_BOOTFILE_UEFI`、`BOOT_TFTP_BOOTFILE_BIOS`；`builtin` 模式还必须设置 `BOOT_DHCP_LEASE_START` 和 `BOOT_DHCP_LEASE_END`。
-- TFTP 只服务 `BOOT_TFTP_ROOT` 内文件，并内置 `boot.ipxe`、`auto.ipxe`、`default.ipxe`，链到 `GET /boot/ipxe`。真实启动加载器如 `ipxe.efi`、`undionly.kpxe` 需要由部署环境放入 TFTP 根目录。
+- 启用时必须配置 `BOOT_BIND_INTERFACE`、`BOOT_DHCP_SERVER_IP`、`BOOT_TFTP_ROOT`、`BOOT_TFTP_BOOTFILE_UEFI`、`BOOT_TFTP_BOOTFILE_BIOS`；生产环境还必须把 `BOOT_DHCP_LISTEN_ADDR`、`BOOT_TFTP_LISTEN_ADDR` 显式绑定到部署网接口 IP，例如 `192.168.100.10:67` 和 `192.168.100.10:69`，避免全接口监听；`builtin` 模式还必须设置 `BOOT_DHCP_LEASE_START` 和 `BOOT_DHCP_LEASE_END`。
+- TFTP 只服务 `BOOT_TFTP_ROOT` 内文件，并内置 `boot.ipxe`、`auto.ipxe`、`default.ipxe`，链到 `GET /boot/ipxe`。真实启动加载器如 `ipxe.efi`、`undionly.kpxe` 需要由部署环境放入 TFTP 根目录。TFTP RRQ 支持常见 PXE/iPXE options：`blksize` 会限制传输块大小，`timeout` 会协商 ACK 等待时间，`tsize` 会返回文件大小。
+- DHCP/ProxyDHCP 响应会同时写入 option 54 server identifier、BOOTP `siaddr` next-server、option 66 TFTP server name、option 67 bootfile 和传统 BOOTP `file` 字段，UEFI 默认返回 `BOOT_TFTP_BOOTFILE_UEFI`，Legacy BIOS 默认返回 `BOOT_TFTP_BOOTFILE_BIOS`。`/readyz` 和严格验收的 DHCP 探针会在响应中报告 `server_identifier`、`next_server`、`tftp_server_name` 和 `legacy_bootfile`，用于排查读取不同 PXE 引导字段的物理固件。
 - `/readyz` 的 `pxe_services` 检查会报告服务启用状态、TFTP 根目录探针和启动加载器文件缺失 warning。
-- `GET /boot/ipxe` 和 `POST /boot/events` 仍是 DHCP/ProxyDHCP/TFTP 之外的 HTTP 对接边界。
+- `GET /boot/ipxe` 和 `POST /boot/events` 仍是 DHCP/ProxyDHCP/TFTP 之外的 HTTP 对接边界；`/boot/ipxe` 只有当客户端 IP 位于已启用 `deployment` 网络 CIDR 内且不是内部验收 HTTP 探测时才把 BootEvent 记为 `http_ipxe`，否则记为 `api_event`。
 - 未知 MAC 请求 `/boot/ipxe` 或上报 `/boot/events` 时，平台会自动创建 `discovered` 资产和 `boot.discovery` 状态历史，后续由运维人员补充归属、位置、BMC 和用途。
 - `BOOT_BASE_URL` 控制 iPXE、镜像、metadata 和安装器脚本中使用的平台地址。
 - 平台提供 `/boot/discovery.ipxe` 和 `/boot/linux-installer.ipxe`，不再依赖占位安装器 URL。
@@ -28,7 +44,7 @@
 
 - `/api/v1/network-configs` 记录管理网、部署网和业务网的 CIDR、网关、DNS、VLAN、DHCP 模式和 ProxyDHCP 开关。
 - 网络配置写入时会校验 CIDR、网关归属、DNS IP 列表、VLAN 0-4094、用途、状态和 DHCP 模式枚举，避免无效部署网进入后续安装流程。
-- `POST /api/v1/network-configs/{id}/check` 提供只读网络配置检查，覆盖格式、启用网段重叠、网关、DNS、状态、DHCP/ProxyDHCP 模式和部署网可用性。该检查不会启动 DHCP/TFTP，也不会对真实网关或 DHCP 服务做破坏性探测。
+- `POST /api/v1/network-configs/{id}/check` 提供只读网络配置检查，覆盖格式、启用网段重叠、网关、DNS、状态、DHCP/ProxyDHCP 模式、当前 PXE/DHCP/TFTP runtime 配置匹配情况、runtime 地址与部署网 CIDR 一致性和部署网可用性。该检查不会启动或停止 DHCP/TFTP，也不会对真实网关或 DHCP 服务做破坏性探测。
 - 真实 DHCP/TFTP 只由启动配置控制，不会因为创建网络配置而自动启用，避免在开发机或办公网误启动。
 - 创建部署前要求至少存在一个启用的 `deployment` 网络配置；部署请求可传 `network_id` 显式绑定启用的部署网络，未传时保留旧的自动选择兼容行为。
 - 生产启用内置 DHCP 前，应基于这些配置执行 DHCP 冲突检测、网关连通性测试和 VLAN 隔离验证。
@@ -61,9 +77,9 @@
 ## Redfish/IPMI
 
 - service 层提供 `BMCAdapter` 接口，默认启用 `SimulatedBMCAdapter`；生产或实验室硬件验证可设置 `BMC_ADAPTER=redfish` 或 `ipmi`。
-- 设置 `BMC_ADAPTER=redfish` 后，`RedfishBMCAdapter` 会使用 BMC 端点、用户名和加密凭据，通过 HTTP Basic Auth 调用 `/redfish/v1`，并从 `/redfish/v1/Systems`、`/redfish/v1/Managers` 集合发现真实 system/manager 资源。开机、关机、重启分别映射为 Redfish `On`、`ForceOff`、`ForceRestart`，Reset URL 优先使用资源里的 `Actions.#ComputerSystem.Reset.target`，固件查询从 ComputerSystem 和 Manager 资源读取厂商、型号、序列号、BIOS 版本和 BMC 固件版本。
-- 设置 `BMC_ADAPTER=ipmi` 后，`IPMICommandAdapter` 会调用系统 `ipmitool -I lanplus -H <host> -U <user> -E`，通过 `IPMI_PASSWORD` 环境变量传递解密后的密码，支持 `host:port` 端点。电源查询和控制分别映射为 `power status`、`power on`、`power off`、`power reset`，固件查询使用 `mc info` 解析 BMC 固件版本、厂商和产品名。容器或主机运行环境需要预装 `ipmitool`。
-- BMC 配置写入会校验 Redfish URL、IPMI host/host:port 和协议组合，保存或更新后状态为 `unknown`；创建部署前会调用当前 `BMC_ADAPTER` 执行连通性检查，成功时标记为 `ok`，失败时阻止部署创建并把 Endpoint 状态标记为 `error`。手动 `check` 和电源操作仍可用于日常验证与排障。
+- 设置 `BMC_ADAPTER=redfish` 后，`RedfishBMCAdapter` 会使用 BMC 端点、用户名和加密凭据，通过 HTTP Basic Auth 调用 `/redfish/v1`，并从 `/redfish/v1/Systems`、`/redfish/v1/Managers` 集合发现真实 system/manager 资源。开机、关机、重启分别映射为 Redfish `On`、`ForceOff`、`ForceRestart`，Reset URL 优先使用资源里的 `Actions.#ComputerSystem.Reset.target`，固件查询从 ComputerSystem 和 Manager 资源读取厂商、型号、序列号、BIOS 版本和 BMC 固件版本。Redfish Endpoint 保存时要求 `protocol` 与 URL scheme 一致；`http://` 仅用于开发/实验室 mock 或隔离自签验证，生产环境会拒绝 `http://` Redfish Endpoint。`REDFISH_INSECURE_TLS=true` 只用于开发/实验室自签证书；生产环境使用 Redfish 时启动校验要求 `REDFISH_INSECURE_TLS=false`，并应把 BMC 管理口证书或 CA 加入运行环境信任链，也可通过 `REDFISH_CA_CERT_PATH` 指向 PEM CA bundle。
+- 设置 `BMC_ADAPTER=ipmi` 后，`IPMICommandAdapter` 会调用系统 `ipmitool -I lanplus -H <host> -U <user> -E`，通过 `IPMI_PASSWORD` 环境变量传递解密后的密码，支持 `host:port` 端点。电源查询和控制分别映射为 `power status`、`power on`、`power off`、`power reset`，固件查询使用 `mc info` 解析 Device ID、Device Revision、Manufacturer ID、Product ID、BMC 固件版本、厂商和产品名。容器或主机运行环境需要预装 `ipmitool`，并可通过 `/readyz` 的 `bmc_tooling` 在上线前确认。
+- BMC 配置写入会校验 Redfish URL、IPMI host/host:port 和协议组合，保存或更新后状态为 `unknown`；创建部署前会调用当前 `BMC_ADAPTER` 执行连通性检查，成功时标记为 `ok`，失败时阻止部署创建并把 Endpoint 状态标记为 `error`。真实适配器只接受同类型端点，例如 `BMC_ADAPTER=redfish` 只检查 `type=redfish`，`BMC_ADAPTER=ipmi` 只检查 `type=ipmi`。手动 `check` 和电源操作仍可用于日常验证与排障。
 - BMC 配置、连通性检查和电源变更会拒绝 `retired`/`scrapped` 资产；电源状态和固件信息查询保持只读可用，用于终态资产排障与盘点核对。真实 Redfish/IPMI 接入时必须保留该生命周期保护。
 - 批量电源接口为 `POST /api/v1/servers/bmc/batch-power`，单次最多 50 台，按目标返回成功/失败明细，并对每台目标写入高风险审计。真实接入时可在 service 层增加并发池，但必须保留重复目标校验、终态资产拒绝、二次确认和逐目标结果。
 - Demo seeder 只创建模拟 BMC 端点，不写入可用凭据引用；启用真实 Redfish 前必须在前端重新保存 BMC 密码。
@@ -86,7 +102,7 @@
 - `POST /api/v1/servers/{id}/ssh/check` 使用保存的 SSH 配置连接真实主机并执行轻量只读命令，成功后把 SSHAccess 状态标记为 `ok`，失败标记为 `error`，适合作为真实主机验收第一步。
 - `COLLECTOR_MODE=simulated` 时写入模拟指标；`COLLECTOR_MODE=ssh` 时通过内置 Go SSH 执行器连接真实主机，执行只读采集命令并解析 `host_up`、CPU、内存、磁盘、网络收发、进程数量和僵尸进程数量指标，单次采集默认 30 秒超时。
 - 指标查询和告警评估只读取 7 天保留窗口内的样本；采集成功后会清理超过 7 天的历史指标，避免长期运行后指标表无界增长。
-- 内置 SSH 执行器支持保存的 `password` 和 `private_key` 凭据；当前 host key 策略由 `SSH_HOST_KEY_POLICY` 控制，默认 `insecure_ignore`，应仅用于受控部署网，后续可扩展 known_hosts 校验。
+- 内置 SSH 执行器支持保存的 `password` 和 `private_key` 凭据；host key 策略由 `SSH_HOST_KEY_POLICY` 控制，默认 `insecure_ignore` 仅适合开发/演示。生产环境启用 `COLLECTOR_MODE=ssh` 或 `SSH_OPERATIONS_MODE=ssh` 时，启动校验要求 `SSH_HOST_KEY_POLICY=known_hosts`，并通过 `SSH_KNOWN_HOSTS_PATH` 指向可读、可解析且非空的标准 known_hosts 文件。`/readyz` 和实验室验收报告会把当前 SSH Access 目标与 known_hosts pattern 做静态覆盖检查，支持非哈希条目和 `ssh-keyscan -H` 生成的 OpenSSH 哈希条目；真实 SSH 握手仍由 Go SSH known_hosts verifier 校验主机密钥。
 - SSH 凭据必须加密保存，日志中不得输出私钥、密码和 token。
 
 ## 日志事件接入
@@ -118,7 +134,7 @@
 ## 远程终端 / WebSSH
 
 - MVP 已提供 `POST /api/v1/ops/terminal-sessions`、`GET /api/v1/ops/terminal-sessions`、详情查询和关闭接口。
-- 当前终端会话默认是模拟模式，只生成 session 记录和 transcript；设置 `SSH_OPERATIONS_MODE=ssh` 后，打开会话会通过 Go SSH 验证真实主机，并允许通过 `POST /api/v1/ops/terminal-sessions/{id}/commands` 执行命令，命令和输出追加到 transcript。
+- 当前终端会话默认是模拟模式，只生成 session 记录和 transcript；设置 `SSH_OPERATIONS_MODE=ssh` 后，打开会话会通过 Go SSH 验证真实主机，并允许通过 `POST /api/v1/ops/terminal-sessions/{id}/commands` 执行命令，命令、输出、stderr、错误和 `exit_code` 都会追加到 transcript，便于作为真实 SSH 主机操作证据。
 - 打开会话前会校验目标资产存在且未退役/报废，并限制 `reason` 不超过 255 字符。
 - 打开、执行命令和关闭终端都属于高风险操作，必须保留 `X-Confirm-Action: ops.terminal.open`、`ops.terminal.command` 和 `ops.terminal.close`。
 - 完整 WebSSH/PTTY 接入应通过后端会话代理建立短时授权，复用 `SSHAccess` 与加密凭据，强制 RBAC、空闲超时、最大会话时长、来源 IP 记录、完整 transcript/录屏审计和敏感输出脱敏。
@@ -127,10 +143,10 @@
 ## 备份与恢复
 
 - MVP 已提供 `GET /api/v1/ops/backup/export` 导出 JSON 备份，需管理员角色和 `X-Confirm-Action: ops.backup.export`。
-- 导出数据覆盖租户、资产、硬件、镜像、模板、部署、工作流、指标、日志事件、采集任务、运维任务、告警和审计日志。
-- MVP 已提供 `POST /api/v1/ops/backup/validate` 做恢复前 dry-run 预检，校验备份 schema、版本、引用完整性、租户服务器配额、部署网络、告警规则和目标库是否已有数据，不写入数据库。
+- 导出数据覆盖租户、资产、硬件、镜像、模板、部署、验收运行批次与结果、工作流、指标、日志事件、采集任务、运维任务、告警和审计日志。
+- MVP 已提供 `POST /api/v1/ops/backup/validate` 做恢复前 dry-run 预检，校验备份 schema、版本、引用完整性、验收运行历史引用、租户服务器配额、部署网络、告警规则和目标库是否已有数据，不写入数据库。
 - MVP 已提供 `POST /api/v1/ops/backup/restore` 执行受保护恢复，需 `X-Confirm-Action: ops.backup.restore`，仅允许 fresh 目标库。普通恢复用户会写入不可登录占位密码并要求后续重置；执行恢复的当前管理员账号会保留目标环境中的现有密码作为恢复入口；恢复后会修正 PostgreSQL/SQLite 自增序列。
-- 默认不导出 `credentials`、`ssh_accesses`、BMC 端点、启动事件和 metadata token，避免凭据密文、管理网端点、账号信息和短期运行态数据进入普通备份包；这些表如果在目标库已有数据，也会让恢复预检/恢复执行判定目标库不 fresh。
+- 默认不导出 `credentials`、`ssh_accesses`、BMC 端点、启动事件、物理证据记录和 metadata token，避免凭据密文、管理网端点、账号信息和短期运行态数据进入普通备份包；非敏感的验收运行批次与结果会导出，帮助恢复环境保留实验室验收审计脉络。这些运行态/敏感表如果在目标库已有数据，也会让恢复预检/恢复执行判定目标库不 fresh。
 - 生产恢复仍建议优先使用离线工具或维护窗口执行；恢复前必须校验备份版本、schema、租户边界、目标环境为空或显式覆盖，并生成恢复审计报告。
 - PostgreSQL 生产环境仍应配置数据库级备份和 PITR；平台 JSON 备份只用于演示、迁移预检查和小规模配置快照。
 

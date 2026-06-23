@@ -1,4 +1,6 @@
 services:
+  # Development/demo compose. For real PXE/DHCP/TFTP on Linux, use the
+  # standalone docker-compose.production.yml with a reviewed ../.env.production.
   postgres:
     image: postgres:16-alpine
     environment:

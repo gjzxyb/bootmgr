@@ -1,7 +1,8 @@
 import { DeleteOutlined, DownloadOutlined, EditOutlined, HddOutlined, ImportOutlined, LineChartOutlined, ReloadOutlined, SafetyCertificateOutlined, StopOutlined, ThunderboltOutlined, ToolOutlined } from '@ant-design/icons';
 import { Button, Descriptions, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Spin, Table, Tabs, Tag, Typography, message } from 'antd';
+import axios from 'axios';
 import { useEffect, useState } from 'react';
-import { api, BMCFirmwareInfo, CollectionJob, MetricSample, PageResult, RetirementRecord, Server, SSHAccess, Tenant } from '../api/client';
+import { api, BMCCheckResponse, BMCFirmwareInfo, CollectionJob, MetricSample, PageResult, RetirementRecord, Server, SSHAccess, SSHCheckResponse, Tenant } from '../api/client';
 import { canManage, isAdmin } from '../authz';
 
 type BOMRow = {
@@ -50,6 +51,20 @@ const batchConfirmHeader = (action: string) => action === 'reboot' ? 'bmc.batch-
 const batchPowerLabel = (action: string) => ({ 'power-on': '开机', 'power-off': '关机', reboot: '重启' }[action] || action);
 const eraseStatusColor = (status: string) => ({ verified: 'green', pending: 'orange', failed: 'red', not_required: 'default' }[status] || 'default');
 const lifecycleActionLabel = (action: TerminalLifecycleAction) => action === 'scrap' ? '报废' : '退役';
+const bmcProofSummary = (proof?: BMCFirmwareInfo) => {
+  if (!proof) return '';
+  const parts = [
+    proof.adapter ? `适配器 ${proof.adapter}` : '',
+    proof.manufacturer ? `厂商 ${proof.manufacturer}` : '',
+    proof.model ? `型号 ${proof.model}` : '',
+    proof.serial_number ? `序列号 ${proof.serial_number}` : '',
+    proof.device_id ? `Device ID ${proof.device_id}` : '',
+    proof.product_id ? `Product ID ${proof.product_id}` : '',
+    proof.bmc_version ? `BMC ${proof.bmc_version}` : '',
+    proof.firmware_version ? `固件 ${proof.firmware_version}` : ''
+  ].filter(Boolean);
+  return parts.length ? `，身份: ${parts.join(' / ')}` : '';
+};
 const tagsToText = (tags: unknown) => {
   if (tags === undefined || tags === null || tags === '') return '';
   try {
@@ -209,7 +224,15 @@ export function ServersPage({ role }: { role?: string }) {
     try {
       await api.post(`/servers/${id}/bmc/${action}`, {}, { headers: { 'X-Confirm-Action': `bmc.${action}` }, suppressGlobalError: true });
       msg.success('BMC 操作已执行');
-    } catch {
+    } catch (error) {
+      if (axios.isAxiosError<BMCCheckResponse>(error)) {
+        const data = error.response?.data;
+        const stage = data?.proof?.stage ? `，阶段: ${data.proof.stage}` : '';
+        const adapter = data?.proof?.adapter ? `，适配器: ${data.proof.adapter}` : '';
+        const detail = data?.detail || data?.error;
+        msg.error(`BMC 操作失败${detail ? `：${detail}` : ''}${stage}${adapter}`);
+        return;
+      }
       msg.error('请先配置该资产的 BMC 端点');
     }
   };
@@ -233,16 +256,26 @@ export function ServersPage({ role }: { role?: string }) {
     try {
       const res = await api.get<{ power_state: string; adapter: string }>(`/servers/${server.id}/bmc/power`, { suppressGlobalError: true });
       msg.info(`${server.hostname} 当前电源状态: ${res.data.power_state || 'unknown'}`);
-    } catch {
+    } catch (error) {
+      if (axios.isAxiosError<BMCCheckResponse>(error)) {
+        const data = error.response?.data;
+        const stage = data?.proof?.stage ? `，阶段: ${data.proof.stage}` : '';
+        const adapter = data?.proof?.adapter ? `，适配器: ${data.proof.adapter}` : '';
+        const detail = data?.detail || data?.error;
+        msg.error(`BMC 连通性检查失败${detail ? `：${detail}` : ''}${stage}${adapter}`);
+        return;
+      }
       msg.error('请先配置该资产的 BMC 端点');
     }
   };
 
   const checkBmc = async (server: Server) => {
     try {
-      const res = await api.post<{ status: string; checked_at?: string }>(`/servers/${server.id}/bmc/check`, {}, { suppressGlobalError: true });
+      const res = await api.post<BMCCheckResponse>(`/servers/${server.id}/bmc/check`, {}, { suppressGlobalError: true });
       const checkedAt = res.data.checked_at ? `，检查时间: ${res.data.checked_at}` : '';
-      msg.success(`${server.hostname} BMC 连通性正常，状态: ${res.data.status || 'ok'}${checkedAt}`);
+      const proof = bmcProofSummary(res.data.proof);
+      msg.success(`${server.hostname} BMC 连通性正常，状态: ${res.data.status || 'ok'}${checkedAt}${proof}`);
+      if (res.data.proof_error) msg.warning(`BMC 身份探针未完整返回: ${res.data.proof_error}`);
     } catch {
       msg.error('请先配置该资产的 BMC 端点');
     }
@@ -380,11 +413,23 @@ export function ServersPage({ role }: { role?: string }) {
   const checkSSH = async () => {
     if (!activeServer) return;
     try {
-      const { data } = await api.post<{ status: string; checked_at?: string }>(`/servers/${activeServer.id}/ssh/check`, {}, { suppressGlobalError: true });
+      const { data } = await api.post<SSHCheckResponse>(`/servers/${activeServer.id}/ssh/check`, {}, { suppressGlobalError: true });
       const checkedAt = data.checked_at ? `，检查时间: ${data.checked_at}` : '';
-      msg.success(`${activeServer.hostname || activeServer.asset_no} SSH 连通性正常，状态: ${data.status || 'ok'}${checkedAt}`);
+      const hostKey = data.proof?.host_key_sha256 ? `，HostKey: ${data.proof.host_key_verified ? '已验证 ' : ''}${data.proof.host_key_sha256}` : '';
+      const policy = data.proof?.host_key_policy ? `，策略: ${data.proof.host_key_policy}` : '';
+      msg.success(`${activeServer.hostname || activeServer.asset_no} SSH 连通性正常，状态: ${data.status || 'ok'}${checkedAt}${policy}${hostKey}`);
       await loadServerMonitoring(activeServer);
-    } catch {
+    } catch (error) {
+      if (axios.isAxiosError<SSHCheckResponse>(error)) {
+        const data = error.response?.data;
+        const proof = data?.proof;
+        const stage = proof?.stage ? `，阶段: ${proof.stage}` : '';
+        const policy = proof?.host_key_policy ? `，策略: ${proof.host_key_policy}` : '';
+        const hostKey = proof?.host_key_sha256 ? `，HostKey: ${proof.host_key_verified ? '已验证 ' : ''}${proof.host_key_sha256}` : '';
+        const detail = data?.detail || data?.error;
+        msg.error(`SSH 连通性检查失败${detail ? `：${detail}` : ''}${stage}${policy}${hostKey}`);
+        return;
+      }
       msg.error('SSH 连通性检查失败，请检查主机、端口或凭据');
     }
   };
@@ -562,7 +607,11 @@ export function ServersPage({ role }: { role?: string }) {
         <Descriptions.Item label="适配器">{firmware?.adapter || '-'}</Descriptions.Item>
         <Descriptions.Item label="端点状态">{firmware?.endpoint_status || '-'}</Descriptions.Item>
         <Descriptions.Item label="厂商">{firmware?.manufacturer || '-'}</Descriptions.Item>
+        <Descriptions.Item label="厂商 ID">{firmware?.manufacturer_id || '-'}</Descriptions.Item>
         <Descriptions.Item label="型号">{firmware?.model || '-'}</Descriptions.Item>
+        <Descriptions.Item label="产品 ID">{firmware?.product_id || '-'}</Descriptions.Item>
+        <Descriptions.Item label="设备 ID">{firmware?.device_id || '-'}</Descriptions.Item>
+        <Descriptions.Item label="设备修订">{firmware?.device_revision || '-'}</Descriptions.Item>
         <Descriptions.Item label="序列号">{firmware?.serial_number || '-'}</Descriptions.Item>
         <Descriptions.Item label="固件版本">{firmware?.firmware_version || '-'}</Descriptions.Item>
         <Descriptions.Item label="BIOS 版本">{firmware?.bios_version || '-'}</Descriptions.Item>

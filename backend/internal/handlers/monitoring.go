@@ -125,18 +125,52 @@ func (h Handler) checkSSHAccess(c *gin.Context) {
 		return
 	}
 	actorID, actorEmail := middleware.Actor(c)
-	access, err := h.sshExecutor.Check(c.Request.Context(), uint(serverID))
+	command := services.DefaultSSHCheckCommand
+	access, proof, err := h.sshExecutor.CheckWithCommand(c.Request.Context(), uint(serverID), command)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "ssh access not found"})
 			return
 		}
 		h.audit.Record(actorID, actorEmail, "ssh.check", "server", c.Param("id"), "medium", c.ClientIP(), c.Request.UserAgent(), c.GetString("request_id"))
-		c.JSON(http.StatusBadGateway, gin.H{"error": "ssh connectivity check failed", "detail": err.Error(), "status": access.Status, "checked_at": access.LastCheckedAt})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "ssh connectivity check failed", "detail": err.Error(), "status": access.Status, "checked_at": access.LastCheckedAt, "proof": sshCheckProofPayload(command, proof)})
 		return
 	}
 	h.audit.Record(actorID, actorEmail, "ssh.check", "server", c.Param("id"), "medium", c.ClientIP(), c.Request.UserAgent(), c.GetString("request_id"))
-	c.JSON(http.StatusOK, gin.H{"status": access.Status, "checked_at": access.LastCheckedAt})
+	c.JSON(http.StatusOK, gin.H{"status": access.Status, "checked_at": access.LastCheckedAt, "proof": sshCheckProofPayload(command, proof)})
+}
+
+func sshCheckProofPayload(command string, result services.RemoteCommandResult) gin.H {
+	payload := gin.H{
+		"command":   truncateLabResultText(command, 255),
+		"exit_code": result.ExitCode,
+	}
+	if stage := strings.TrimSpace(result.FailureStage); stage != "" {
+		payload["stage"] = truncateLabResultText(stage, 80)
+	}
+	if policy := strings.TrimSpace(result.HostKeyPolicy); policy != "" {
+		payload["host_key_policy"] = truncateLabResultText(policy, 80)
+		payload["host_key_verified"] = result.HostKeyVerified
+	}
+	if algorithm := strings.TrimSpace(result.HostKeyAlgorithm); algorithm != "" {
+		payload["host_key_algorithm"] = truncateLabResultText(algorithm, 80)
+	}
+	if fingerprint := strings.TrimSpace(result.HostKeySHA256); fingerprint != "" {
+		payload["host_key_sha256"] = truncateLabResultText(fingerprint, 120)
+	}
+	if host := strings.TrimSpace(result.HostKeyHost); host != "" {
+		payload["host_key_host"] = truncateLabResultText(host, 255)
+	}
+	if remote := strings.TrimSpace(result.HostKeyRemote); remote != "" {
+		payload["host_key_remote"] = truncateLabResultText(remote, 255)
+	}
+	if stdout := strings.TrimSpace(result.Stdout); stdout != "" {
+		payload["stdout"] = truncateLabResultText(stdout, 2000)
+	}
+	if stderr := strings.TrimSpace(result.Stderr); stderr != "" {
+		payload["stderr"] = truncateLabResultText(stderr, 2000)
+	}
+	return payload
 }
 
 func (h Handler) serverMetrics(c *gin.Context) {

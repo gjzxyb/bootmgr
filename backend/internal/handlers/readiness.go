@@ -3,9 +3,11 @@ package handlers
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	"baremetal-platform/backend/internal/config"
+	"baremetal-platform/backend/internal/services"
 
 	"github.com/gin-gonic/gin"
 )
@@ -62,29 +64,15 @@ func (h Handler) readyz(c *gin.Context) {
 		addCheck("image_storage", "ok", "image storage is writable")
 	}
 
+	toolingStatus, toolingMessage := bmcToolingStatus(h.cfg.BMCAdapter)
+	addCheck("bmc_tooling", toolingStatus, toolingMessage)
+
+	sshKnownHostsStatus, sshKnownHostsMessage := h.sshKnownHostsStatus()
+	addCheck("ssh_known_hosts", sshKnownHostsStatus, sshKnownHostsMessage)
+
 	bootIssues := config.BootRuntimeIssues(h.cfg)
-	if !h.cfg.BootServicesEnabled {
-		if config.IsProduction(h.cfg.AppEnv) {
-			addCheck("pxe_services", "warning", "PXE/DHCP/TFTP listeners are disabled")
-		} else {
-			addCheck("pxe_services", "ok", "PXE/DHCP/TFTP listeners are disabled")
-		}
-	} else {
-		bootStatus := "ok"
-		bootMessage := "PXE/DHCP/TFTP runtime checks passed"
-		for _, issue := range bootIssues {
-			if issue.Level == "error" {
-				bootStatus = "error"
-				bootMessage = issue.Message
-				break
-			}
-			if issue.Level == "warning" && bootStatus == "ok" {
-				bootStatus = "warning"
-				bootMessage = issue.Message
-			}
-		}
-		addCheck("pxe_services", bootStatus, bootMessage)
-	}
+	pxeStatus, pxeMessage := pxeReadinessStatus(ctx, h.cfg, bootIssues)
+	addCheck("pxe_services", pxeStatus, pxeMessage)
 
 	validation := config.Validate(h.cfg)
 	response.ConfigIssues = validation.Issues()
@@ -98,4 +86,65 @@ func (h Handler) readyz(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, response)
+}
+
+func pxeReadinessStatus(ctx context.Context, cfg config.Config, bootIssues []config.Issue) (string, string) {
+	if !cfg.BootServicesEnabled {
+		if config.IsProduction(cfg.AppEnv) {
+			return "warning", "PXE/DHCP/TFTP listeners are disabled"
+		}
+		return "ok", "PXE/DHCP/TFTP listeners are disabled"
+	}
+	status := "ok"
+	issueMessage := ""
+	for _, issue := range bootIssues {
+		if issue.Level == "error" {
+			return "error", issue.Message
+		}
+		if issue.Level == "warning" && status == "ok" {
+			status = "warning"
+			issueMessage = issue.Message
+		}
+	}
+	data, tftpOptions, err := services.ProbeTFTPFileWithOptions(ctx, cfg.BootTFTPListenAddr, "boot.ipxe", 64*1024, map[string]string{"blksize": "1024", "timeout": "1", "tsize": "0"})
+	if err != nil {
+		return "error", "TFTP boot.ipxe probe failed: " + err.Error()
+	}
+	if !strings.Contains(string(data), "#!ipxe") {
+		return "error", "TFTP boot.ipxe did not return an iPXE script"
+	}
+	if tftpOptions["blksize"] == "" || tftpOptions["tsize"] == "" {
+		return "error", "TFTP boot.ipxe probe did not negotiate blksize/tsize options"
+	}
+	mode := strings.ToLower(strings.TrimSpace(cfg.BootServiceMode))
+	if mode == "" {
+		mode = "proxy"
+	}
+	tftpMessage := "TFTP OACK blksize=" + tftpOptions["blksize"] + " tsize=" + tftpOptions["tsize"]
+	message := "PXE/DHCP/TFTP runtime probes passed; " + tftpMessage
+	if mode == "external" {
+		message = "PXE/TFTP runtime probe passed; external DHCP is expected; " + tftpMessage
+	} else {
+		probe, err := services.ProbePXEDHCP(ctx, cfg.BootDHCPListenAddr, "52:54:00:00:00:fe", 9)
+		if err != nil {
+			return "error", "DHCP/ProxyDHCP probe failed: " + err.Error()
+		}
+		message = "PXE/DHCP/TFTP runtime probes passed; " + tftpMessage + "; DHCP bootfile=" + probe.Bootfile
+		if probe.LegacyBootfile != "" {
+			message += " legacy_bootfile=" + probe.LegacyBootfile
+		}
+		if probe.ServerIP != "" {
+			message += " server_identifier=" + probe.ServerIP
+		}
+		if probe.NextServerIP != "" {
+			message += " next_server=" + probe.NextServerIP
+		}
+		if probe.TFTPServerName != "" {
+			message += " tftp_server_name=" + probe.TFTPServerName
+		}
+	}
+	if status == "warning" {
+		return status, issueMessage + "; " + message
+	}
+	return status, message
 }

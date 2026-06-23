@@ -1,12 +1,28 @@
-import { EditOutlined, ExperimentOutlined, LockOutlined, PlayCircleOutlined, PlusOutlined, ReloadOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
+import { DownloadOutlined, EditOutlined, ExperimentOutlined, FileDoneOutlined, LockOutlined, PlayCircleOutlined, PlusOutlined, ReloadOutlined, SafetyCertificateOutlined, SearchOutlined } from '@ant-design/icons';
 import { Button, Descriptions, Form, Input, InputNumber, Modal, Select, Space, Table, Tabs, Tag, Typography, message } from 'antd';
 import { useEffect, useState } from 'react';
-import { api, ConfigIssue, LabBMCRef, LabBootEvent, LabSSHRef, LabValidationCheck, LabValidationReport, LabValidationRunResult, NetworkCheck, NetworkCheckReport, NetworkConfig, PageResult, ReadinessCheck, ReadinessStatus, rootApi, Tenant, User } from '../api/client';
+import { api, ConfigIssue, LabBMCRef, LabBootEvent, LabEvidenceCandidate, LabOperatorChecklistItem, LabSSHRef, LabValidationCheck, LabValidationEvidence, LabValidationEvidenceBundle, LabValidationLogEvent, LabValidationReport, LabValidationRunDetail, LabValidationRunResult, LabValidationRunSummary, LabValidationScriptExecution, LabValidationTarget, LabValidationTerminalSession, NetworkCheck, NetworkCheckReport, NetworkConfig, PageResult, ReadinessCheck, ReadinessStatus, rootApi, Tenant, User } from '../api/client';
 
 const roleColor = (role: string) => role === 'admin' ? 'red' : role === 'operator' ? 'blue' : 'default';
 const readinessColor = (status: string) => status === 'ok' ? 'green' : status === 'warning' ? 'orange' : 'red';
+const labRunColor = (status: string) => status === 'running' ? 'blue' : readinessColor(status);
 const runResultColor = (status: string) => status === 'success' ? 'green' : status === 'skipped' ? 'default' : 'red';
+const labTargetStatusColor = (status: string) => status === 'ok' ? 'green' : status === 'missing' ? 'default' : status === 'stale' || status === 'partial' || status === 'configured' || status === 'unknown' ? 'orange' : 'red';
 const serverLabel = (row: { hostname?: string; asset_no?: string; server_id: number }) => row.hostname || row.asset_no || `server-${row.server_id}`;
+const labRunTargets = (row: LabValidationRunSummary) => {
+  const parts = [];
+  if (row.server_ids?.length) parts.push(`资产 ${row.server_ids.join(',')}`);
+  if (row.pxe_macs?.length) parts.push(`PXE ${row.pxe_macs.join(',')}`);
+  return parts.join(' / ') || '-';
+};
+const runResultDetails = (details?: Record<string, unknown>) => {
+  if (!details || !Object.keys(details).length) return '-';
+  return Object.entries(details)
+    .filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== '')
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join('; ')
+    .slice(0, 160) || '-';
+};
 const quotaToText = (quota: unknown) => {
   if (quota === undefined || quota === null || quota === '') return '';
   try {
@@ -25,6 +41,15 @@ export function SystemPage() {
   const [labValidation, setLabValidation] = useState<LabValidationReport | null>(null);
   const [labValidationLoading, setLabValidationLoading] = useState(false);
   const [labValidationRunLoading, setLabValidationRunLoading] = useState(false);
+  const [labRunDetail, setLabRunDetail] = useState<LabValidationRunDetail | null>(null);
+  const [labRunDetailOpen, setLabRunDetailOpen] = useState(false);
+  const [labRunDetailLoading, setLabRunDetailLoading] = useState(false);
+  const [labEvidenceBundle, setLabEvidenceBundle] = useState<LabValidationEvidenceBundle | null>(null);
+  const [labEvidenceBundleOpen, setLabEvidenceBundleOpen] = useState(false);
+  const [labEvidenceBundleLoading, setLabEvidenceBundleLoading] = useState(false);
+  const [labRunOpen, setLabRunOpen] = useState(false);
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
+  const [evidenceLoading, setEvidenceLoading] = useState(false);
   const [total, setTotal] = useState(0);
   const [tenantTotal, setTenantTotal] = useState(0);
   const [networkTotal, setNetworkTotal] = useState(0);
@@ -55,6 +80,8 @@ export function SystemPage() {
   const [tenantForm] = Form.useForm();
   const [networkForm] = Form.useForm();
   const [passwordForm] = Form.useForm();
+  const [labRunForm] = Form.useForm();
+  const [evidenceForm] = Form.useForm();
   const [msg, holder] = message.useMessage();
 
   const loadUsers = async (nextPage = page, nextPageSize = pageSize) => {
@@ -104,16 +131,200 @@ export function SystemPage() {
     }
   };
 
+  const parseNumberList = (value?: string) => {
+    if (!value?.trim()) return undefined;
+    return value.split(/[,\s]+/).map(item => Number(item.trim())).filter(value => Number.isInteger(value) && value > 0);
+  };
+
+  const parseTextList = (value?: string) => {
+    if (!value?.trim()) return undefined;
+    return value.split(/[,\s]+/).map(item => item.trim()).filter(Boolean);
+  };
+
+  const openLabRunModal = (target?: LabValidationTarget) => {
+    labRunForm.resetFields();
+    labRunForm.setFieldsValue({
+      strict: true,
+      check_pxe: true,
+      check_bmc: true,
+      check_ssh: true,
+      limit: target ? 1 : 20,
+      server_ids: target ? String(target.server_id) : undefined,
+      pxe_macs: target?.primary_mac || undefined,
+      ssh_probe_command: undefined,
+      pxe_arch: 9
+    });
+    setLabRunOpen(true);
+  };
+
   const runLabValidation = async () => {
+    const values = await labRunForm.validateFields();
+    const payload = {
+      strict: values.strict,
+      check_pxe: values.check_pxe,
+      check_bmc: values.check_bmc,
+      check_ssh: values.check_ssh,
+      limit: values.limit,
+      server_ids: parseNumberList(values.server_ids),
+      pxe_macs: parseTextList(values.pxe_macs),
+      pxe_probe_mac: values.pxe_probe_mac || undefined,
+      ssh_probe_command: values.ssh_probe_command || undefined,
+      pxe_arch: values.pxe_arch
+    };
     setLabValidationRunLoading(true);
     try {
-      const { data } = await api.post<LabValidationReport>('/system/lab-validation/run', { check_pxe: true, check_bmc: true, check_ssh: true, limit: 20 }, { headers: { 'X-Confirm-Action': 'system.lab-validation.run' } });
+      const { data } = await api.post<LabValidationReport>('/system/lab-validation/run', payload, { headers: { 'X-Confirm-Action': 'system.lab-validation.run' } });
       setLabValidation(data);
+      setLabRunOpen(false);
       if (data.status === 'ok') msg.success('真实验收检查通过');
       else if (data.status === 'warning') msg.warning('真实验收检查存在 warning');
       else msg.error('真实验收检查存在 error');
     } finally {
       setLabValidationRunLoading(false);
+    }
+  };
+
+  const openLabRunDetail = async (run: LabValidationRunSummary) => {
+    setLabRunDetail(null);
+    setLabRunDetailOpen(true);
+    setLabRunDetailLoading(true);
+    try {
+      const { data } = await api.get<LabValidationRunDetail>(`/system/lab-validation/runs/${run.id}`);
+      setLabRunDetail(data);
+    } finally {
+      setLabRunDetailLoading(false);
+    }
+  };
+
+  const openLabEvidenceBundle = async (run: LabValidationRunSummary) => {
+    setLabEvidenceBundle(null);
+    setLabEvidenceBundleOpen(true);
+    setLabEvidenceBundleLoading(true);
+    try {
+      const { data } = await api.get<LabValidationEvidenceBundle>(`/system/lab-validation/runs/${run.id}/evidence-bundle`);
+      setLabEvidenceBundle(data);
+    } finally {
+      setLabEvidenceBundleLoading(false);
+    }
+  };
+
+  const downloadLabEvidenceBundle = () => {
+    if (!labEvidenceBundle) return;
+    const blob = new Blob([JSON.stringify(labEvidenceBundle, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `lab-validation-run-${labEvidenceBundle.run.id}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
+
+  const openEvidenceModal = (target?: LabValidationTarget) => {
+    evidenceForm.resetFields();
+    evidenceForm.setFieldsValue({
+      kind: target ? 'full' : 'pxe',
+      status: 'ok',
+      subject: target ? serverLabel(target) : undefined,
+      run_id: target?.latest_run_strict ? target.latest_run_id : undefined,
+      server_id: target?.server_id,
+      boot_event_id: target?.pxe_boot_event_id,
+      summary: target ? `${serverLabel(target)} 真实 PXE/BMC/SSH 验收证据` : undefined
+    });
+    setEvidenceOpen(true);
+  };
+
+  const checklistBootEvent = (row: LabOperatorChecklistItem) => {
+    if (!row.boot_event_id || !labEvidenceBundle) return undefined;
+    return labEvidenceBundle.boot_events.find(event => event.id === row.boot_event_id);
+  };
+
+  const checklistTarget = (row: LabOperatorChecklistItem) => {
+    if (!row.server_id || !labEvidenceBundle) return undefined;
+    return labEvidenceBundle.targets.find(target => target.server_id === row.server_id);
+  };
+
+  const checklistStepOK = (serverID: number | undefined, step: string) => {
+    if (!serverID || !labEvidenceBundle) return false;
+    return labEvidenceBundle.operator_checklist.some(item => item.server_id === serverID && item.step === step && item.status === 'ok');
+  };
+
+  const canRecordChecklistEvidence = (row: LabOperatorChecklistItem) => {
+    if (!labEvidenceBundle || !row.run_id) return false;
+    if (row.step === 'pxe_boot_event') return row.status === 'ok' && !!row.boot_event_id && !!checklistBootEvent(row)?.mac;
+    if (row.step === 'bmc_identity' || row.step === 'ssh_command') return row.status === 'ok' && !!row.server_id;
+    if (row.step === 'full_chain_evidence') {
+      return !!row.server_id && !!row.boot_event_id && !row.evidence_id &&
+        checklistStepOK(row.server_id, 'pxe_boot_event') &&
+        checklistStepOK(row.server_id, 'bmc_identity') &&
+        checklistStepOK(row.server_id, 'ssh_command');
+    }
+    return false;
+  };
+
+  const openEvidenceFromChecklist = (row: LabOperatorChecklistItem) => {
+    const target = checklistTarget(row);
+    const event = checklistBootEvent(row);
+    const targetName = target ? serverLabel(target) : row.subject;
+    const values: Record<string, unknown> = {
+      status: 'ok',
+      run_id: row.run_id,
+      server_id: row.server_id,
+      boot_event_id: row.boot_event_id
+    };
+    if (row.step === 'pxe_boot_event') {
+      values.kind = 'pxe';
+      values.subject = event?.mac || row.subject;
+      values.summary = `真实 PXE 启动证据 - ${event?.mac || row.subject}`;
+      values.details = `验收批次 #${row.run_id} 记录到真实 PXE BootEvent #${row.boot_event_id}${event?.source ? `，来源 ${event.source}` : ''}。`;
+    } else if (row.step === 'bmc_identity') {
+      values.kind = 'bmc';
+      values.subject = targetName;
+      values.summary = `物理 Redfish/IPMI 身份证据 - ${targetName}`;
+      values.details = `验收批次 #${row.run_id} 包含 server_id ${row.server_id} 的物理 BMC 身份 proof。`;
+    } else if (row.step === 'ssh_command') {
+      values.kind = 'ssh';
+      values.subject = targetName;
+      values.summary = `真实 SSH 命令证据 - ${targetName}`;
+      values.details = `验收批次 #${row.run_id} 包含 server_id ${row.server_id} 的真实 SSH command/exit_code/stdout proof。`;
+    } else {
+      values.kind = 'full';
+      values.subject = targetName;
+      values.summary = `全链路 PXE/BMC/SSH 验收证据 - ${targetName}`;
+      values.details = `验收批次 #${row.run_id} 已包含 server_id ${row.server_id} 的真实 PXE BootEvent #${row.boot_event_id}、物理 BMC 身份 proof 和真实 SSH 命令 proof。`;
+    }
+    evidenceForm.resetFields();
+    evidenceForm.setFieldsValue(values);
+    setEvidenceOpen(true);
+  };
+
+  const openEvidenceFromCandidate = (candidate: LabEvidenceCandidate) => {
+    evidenceForm.resetFields();
+    evidenceForm.setFieldsValue({
+      kind: candidate.kind,
+      status: candidate.status,
+      subject: candidate.subject,
+      summary: candidate.summary,
+      details: candidate.details,
+      run_id: candidate.run_id,
+      server_id: candidate.server_id,
+      boot_event_id: candidate.boot_event_id
+    });
+    setEvidenceOpen(true);
+  };
+
+  const recordLabEvidence = async () => {
+    const values = await evidenceForm.validateFields();
+    setEvidenceLoading(true);
+    try {
+      await api.post('/system/lab-validation/evidence', values, { headers: { 'X-Confirm-Action': 'system.lab-validation.evidence' } });
+      msg.success('验收证据已记录');
+      setEvidenceOpen(false);
+      void loadLabValidation();
+      if (labEvidenceBundle?.run) void openLabEvidenceBundle(labEvidenceBundle.run);
+    } finally {
+      setEvidenceLoading(false);
     }
   };
 
@@ -326,7 +537,7 @@ export function SystemPage() {
         </div>
         <Table<ReadinessCheck> rowKey="name" dataSource={readiness?.checks || []} loading={readinessLoading} pagination={false} columns={[
           { title: '检查项', dataIndex: 'name' },
-          { title: '状态', dataIndex: 'status', render: value => <Tag color={readinessColor(value)}>{value}</Tag> },
+          { title: '状态', dataIndex: 'status', render: value => <Tag color={labRunColor(value)}>{value}</Tag> },
           { title: '结果', dataIndex: 'message' }
         ]} />
         <Typography.Title level={5} style={{ marginTop: 18 }}>配置问题</Typography.Title>
@@ -344,7 +555,8 @@ export function SystemPage() {
           <Space>
             <Tag color={readinessColor(labValidation?.status || 'warning')}>总体 {labValidation?.status || '-'}</Tag>
             <Button icon={<ReloadOutlined />} loading={labValidationLoading} onClick={() => loadLabValidation()}>刷新</Button>
-            <Button type="primary" icon={<PlayCircleOutlined />} loading={labValidationRunLoading} onClick={runLabValidation}>执行检查</Button>
+            <Button type="primary" icon={<PlayCircleOutlined />} loading={labValidationRunLoading} onClick={() => openLabRunModal()}>执行检查</Button>
+            <Button icon={<FileDoneOutlined />} onClick={() => openEvidenceModal()}>记录证据</Button>
           </Space>
         </div>
         <Descriptions bordered size="small" column={{ xs: 1, md: 2 }} style={{ marginBottom: 16 }}>
@@ -377,7 +589,8 @@ export function SystemPage() {
           { title: 'MAC', dataIndex: 'mac' },
           { title: '固件', dataIndex: 'firmware' },
           { title: '架构', dataIndex: 'architecture' },
-          { title: '来源', dataIndex: 'remote_addr' },
+          { title: '链路', dataIndex: 'source', render: value => <Tag color={value === 'api_event' ? 'orange' : 'blue'}>{value || 'unknown'}</Tag> },
+          { title: '远端', dataIndex: 'remote_addr' },
           { title: '资产', dataIndex: 'server_id', render: value => value || '-' },
           { title: '时间', dataIndex: 'created_at' }
         ]} />
@@ -411,12 +624,52 @@ export function SystemPage() {
           { title: '状态', dataIndex: 'status', render: value => <Tag color={readinessColor(value === 'ok' ? 'ok' : value === 'error' ? 'error' : 'warning')}>{value || 'unknown'}</Tag> },
           { title: '最近检查', dataIndex: 'last_checked_at', render: value => value || '-' }
         ]} />
+        <Typography.Title level={5} style={{ marginTop: 18 }}>目标矩阵</Typography.Title>
+        <Table<LabValidationTarget> rowKey="server_id" dataSource={labValidation?.targets || []} loading={labValidationLoading || labValidationRunLoading} pagination={false} size="small" locale={{ emptyText: '暂无物理验收目标' }} columns={[
+          { title: '资产', render: (_, row) => serverLabel(row) },
+          { title: 'MAC', dataIndex: 'primary_mac', render: value => value || '-' },
+          { title: 'PXE', dataIndex: 'pxe_status', render: (_, row) => <Space><Tag color={labTargetStatusColor(row.pxe_status)}>{row.pxe_status}</Tag>{row.pxe_boot_event_id ? <Typography.Text type="secondary">#{row.pxe_boot_event_id}</Typography.Text> : null}</Space> },
+          { title: 'BMC', dataIndex: 'bmc_status', render: value => <Tag color={labTargetStatusColor(value)}>{value}</Tag> },
+          { title: 'SSH', dataIndex: 'ssh_status', render: value => <Tag color={labTargetStatusColor(value)}>{value}</Tag> },
+          { title: '证据', dataIndex: 'evidence_status', render: (_, row) => <Space><Tag color={labTargetStatusColor(row.evidence_status)}>{row.evidence_status}</Tag>{row.evidence_id ? <Typography.Text type="secondary">#{row.evidence_id}</Typography.Text> : null}</Space> },
+          { title: '最近批次', render: (_, row) => row.latest_run_id ? <Space><Typography.Text>#{row.latest_run_id}</Typography.Text>{row.latest_run_strict ? <Tag color="red">strict</Tag> : null}{row.latest_run_status ? <Tag color={labRunColor(row.latest_run_status)}>{row.latest_run_status}</Tag> : null}{row.latest_run_kind ? <Typography.Text type="secondary">{row.latest_run_kind}</Typography.Text> : null}{row.latest_run_result_status ? <Tag color={runResultColor(row.latest_run_result_status)}>{row.latest_run_result_status}</Tag> : null}</Space> : '-' },
+          { title: '全链路', dataIndex: 'full_chain_ready', render: value => value ? <Tag color="green">ready</Tag> : <Tag color="orange">pending</Tag> },
+          { title: '缺口', dataIndex: 'blocking_reasons', render: value => value?.length ? value.join('；') : '-' },
+          { title: '操作', render: (_, row) => <Space><Button size="small" icon={<PlayCircleOutlined />} loading={labValidationRunLoading} onClick={() => openLabRunModal(row)}>严格检查</Button><Button size="small" icon={<FileDoneOutlined />} onClick={() => openEvidenceModal(row)}>补证据</Button></Space> }
+        ]} />
+        <Typography.Title level={5} style={{ marginTop: 18 }}>物理证据</Typography.Title>
+        <Table<LabValidationEvidence> rowKey="id" dataSource={labValidation?.recent_evidence || []} loading={labValidationLoading} pagination={false} size="small" locale={{ emptyText: '暂无物理证据' }} columns={[
+          { title: '类型', dataIndex: 'kind' },
+          { title: '对象', dataIndex: 'subject', render: value => value || '-' },
+          { title: '资产', dataIndex: 'server_id', render: value => value || '-' },
+          { title: 'BootEvent', dataIndex: 'boot_event_id', render: value => value || '-' },
+          { title: '状态', dataIndex: 'status', render: value => <Tag color={readinessColor(value)}>{value}</Tag> },
+          { title: '摘要', dataIndex: 'summary' },
+          { title: '批次', dataIndex: 'run_id', render: value => value ? `#${value}` : '-' },
+          { title: '记录人', dataIndex: 'created_by' },
+          { title: '时间', dataIndex: 'created_at' }
+        ]} />
+        <Typography.Title level={5} style={{ marginTop: 18 }}>执行批次</Typography.Title>
+        <Table<LabValidationRunSummary> rowKey="id" dataSource={labValidation?.recent_runs || []} loading={labValidationLoading || labValidationRunLoading} pagination={false} size="small" locale={{ emptyText: '暂无执行批次' }} columns={[
+          { title: '批次', dataIndex: 'id', render: value => `#${value}` },
+          { title: '状态', dataIndex: 'status', render: value => <Tag color={labRunColor(value)}>{value}</Tag> },
+          { title: '严格', dataIndex: 'strict', render: value => value ? <Tag color="red">strict</Tag> : <Tag>off</Tag> },
+          { title: '范围', render: (_, row) => labRunTargets(row) },
+          { title: '结果', render: (_, row) => `${row.results} 项 / ${row.failures} 失败 / ${row.skipped} 跳过` },
+          { title: '请求人', dataIndex: 'requested_by', render: value => value || '-' },
+          { title: 'Request ID', dataIndex: 'request_id', render: value => value || '-' },
+          { title: '开始时间', dataIndex: 'started_at' },
+          { title: '完成时间', dataIndex: 'finished_at', render: value => value || '-' },
+          { title: '操作', render: (_, row) => <Space><Button size="small" icon={<SearchOutlined />} onClick={() => openLabRunDetail(row)}>查看</Button><Button size="small" icon={<DownloadOutlined />} onClick={() => openLabEvidenceBundle(row)}>验收包</Button></Space> }
+        ]} />
         <Typography.Title level={5} style={{ marginTop: 18 }}>执行结果</Typography.Title>
-        <Table<LabValidationRunResult> rowKey={record => `${record.kind}-${record.server_id}-${record.message}`} dataSource={labValidation?.run_results || []} loading={labValidationRunLoading} pagination={false} size="small" locale={{ emptyText: '暂无执行结果' }} columns={[
+        <Table<LabValidationRunResult> rowKey={record => record.id || `${record.run_id || labValidation?.run_id || 'current'}-${record.kind}-${record.server_id}-${record.message}`} dataSource={labValidation?.run_results || []} loading={labValidationRunLoading} pagination={false} size="small" locale={{ emptyText: '暂无执行结果' }} columns={[
+          { title: '批次', dataIndex: 'run_id', render: value => value || labValidation?.run_id || '-' },
           { title: '类型', dataIndex: 'kind' },
           { title: '资产', render: (_, row) => serverLabel(row) },
           { title: '状态', dataIndex: 'status', render: value => <Tag color={runResultColor(value)}>{value}</Tag> },
           { title: '结果', dataIndex: 'message' },
+          { title: '详情', dataIndex: 'details', render: value => <Typography.Text code>{runResultDetails(value)}</Typography.Text> },
           { title: '时间', dataIndex: 'checked_at', render: value => value || '-' }
         ]} />
       </>
@@ -537,6 +790,227 @@ export function SystemPage() {
         { title: '检查项', dataIndex: 'name' },
         { title: '状态', dataIndex: 'status', render: value => <Tag color={readinessColor(value)}>{value}</Tag> },
         { title: '结果', dataIndex: 'message' }
+      ]} />
+    </Modal>
+
+    <Modal title="记录物理验收证据" open={evidenceOpen} onOk={recordLabEvidence} confirmLoading={evidenceLoading} onCancel={() => setEvidenceOpen(false)} width={680} forceRender>
+      <Form form={evidenceForm} layout="vertical">
+        <Form.Item name="kind" label="类型" rules={[{ required: true }]}><Select options={[
+          { value: 'pxe', label: 'PXE/DHCP/TFTP' },
+          { value: 'bmc', label: 'Redfish/IPMI' },
+          { value: 'ssh', label: 'SSH 主机' },
+          { value: 'full', label: '全链路' }
+        ]} /></Form.Item>
+        <Form.Item name="status" label="状态" rules={[{ required: true }]}><Select options={[
+          { value: 'ok', label: 'ok' },
+          { value: 'warning', label: 'warning' },
+          { value: 'error', label: 'error' }
+        ]} /></Form.Item>
+        <Form.Item name="subject" label="对象" rules={[{ required: true, message: '请输入证据对象' }, { max: 160 }]}><Input placeholder="MAC、BMC 地址、SSH 主机或批次编号" /></Form.Item>
+        <Space wrap>
+          <Form.Item name="run_id" label="验收批次 ID" rules={[({ getFieldValue }) => ({
+            validator(_, value) {
+              const kind = getFieldValue('kind');
+              if (getFieldValue('status') === 'ok' && ['bmc', 'ssh', 'full'].includes(kind) && !value) {
+                return Promise.reject(new Error('ok BMC、SSH 或全链路证据必须关联严格验收批次 ID'));
+              }
+              return Promise.resolve();
+            }
+          })]}><InputNumber min={1} /></Form.Item>
+          <Form.Item name="server_id" label="资产 ID" rules={[({ getFieldValue }) => ({
+            validator(_, value) {
+              const kind = getFieldValue('kind');
+              if (getFieldValue('status') === 'ok' && ['bmc', 'ssh', 'full'].includes(kind) && !value) {
+                return Promise.reject(new Error('ok BMC、SSH 或全链路证据必须关联资产 ID'));
+              }
+              return Promise.resolve();
+            }
+          })]}><InputNumber min={1} /></Form.Item>
+          <Form.Item name="boot_event_id" label="BootEvent ID" rules={[({ getFieldValue }) => ({
+            validator(_, value) {
+              const kind = getFieldValue('kind');
+              if (getFieldValue('status') === 'ok' && ['pxe', 'full'].includes(kind) && !value) {
+                return Promise.reject(new Error('ok PXE 或全链路证据必须关联 BootEvent ID'));
+              }
+              return Promise.resolve();
+            }
+          })]}><InputNumber min={1} /></Form.Item>
+        </Space>
+        <Form.Item name="summary" label="摘要" rules={[{ required: true }, { max: 500 }]}><Input /></Form.Item>
+        <Form.Item name="details" label="详情" rules={[{ max: 4000 }]}><Input.TextArea rows={5} /></Form.Item>
+        <Form.Item name="artifact_url" label="证据链接" rules={[{ type: 'url' }, { max: 500 }]}><Input placeholder="https://..." /></Form.Item>
+      </Form>
+    </Modal>
+
+    <Modal title="执行真实验收检查" open={labRunOpen} onOk={runLabValidation} confirmLoading={labValidationRunLoading} onCancel={() => setLabRunOpen(false)} width={680} forceRender>
+      <Form form={labRunForm} layout="vertical">
+        <Space wrap>
+          <Form.Item name="strict" label="严格验收" style={{ minWidth: 130 }}><Select options={[{ value: true, label: '开启' }, { value: false, label: '关闭' }]} /></Form.Item>
+          <Form.Item name="check_pxe" label="PXE" style={{ minWidth: 130 }}><Select options={[{ value: true, label: '检查' }, { value: false, label: '跳过' }]} /></Form.Item>
+          <Form.Item name="check_bmc" label="BMC" style={{ minWidth: 130 }}><Select options={[{ value: true, label: '检查' }, { value: false, label: '跳过' }]} /></Form.Item>
+          <Form.Item name="check_ssh" label="SSH" style={{ minWidth: 130 }}><Select options={[{ value: true, label: '检查' }, { value: false, label: '跳过' }]} /></Form.Item>
+          <Form.Item name="limit" label="数量上限"><InputNumber min={1} max={50} /></Form.Item>
+        </Space>
+        <Form.Item name="server_ids" label="资产 ID"><Input placeholder="1,2,3" /></Form.Item>
+        <Form.Item name="pxe_macs" label="PXE MAC"><Input placeholder="52:54:00:aa:bb:cc, 52:54:00:dd:ee:ff" /></Form.Item>
+        <Form.Item name="ssh_probe_command" label="SSH 探针命令" rules={[{ max: 255 }]}><Input placeholder="默认执行安全只读探针命令" /></Form.Item>
+        <Space wrap>
+          <Form.Item name="pxe_probe_mac" label="探针 MAC"><Input placeholder="52:54:00:00:00:fe" style={{ width: 240 }} /></Form.Item>
+          <Form.Item name="pxe_arch" label="PXE 架构" style={{ minWidth: 180 }}><Select options={[
+            { value: 9, label: 'UEFI x86_64 (9)' },
+            { value: 7, label: 'UEFI x86_64 (7)' },
+            { value: 11, label: 'UEFI x86_64 HTTP (11)' },
+            { value: 0, label: 'Legacy BIOS (0)' }
+          ]} /></Form.Item>
+        </Space>
+      </Form>
+    </Modal>
+
+    <Modal title={`验收批次 #${labRunDetail?.run.id || ''}`} open={labRunDetailOpen} onCancel={() => setLabRunDetailOpen(false)} footer={<Space><Button icon={<DownloadOutlined />} disabled={!labRunDetail} onClick={() => labRunDetail && openLabEvidenceBundle(labRunDetail.run)}>验收包</Button><Button type="primary" onClick={() => setLabRunDetailOpen(false)}>关闭</Button></Space>} width={880}>
+      <Descriptions bordered size="small" column={{ xs: 1, md: 2 }} style={{ marginBottom: 12 }}>
+        <Descriptions.Item label="状态">{labRunDetail?.run.status ? <Tag color={labRunColor(labRunDetail.run.status)}>{labRunDetail.run.status}</Tag> : '-'}</Descriptions.Item>
+        <Descriptions.Item label="严格验收">{labRunDetail?.run.strict ? '开启' : '关闭'}</Descriptions.Item>
+        <Descriptions.Item label="请求人">{labRunDetail?.run.requested_by || '-'}</Descriptions.Item>
+        <Descriptions.Item label="Request ID">{labRunDetail?.run.request_id || '-'}</Descriptions.Item>
+        <Descriptions.Item label="目标">{labRunDetail ? labRunTargets(labRunDetail.run) : '-'}</Descriptions.Item>
+        <Descriptions.Item label="SSH 探针命令">{labRunDetail?.run.ssh_probe_command || '-'}</Descriptions.Item>
+        <Descriptions.Item label="结果">{labRunDetail ? `${labRunDetail.run.results} 项 / ${labRunDetail.run.failures} 失败 / ${labRunDetail.run.skipped} 跳过` : '-'}</Descriptions.Item>
+      </Descriptions>
+      <Table<LabValidationRunResult> rowKey={record => record.id || `${record.kind}-${record.server_id}-${record.message}`} dataSource={labRunDetail?.results || []} loading={labRunDetailLoading} pagination={false} size="small" locale={{ emptyText: '暂无执行结果' }} columns={[
+        { title: '类型', dataIndex: 'kind' },
+        { title: '资产', render: (_, row) => serverLabel(row) },
+        { title: '状态', dataIndex: 'status', render: value => <Tag color={runResultColor(value)}>{value}</Tag> },
+        { title: '结果', dataIndex: 'message' },
+        { title: '详情', dataIndex: 'details', render: value => <Typography.Text code>{runResultDetails(value)}</Typography.Text> },
+        { title: '时间', dataIndex: 'checked_at', render: value => value || '-' }
+      ]} />
+    </Modal>
+
+    <Modal title={`验收包 #${labEvidenceBundle?.run.id || ''}`} open={labEvidenceBundleOpen} onCancel={() => setLabEvidenceBundleOpen(false)} footer={<Space><Button icon={<DownloadOutlined />} disabled={!labEvidenceBundle} onClick={downloadLabEvidenceBundle}>下载 JSON</Button><Button type="primary" onClick={() => setLabEvidenceBundleOpen(false)}>关闭</Button></Space>} width={980}>
+      <Descriptions bordered size="small" column={{ xs: 1, md: 2 }} style={{ marginBottom: 12 }}>
+        <Descriptions.Item label="生成时间">{labEvidenceBundle?.generated_at || '-'}</Descriptions.Item>
+        <Descriptions.Item label="批次状态">{labEvidenceBundle?.run.status ? <Tag color={labRunColor(labEvidenceBundle.run.status)}>{labEvidenceBundle.run.status}</Tag> : '-'}</Descriptions.Item>
+        <Descriptions.Item label="BMC 适配器">{labEvidenceBundle?.environment.bmc_adapter || '-'}</Descriptions.Item>
+        <Descriptions.Item label="启动 URL">{labEvidenceBundle?.environment.boot_base_url || '-'}</Descriptions.Item>
+        <Descriptions.Item label="目标">{labEvidenceBundle ? labRunTargets(labEvidenceBundle.run) : '-'}</Descriptions.Item>
+        <Descriptions.Item label="备注">{labEvidenceBundle?.notes?.join('；') || '-'}</Descriptions.Item>
+      </Descriptions>
+      <Typography.Title level={5}>检查项</Typography.Title>
+      <Table<LabValidationCheck> rowKey="name" dataSource={labEvidenceBundle?.checks || []} loading={labEvidenceBundleLoading} pagination={false} size="small" columns={[
+        { title: '检查项', dataIndex: 'name' },
+        { title: '状态', dataIndex: 'status', render: value => <Tag color={readinessColor(value)}>{value}</Tag> },
+        { title: '结果', dataIndex: 'message' }
+      ]} />
+      <Typography.Title level={5} style={{ marginTop: 18 }}>现场检查清单</Typography.Title>
+      <Table<LabOperatorChecklistItem> rowKey={record => `${record.subject}-${record.step}-${record.server_id || 0}-${record.boot_event_id || 0}`} dataSource={labEvidenceBundle?.operator_checklist || []} loading={labEvidenceBundleLoading} pagination={false} size="small" locale={{ emptyText: '暂无现场检查清单' }} columns={[
+        { title: '对象', dataIndex: 'subject' },
+        { title: '步骤', dataIndex: 'step' },
+        { title: '状态', dataIndex: 'status', render: value => <Tag color={value === 'pending' ? 'orange' : readinessColor(value)}>{value}</Tag> },
+        { title: '引用', render: (_, row) => <Space wrap>{row.run_id ? <Typography.Text>run #{row.run_id}</Typography.Text> : null}{row.server_id ? <Typography.Text>server #{row.server_id}</Typography.Text> : null}{row.boot_event_id ? <Typography.Text>BootEvent #{row.boot_event_id}</Typography.Text> : null}{row.evidence_id ? <Typography.Text>evidence #{row.evidence_id}</Typography.Text> : null}</Space> },
+        { title: '结果', dataIndex: 'message' },
+        { title: '下一步', dataIndex: 'next_action', render: value => value || '-' },
+        { title: '阻塞原因', dataIndex: 'blocking_reasons', render: value => Array.isArray(value) && value.length ? value.join('；') : '-' },
+        { title: '操作', render: (_, row) => canRecordChecklistEvidence(row) ? <Button size="small" icon={<FileDoneOutlined />} onClick={() => openEvidenceFromChecklist(row)}>记录证据</Button> : '-' }
+      ]} />
+      <Typography.Title level={5} style={{ marginTop: 18 }}>可记录证据候选</Typography.Title>
+      <Table<LabEvidenceCandidate> rowKey={record => `${record.kind}-${record.server_id || 0}-${record.boot_event_id || 0}-${record.source_step}`} dataSource={labEvidenceBundle?.evidence_candidates || []} loading={labEvidenceBundleLoading} pagination={false} size="small" locale={{ emptyText: '暂无可记录证据候选' }} columns={[
+        { title: '类型', dataIndex: 'kind' },
+        { title: '对象', dataIndex: 'subject' },
+        { title: '来源', dataIndex: 'source_step' },
+        { title: '引用', render: (_, row) => <Space wrap><Typography.Text>run #{row.run_id}</Typography.Text>{row.server_id ? <Typography.Text>server #{row.server_id}</Typography.Text> : null}{row.boot_event_id ? <Typography.Text>BootEvent #{row.boot_event_id}</Typography.Text> : null}</Space> },
+        { title: '摘要', dataIndex: 'summary' },
+        { title: '操作', render: (_, row) => <Button size="small" icon={<FileDoneOutlined />} onClick={() => openEvidenceFromCandidate(row)}>记录证据</Button> }
+      ]} />
+      <Typography.Title level={5}>执行结果</Typography.Title>
+      <Table<LabValidationRunResult> rowKey={record => record.id || `${record.kind}-${record.server_id}-${record.message}`} dataSource={labEvidenceBundle?.results || []} loading={labEvidenceBundleLoading} pagination={false} size="small" columns={[
+        { title: '类型', dataIndex: 'kind' },
+        { title: '资产', render: (_, row) => serverLabel(row) },
+        { title: '状态', dataIndex: 'status', render: value => <Tag color={runResultColor(value)}>{value}</Tag> },
+        { title: '结果', dataIndex: 'message' },
+        { title: '详情', dataIndex: 'details', render: value => <Typography.Text code>{runResultDetails(value)}</Typography.Text> },
+        { title: '时间', dataIndex: 'checked_at', render: value => value || '-' }
+      ]} />
+      <Typography.Title level={5} style={{ marginTop: 18 }}>目标矩阵</Typography.Title>
+      <Table<LabValidationTarget> rowKey="server_id" dataSource={labEvidenceBundle?.targets || []} loading={labEvidenceBundleLoading} pagination={false} size="small" locale={{ emptyText: '暂无目标矩阵' }} columns={[
+        { title: '资产', render: (_, row) => serverLabel(row) },
+        { title: 'MAC', dataIndex: 'primary_mac', render: value => value || '-' },
+        { title: 'PXE', dataIndex: 'pxe_status', render: value => <Tag color={labTargetStatusColor(value)}>{value}</Tag> },
+        { title: 'BMC', dataIndex: 'bmc_status', render: value => <Tag color={labTargetStatusColor(value)}>{value}</Tag> },
+        { title: 'SSH', dataIndex: 'ssh_status', render: value => <Tag color={labTargetStatusColor(value)}>{value}</Tag> },
+        { title: '证据', dataIndex: 'evidence_status', render: value => <Tag color={labTargetStatusColor(value)}>{value}</Tag> },
+        { title: '最近批次', render: (_, row) => row.latest_run_id ? <Space><Typography.Text>#{row.latest_run_id}</Typography.Text>{row.latest_run_strict ? <Tag color="red">strict</Tag> : null}{row.latest_run_status ? <Tag color={labRunColor(row.latest_run_status)}>{row.latest_run_status}</Tag> : null}{row.latest_run_result_status ? <Tag color={runResultColor(row.latest_run_result_status)}>{row.latest_run_result_status}</Tag> : null}</Space> : '-' },
+        { title: '全链路', dataIndex: 'full_chain_ready', render: value => value ? <Tag color="green">ready</Tag> : <Tag color="orange">pending</Tag> }
+      ]} />
+      <Typography.Title level={5} style={{ marginTop: 18 }}>关联 BootEvent</Typography.Title>
+      <Table<LabBootEvent> rowKey="id" dataSource={labEvidenceBundle?.boot_events || []} loading={labEvidenceBundleLoading} pagination={false} size="small" locale={{ emptyText: '暂无关联 BootEvent' }} columns={[
+        { title: 'ID', dataIndex: 'id' },
+        { title: 'MAC', dataIndex: 'mac' },
+        { title: '固件', dataIndex: 'firmware' },
+        { title: '链路', dataIndex: 'source', render: value => <Tag color={value === 'api_event' ? 'orange' : 'blue'}>{value || 'unknown'}</Tag> },
+        { title: '远端', dataIndex: 'remote_addr' },
+        { title: '资产', dataIndex: 'server_id', render: value => value || '-' },
+        { title: '时间', dataIndex: 'created_at' }
+      ]} />
+      <Typography.Title level={5} style={{ marginTop: 18 }}>关联 BMC / SSH</Typography.Title>
+      <Table<LabBMCRef> rowKey="server_id" dataSource={labEvidenceBundle?.bmc_endpoints || []} loading={labEvidenceBundleLoading} pagination={false} size="small" locale={{ emptyText: '暂无关联 BMC' }} columns={[
+        { title: '资产', render: (_, row) => serverLabel(row) },
+        { title: '类型', dataIndex: 'type' },
+        { title: '端点', dataIndex: 'endpoint' },
+        { title: '状态', dataIndex: 'status', render: value => <Tag color={readinessColor(value)}>{value}</Tag> },
+        { title: '检查时间', dataIndex: 'last_checked_at', render: value => value || '-' }
+      ]} />
+      <Table<LabSSHRef> rowKey="server_id" dataSource={labEvidenceBundle?.ssh_accesses || []} loading={labEvidenceBundleLoading} pagination={false} size="small" style={{ marginTop: 8 }} locale={{ emptyText: '暂无关联 SSH' }} columns={[
+        { title: '资产', render: (_, row) => serverLabel(row) },
+        { title: '主机', render: (_, row) => `${row.host}:${row.port}` },
+        { title: '用户', dataIndex: 'username' },
+        { title: '状态', dataIndex: 'status', render: value => <Tag color={readinessColor(value)}>{value}</Tag> },
+        { title: '检查时间', dataIndex: 'last_checked_at', render: value => value || '-' }
+      ]} />
+      <Typography.Title level={5} style={{ marginTop: 18 }}>关联终端会话</Typography.Title>
+      <Table<LabValidationTerminalSession> rowKey="id" dataSource={labEvidenceBundle?.terminal_sessions || []} loading={labEvidenceBundleLoading} pagination={false} size="small" locale={{ emptyText: '暂无关联终端会话' }} columns={[
+        { title: 'ID', dataIndex: 'id', render: value => `#${value}` },
+        { title: '资产', render: (_, row) => serverLabel(row) },
+        { title: '模式', dataIndex: 'mode' },
+        { title: '状态', dataIndex: 'status', render: value => <Tag color={readinessColor(value)}>{value}</Tag> },
+        { title: '操作者', dataIndex: 'requested_by' },
+        { title: '打开时间', dataIndex: 'opened_at' },
+        { title: 'Transcript', dataIndex: 'transcript', render: value => <Typography.Text code>{value ? String(value).slice(0, 120) : '-'}</Typography.Text> }
+      ]} />
+      <Typography.Title level={5} style={{ marginTop: 18 }}>关联脚本执行</Typography.Title>
+      <Table<LabValidationScriptExecution> rowKey="id" dataSource={labEvidenceBundle?.script_executions || []} loading={labEvidenceBundleLoading} pagination={false} size="small" locale={{ emptyText: '暂无关联脚本执行' }} columns={[
+        { title: 'ID', dataIndex: 'id', render: value => `#${value}` },
+        { title: '任务', render: (_, row) => row.job_name ? `${row.job_name} (#${row.script_job_id})` : `#${row.script_job_id}` },
+        { title: '资产', render: (_, row) => serverLabel(row) },
+        { title: '状态', dataIndex: 'status', render: value => <Tag color={runResultColor(value)}>{value}</Tag> },
+        { title: '退出码', dataIndex: 'exit_code' },
+        { title: '完成时间', dataIndex: 'finished_at', render: value => value || '-' },
+        { title: '输出', render: (_, row) => <Typography.Text code>{(row.stdout || row.stderr) ? `${row.stdout || ''}${row.stderr ? ` ${row.stderr}` : ''}`.slice(0, 120) : '-'}</Typography.Text> }
+      ]} />
+      <Typography.Title level={5} style={{ marginTop: 18 }}>关联日志事件</Typography.Title>
+      <Table<LabValidationLogEvent> rowKey="id" dataSource={labEvidenceBundle?.log_events || []} loading={labEvidenceBundleLoading} pagination={false} size="small" locale={{ emptyText: '暂无关联日志事件' }} columns={[
+        { title: 'ID', dataIndex: 'id', render: value => `#${value}` },
+        { title: '资产', render: (_, row) => serverLabel(row) },
+        { title: '来源', dataIndex: 'source' },
+        { title: '级别', dataIndex: 'level', render: value => <Tag color={readinessColor(value === 'info' ? 'ok' : 'warning')}>{value}</Tag> },
+        { title: '时间', dataIndex: 'occurred_at' },
+        { title: '消息', dataIndex: 'message', render: value => <Typography.Text code>{value ? String(value).slice(0, 140) : '-'}</Typography.Text> }
+      ]} />
+      <Typography.Title level={5} style={{ marginTop: 18 }}>关联物理证据</Typography.Title>
+      <Table<LabValidationEvidence> rowKey="id" dataSource={labEvidenceBundle?.recent_evidence || []} loading={labEvidenceBundleLoading} pagination={false} size="small" locale={{ emptyText: '暂无关联物理证据' }} columns={[
+        { title: '类型', dataIndex: 'kind' },
+        { title: '对象', dataIndex: 'subject' },
+        { title: '资产', dataIndex: 'server_id', render: value => value || '-' },
+        { title: 'BootEvent', dataIndex: 'boot_event_id', render: value => value || '-' },
+        { title: '状态', dataIndex: 'status', render: value => <Tag color={readinessColor(value)}>{value}</Tag> },
+        { title: '摘要', dataIndex: 'summary' },
+        { title: '批次', dataIndex: 'run_id', render: value => value ? `#${value}` : '-' },
+        { title: '时间', dataIndex: 'created_at' }
+      ]} />
+      <Typography.Title level={5} style={{ marginTop: 18 }}>配置与运行问题</Typography.Title>
+      <Table<ConfigIssue> rowKey={record => `${record.level}-${record.key}-${record.message}`} dataSource={[...(labEvidenceBundle?.config_issues || []), ...(labEvidenceBundle?.pxe_runtime_issues || [])]} loading={labEvidenceBundleLoading} pagination={false} size="small" locale={{ emptyText: '暂无配置或运行问题' }} columns={[
+        { title: '级别', dataIndex: 'level', render: value => <Tag color={readinessColor(value)}>{value}</Tag> },
+        { title: '配置项', dataIndex: 'key' },
+        { title: '说明', dataIndex: 'message' }
       ]} />
     </Modal>
 

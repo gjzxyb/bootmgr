@@ -22,6 +22,8 @@ import (
 	"gorm.io/gorm"
 )
 
+const labValidationDHCPProbeVendorClass = "PXEClient:LabValidationProbe"
+
 type PXEService struct {
 	db     *gorm.DB
 	cfg    config.Config
@@ -66,6 +68,10 @@ func (s PXEService) startDHCP(ctx context.Context) error {
 	conn, err := net.ListenUDP("udp4", addr)
 	if err != nil {
 		return fmt.Errorf("listen DHCP on %s: %w", s.cfg.BootDHCPListenAddr, err)
+	}
+	if err := enableUDPBroadcast(conn); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("enable DHCP broadcast on %s: %w", s.cfg.BootDHCPListenAddr, err)
 	}
 	s.logger("DHCP/ProxyDHCP listener active on %s mode=%s interface=%s", s.cfg.BootDHCPListenAddr, s.cfg.BootServiceMode, s.cfg.BootBindInterface)
 	go func() {
@@ -124,7 +130,14 @@ func (s PXEService) handleDHCPPacket(conn *net.UDPConn, addr *net.UDPAddr, packe
 		s.logger("DHCP response to %s failed: %v", dest, err)
 		return
 	}
-	_, _, _ = s.boot.RenderIPXEScript(BootRequest{MAC: packet.macString(), Architecture: packet.architecture(), Firmware: packet.firmware(), RemoteAddr: addr.String()})
+	if packet.isLabValidationProbe() {
+		return
+	}
+	remoteAddr := ""
+	if addr != nil {
+		remoteAddr = addr.String()
+	}
+	_, _, _ = s.boot.RenderIPXEScript(BootRequest{MAC: packet.macString(), Architecture: packet.architecture(), Firmware: packet.firmware(), RemoteAddr: remoteAddr, Source: "pxe_dhcp"})
 }
 
 func (s PXEService) buildDHCPResponse(packet dhcpPacket, leaseIP net.IP, messageType byte) []byte {
@@ -145,6 +158,11 @@ func (s PXEService) buildDHCPResponse(packet dhcpPacket, leaseIP net.IP, message
 		copy(resp[20:24], serverIP)
 	}
 	copy(resp[28:44], packet.chaddr[:])
+	bootfile := s.bootfile(packet)
+	if serverIP != nil {
+		copyBOOTPString(resp[44:108], serverIP.String())
+	}
+	copyBOOTPString(resp[108:236], bootfile)
 	resp[236], resp[237], resp[238], resp[239] = 99, 130, 83, 99
 
 	options := dhcpOptions{}
@@ -154,7 +172,7 @@ func (s PXEService) buildDHCPResponse(packet dhcpPacket, leaseIP net.IP, message
 		options.add(66, []byte(serverIP.String()))
 	}
 	options.add(60, []byte("PXEClient"))
-	options.add(67, []byte(s.bootfile(packet)))
+	options.add(67, []byte(bootfile))
 	if strings.ToLower(strings.TrimSpace(s.cfg.BootServiceMode)) == "builtin" {
 		options.addU32(51, 3600)
 		if network, ok := s.deploymentNetwork(); ok {
@@ -255,11 +273,12 @@ func (s PXEService) serveTFTPRequest(addr *net.UDPAddr, req tftpRRQ) {
 	}
 	defer conn.Close()
 	blockSize := req.blockSize()
+	ackTimeout := req.ackTimeout()
 	if req.hasOptions() {
 		if err := tftpSendOACK(conn, addr, req, len(data), blockSize); err != nil {
 			return
 		}
-		if err := tftpWaitACK(conn, addr, 0); err != nil {
+		if err := tftpWaitACK(conn, addr, 0, ackTimeout); err != nil {
 			return
 		}
 	}
@@ -273,7 +292,7 @@ func (s PXEService) serveTFTPRequest(addr *net.UDPAddr, req tftpRRQ) {
 		} else if readErr != nil {
 			return
 		}
-		if err := tftpSendDataWithRetry(conn, addr, block, chunk); err != nil {
+		if err := tftpSendDataWithRetry(conn, addr, block, chunk, ackTimeout); err != nil {
 			return
 		}
 		if len(chunk) < blockSize {
@@ -340,6 +359,8 @@ type dhcpPacket struct {
 	yiaddr  [4]byte
 	siaddr  [4]byte
 	chaddr  [16]byte
+	sname   [64]byte
+	file    [128]byte
 	options map[byte][]byte
 }
 
@@ -366,6 +387,8 @@ func parseDHCPMessage(data []byte, op byte, label string) (dhcpPacket, error) {
 	copy(p.yiaddr[:], data[16:20])
 	copy(p.siaddr[:], data[20:24])
 	copy(p.chaddr[:], data[28:44])
+	copy(p.sname[:], data[44:108])
+	copy(p.file[:], data[108:236])
 	p.options = parseDHCPOptions(data[240:])
 	return p, nil
 }
@@ -407,6 +430,10 @@ func (p dhcpPacket) isPXEClient() bool {
 	return strings.Contains(strings.ToLower(string(p.options[60])), "pxeclient")
 }
 
+func (p dhcpPacket) isLabValidationProbe() bool {
+	return strings.Contains(strings.ToLower(string(p.options[60])), "labvalidationprobe")
+}
+
 func (p dhcpPacket) optionUint16(code byte) uint16 {
 	value := p.options[code]
 	if len(value) < 2 {
@@ -433,6 +460,32 @@ func (p dhcpPacket) firmware() string {
 	}
 }
 
+func (p dhcpPacket) legacyBootfile() string {
+	return strings.TrimSpace(bootpString(p.file[:]))
+}
+
+func copyBOOTPString(dst []byte, value string) {
+	value = strings.TrimSpace(value)
+	if len(dst) == 0 || value == "" {
+		return
+	}
+	limit := len(dst) - 1
+	if limit < 0 {
+		return
+	}
+	if len(value) > limit {
+		value = value[:limit]
+	}
+	copy(dst, value)
+}
+
+func bootpString(value []byte) string {
+	if i := bytes.IndexByte(value, 0); i >= 0 {
+		value = value[:i]
+	}
+	return string(value)
+}
+
 type dhcpOptions struct{ buf []byte }
 
 func (o *dhcpOptions) add(code byte, value []byte) {
@@ -454,11 +507,13 @@ func (o *dhcpOptions) bytes() []byte {
 }
 
 type DHCPProbeResult struct {
-	MessageType  byte
-	Bootfile     string
-	ServerIP     string
-	NextServerIP string
-	LeaseIP      string
+	MessageType    byte
+	Bootfile       string
+	LegacyBootfile string
+	ServerIP       string
+	NextServerIP   string
+	TFTPServerName string
+	LeaseIP        string
 }
 
 type tftpRRQ struct {
@@ -501,10 +556,27 @@ func (r tftpRRQ) blockSize() int {
 	return 512
 }
 
+func (r tftpRRQ) ackTimeout() time.Duration {
+	return time.Duration(r.timeoutSeconds()) * time.Second
+}
+
+func (r tftpRRQ) timeoutSeconds() int {
+	if value, ok := r.options["timeout"]; ok {
+		parsed, err := strconv.Atoi(value)
+		if err == nil && parsed >= 1 && parsed <= 255 {
+			return parsed
+		}
+	}
+	return 2
+}
+
 func tftpSendOACK(conn *net.UDPConn, addr *net.UDPAddr, req tftpRRQ, size int, blockSize int) error {
 	payload := []byte{0, 6}
 	if _, ok := req.options["blksize"]; ok {
 		payload = appendTFTPOption(payload, "blksize", strconv.Itoa(blockSize))
+	}
+	if _, ok := req.options["timeout"]; ok {
+		payload = appendTFTPOption(payload, "timeout", strconv.Itoa(req.timeoutSeconds()))
 	}
 	if _, ok := req.options["tsize"]; ok {
 		payload = appendTFTPOption(payload, "tsize", strconv.Itoa(size))
@@ -521,7 +593,7 @@ func appendTFTPOption(payload []byte, key, value string) []byte {
 	return payload
 }
 
-func tftpSendDataWithRetry(conn *net.UDPConn, addr *net.UDPAddr, block uint16, data []byte) error {
+func tftpSendDataWithRetry(conn *net.UDPConn, addr *net.UDPAddr, block uint16, data []byte, ackTimeout time.Duration) error {
 	payload := make([]byte, 4+len(data))
 	payload[1] = 3
 	binary.BigEndian.PutUint16(payload[2:4], block)
@@ -530,17 +602,20 @@ func tftpSendDataWithRetry(conn *net.UDPConn, addr *net.UDPAddr, block uint16, d
 		if _, err := conn.WriteToUDP(payload, addr); err != nil {
 			return err
 		}
-		if err := tftpWaitACK(conn, addr, block); err == nil {
+		if err := tftpWaitACK(conn, addr, block, ackTimeout); err == nil {
 			return nil
 		}
 	}
 	return errors.New("TFTP ACK timeout")
 }
 
-func tftpWaitACK(conn *net.UDPConn, addr *net.UDPAddr, block uint16) error {
+func tftpWaitACK(conn *net.UDPConn, addr *net.UDPAddr, block uint16, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
 	buf := make([]byte, 516)
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_ = conn.SetReadDeadline(time.Now().Add(timeout))
 		n, from, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			return err
@@ -558,19 +633,24 @@ func tftpWaitACK(conn *net.UDPConn, addr *net.UDPAddr, block uint16) error {
 }
 
 func ProbeTFTPFile(ctx context.Context, listenAddr string, filename string, maxBytes int64) ([]byte, error) {
+	data, _, err := ProbeTFTPFileWithOptions(ctx, listenAddr, filename, maxBytes, nil)
+	return data, err
+}
+
+func ProbeTFTPFileWithOptions(ctx context.Context, listenAddr string, filename string, maxBytes int64, options map[string]string) ([]byte, map[string]string, error) {
 	if strings.TrimSpace(filename) == "" {
-		return nil, errors.New("TFTP probe filename is required")
+		return nil, nil, errors.New("TFTP probe filename is required")
 	}
 	if maxBytes <= 0 {
 		maxBytes = 64 * 1024
 	}
 	serverAddr, err := resolveTFTPProbeAddr(listenAddr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	conn, err := net.ListenUDP("udp4", nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer conn.Close()
 
@@ -579,21 +659,33 @@ func ProbeTFTPFile(ctx context.Context, listenAddr string, filename string, maxB
 	req = append(req, 0)
 	req = append(req, []byte("octet")...)
 	req = append(req, 0)
+	for _, key := range sortedTFTPProbeOptionKeys(options) {
+		value := strings.TrimSpace(options[key])
+		if value == "" {
+			continue
+		}
+		req = append(req, []byte(strings.ToLower(strings.TrimSpace(key)))...)
+		req = append(req, 0)
+		req = append(req, []byte(value)...)
+		req = append(req, 0)
+	}
 	if _, err := conn.WriteToUDP(req, serverAddr); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var out bytes.Buffer
 	var transferAddr *net.UDPAddr
+	negotiatedOptions := map[string]string{}
 	expectedBlock := uint16(1)
-	buf := make([]byte, 4+512)
+	blockSize := 512
+	buf := make([]byte, 4+1468)
 	for {
 		if err := setProbeReadDeadline(ctx, conn, 3*time.Second); err != nil {
-			return nil, err
+			return nil, negotiatedOptions, err
 		}
 		n, from, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			return nil, err
+			return nil, negotiatedOptions, err
 		}
 		if transferAddr != nil && (from.IP.String() != transferAddr.IP.String() || from.Port != transferAddr.Port) {
 			continue
@@ -603,6 +695,25 @@ func ProbeTFTPFile(ctx context.Context, listenAddr string, filename string, maxB
 		}
 		opcode := buf[1]
 		switch opcode {
+		case 6:
+			if transferAddr != nil || expectedBlock != 1 {
+				continue
+			}
+			parsedOptions, err := parseTFTPOptionAck(buf[:n])
+			if err != nil {
+				return nil, negotiatedOptions, err
+			}
+			negotiatedOptions = parsedOptions
+			if value, ok := negotiatedOptions["blksize"]; ok {
+				parsed, err := strconv.Atoi(value)
+				if err == nil && parsed >= 8 && parsed <= 1468 {
+					blockSize = parsed
+				}
+			}
+			transferAddr = from
+			if err := sendTFTPACK(conn, from, 0); err != nil {
+				return nil, negotiatedOptions, err
+			}
 		case 3:
 			block := binary.BigEndian.Uint16(buf[2:4])
 			if block != expectedBlock {
@@ -612,14 +723,14 @@ func ProbeTFTPFile(ctx context.Context, listenAddr string, filename string, maxB
 			chunk := buf[4:n]
 			if int64(out.Len()+len(chunk)) > maxBytes {
 				_ = sendTFTPACK(conn, from, block)
-				return nil, fmt.Errorf("TFTP probe response exceeded %d bytes", maxBytes)
+				return nil, negotiatedOptions, fmt.Errorf("TFTP probe response exceeded %d bytes", maxBytes)
 			}
 			_, _ = out.Write(chunk)
 			if err := sendTFTPACK(conn, from, block); err != nil {
-				return nil, err
+				return nil, negotiatedOptions, err
 			}
-			if len(chunk) < 512 {
-				return out.Bytes(), nil
+			if len(chunk) < blockSize {
+				return out.Bytes(), negotiatedOptions, nil
 			}
 			expectedBlock++
 		case 5:
@@ -627,11 +738,45 @@ func ProbeTFTPFile(ctx context.Context, listenAddr string, filename string, maxB
 			if message == "" {
 				message = "unknown TFTP error"
 			}
-			return nil, errors.New(message)
+			return nil, negotiatedOptions, errors.New(message)
 		default:
 			continue
 		}
 	}
+}
+
+func sortedTFTPProbeOptionKeys(options map[string]string) []string {
+	keys := []string{}
+	for key := range options {
+		key = strings.ToLower(strings.TrimSpace(key))
+		if key != "" {
+			keys = append(keys, key)
+		}
+	}
+	for i := 0; i < len(keys); i++ {
+		for j := i + 1; j < len(keys); j++ {
+			if keys[j] < keys[i] {
+				keys[i], keys[j] = keys[j], keys[i]
+			}
+		}
+	}
+	return keys
+}
+
+func parseTFTPOptionAck(data []byte) (map[string]string, error) {
+	if len(data) < 2 || binary.BigEndian.Uint16(data[:2]) != 6 {
+		return nil, errors.New("not a TFTP OACK packet")
+	}
+	parts := bytes.Split(data[2:], []byte{0})
+	options := map[string]string{}
+	for i := 0; i+1 < len(parts); i += 2 {
+		key := strings.ToLower(strings.TrimSpace(string(parts[i])))
+		value := strings.TrimSpace(string(parts[i+1]))
+		if key != "" {
+			options[key] = value
+		}
+	}
+	return options, nil
 }
 
 func ProbePXEDHCP(ctx context.Context, listenAddr string, macText string, arch uint16) (DHCPProbeResult, error) {
@@ -679,16 +824,23 @@ func ProbePXEDHCP(ctx context.Context, listenAddr string, macText string, arch u
 		if msgType != 2 && msgType != 5 {
 			continue
 		}
-		bootfile := strings.TrimSpace(string(response.options[67]))
+		optionBootfile := strings.TrimSpace(string(response.options[67]))
+		legacyBootfile := response.legacyBootfile()
+		bootfile := optionBootfile
 		if bootfile == "" {
-			return DHCPProbeResult{}, errors.New("DHCP response did not include PXE bootfile option 67")
+			bootfile = legacyBootfile
+		}
+		if bootfile == "" {
+			return DHCPProbeResult{}, errors.New("DHCP response did not include PXE bootfile option 67 or BOOTP file field")
 		}
 		return DHCPProbeResult{
-			MessageType:  msgType,
-			Bootfile:     bootfile,
-			ServerIP:     dhcpOptionIP(response.options[54]),
-			NextServerIP: dhcpPacketIP(response.siaddr[:]),
-			LeaseIP:      dhcpPacketIP(response.yiaddr[:]),
+			MessageType:    msgType,
+			Bootfile:       bootfile,
+			LegacyBootfile: legacyBootfile,
+			ServerIP:       dhcpOptionIP(response.options[54]),
+			NextServerIP:   dhcpPacketIP(response.siaddr[:]),
+			TFTPServerName: strings.TrimSpace(string(response.options[66])),
+			LeaseIP:        dhcpPacketIP(response.yiaddr[:]),
 		}, nil
 	}
 }
@@ -704,7 +856,7 @@ func buildPXEDHCPDiscover(mac net.HardwareAddr, arch uint16, xid [4]byte) []byte
 	options := dhcpOptions{}
 	options.add(53, []byte{1})
 	options.add(55, []byte{1, 3, 6, 66, 67})
-	options.add(60, []byte("PXEClient"))
+	options.add(60, []byte(labValidationDHCPProbeVendorClass))
 	options.add(93, []byte{byte(arch >> 8), byte(arch)})
 	return append(packet, options.bytes()...)
 }

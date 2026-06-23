@@ -24,31 +24,33 @@ import (
 const backupVersion = "mvp-v0.1"
 
 type backupPayload struct {
-	GeneratedAt       time.Time                    `json:"generated_at"`
-	Version           string                       `json:"version"`
-	Users             []models.User                `json:"users"`
-	Tenants           []models.Tenant              `json:"tenants"`
-	NetworkConfigs    []models.NetworkConfig       `json:"network_configs"`
-	Servers           []models.Server              `json:"servers"`
-	Hardware          []models.HardwareInventory   `json:"hardware_inventories"`
-	StatusHistory     []models.ServerStatusHistory `json:"server_status_history"`
-	RetirementRecords []models.RetirementRecord    `json:"retirement_records"`
-	Images            []models.Image               `json:"images"`
-	InstallTemplates  []models.InstallTemplate     `json:"install_templates"`
-	WorkflowTemplates []models.WorkflowTemplate    `json:"workflow_templates"`
-	Deployments       []models.Deployment          `json:"deployments"`
-	WorkflowRuns      []models.WorkflowRun         `json:"workflow_runs"`
-	TaskExecutions    []models.TaskExecution       `json:"task_executions"`
-	Metrics           []models.MetricSample        `json:"metric_samples"`
-	LogEvents         []models.LogEvent            `json:"log_events"`
-	CollectionJobs    []models.CollectionJob       `json:"collection_jobs"`
-	ScriptJobs        []models.ScriptJob           `json:"script_jobs"`
-	ScriptExecutions  []models.ScriptExecution     `json:"script_executions"`
-	TerminalSessions  []models.TerminalSession     `json:"terminal_sessions"`
-	Alerts            []models.Alert               `json:"alerts"`
-	AlertEvents       []models.AlertEvent          `json:"alert_events"`
-	AlertRules        []models.AlertRule           `json:"alert_rules"`
-	AuditLogs         []models.AuditLog            `json:"audit_logs"`
+	GeneratedAt             time.Time                       `json:"generated_at"`
+	Version                 string                          `json:"version"`
+	Users                   []models.User                   `json:"users"`
+	Tenants                 []models.Tenant                 `json:"tenants"`
+	NetworkConfigs          []models.NetworkConfig          `json:"network_configs"`
+	Servers                 []models.Server                 `json:"servers"`
+	Hardware                []models.HardwareInventory      `json:"hardware_inventories"`
+	StatusHistory           []models.ServerStatusHistory    `json:"server_status_history"`
+	RetirementRecords       []models.RetirementRecord       `json:"retirement_records"`
+	Images                  []models.Image                  `json:"images"`
+	InstallTemplates        []models.InstallTemplate        `json:"install_templates"`
+	WorkflowTemplates       []models.WorkflowTemplate       `json:"workflow_templates"`
+	Deployments             []models.Deployment             `json:"deployments"`
+	LabValidationRuns       []models.LabValidationRun       `json:"lab_validation_runs"`
+	LabValidationRunResults []models.LabValidationRunResult `json:"lab_validation_run_results"`
+	WorkflowRuns            []models.WorkflowRun            `json:"workflow_runs"`
+	TaskExecutions          []models.TaskExecution          `json:"task_executions"`
+	Metrics                 []models.MetricSample           `json:"metric_samples"`
+	LogEvents               []models.LogEvent               `json:"log_events"`
+	CollectionJobs          []models.CollectionJob          `json:"collection_jobs"`
+	ScriptJobs              []models.ScriptJob              `json:"script_jobs"`
+	ScriptExecutions        []models.ScriptExecution        `json:"script_executions"`
+	TerminalSessions        []models.TerminalSession        `json:"terminal_sessions"`
+	Alerts                  []models.Alert                  `json:"alerts"`
+	AlertEvents             []models.AlertEvent             `json:"alert_events"`
+	AlertRules              []models.AlertRule              `json:"alert_rules"`
+	AuditLogs               []models.AuditLog               `json:"audit_logs"`
 }
 
 type backupValidationCheck struct {
@@ -89,6 +91,8 @@ func (h Handler) exportBackup(c *gin.Context) {
 		{"install_templates", &payload.InstallTemplates},
 		{"workflow_templates", &payload.WorkflowTemplates},
 		{"deployments", &payload.Deployments},
+		{"lab_validation_runs", &payload.LabValidationRuns},
+		{"lab_validation_run_results", &payload.LabValidationRunResults},
 		{"workflow_runs", &payload.WorkflowRuns},
 		{"task_executions", &payload.TaskExecutions},
 		{"metric_samples", &payload.Metrics},
@@ -204,6 +208,13 @@ func (h Handler) buildBackupValidationReport(payload backupPayload, raw map[stri
 	} else {
 		report.addCheck("retirement_records", "ok", "backup contains retirement_records section")
 	}
+	if _, ok := raw["lab_validation_runs"]; !ok {
+		report.addCheck("lab_validation_runs", "warning", "backup does not contain lab_validation_runs; restored validation audit history will be incomplete")
+	} else if _, ok := raw["lab_validation_run_results"]; !ok {
+		report.addCheck("lab_validation_runs", "warning", "backup does not contain lab_validation_run_results; restored validation audit history will be incomplete")
+	} else {
+		report.addCheck("lab_validation_runs", "ok", "backup contains lab validation run history")
+	}
 
 	if payload.Version != backupVersion {
 		report.addCheck("version", "error", fmt.Sprintf("unsupported backup version %q; expected %s", payload.Version, backupVersion))
@@ -287,29 +298,31 @@ func (r *backupValidationReport) addCheck(name string, status string, message st
 
 func backupTotals(payload backupPayload) map[string]int {
 	return map[string]int{
-		"users":                 len(payload.Users),
-		"tenants":               len(payload.Tenants),
-		"network_configs":       len(payload.NetworkConfigs),
-		"servers":               len(payload.Servers),
-		"hardware_inventories":  len(payload.Hardware),
-		"server_status_history": len(payload.StatusHistory),
-		"retirement_records":    len(payload.RetirementRecords),
-		"images":                len(payload.Images),
-		"install_templates":     len(payload.InstallTemplates),
-		"workflow_templates":    len(payload.WorkflowTemplates),
-		"deployments":           len(payload.Deployments),
-		"workflow_runs":         len(payload.WorkflowRuns),
-		"task_executions":       len(payload.TaskExecutions),
-		"metric_samples":        len(payload.Metrics),
-		"log_events":            len(payload.LogEvents),
-		"collection_jobs":       len(payload.CollectionJobs),
-		"script_jobs":           len(payload.ScriptJobs),
-		"script_executions":     len(payload.ScriptExecutions),
-		"terminal_sessions":     len(payload.TerminalSessions),
-		"alerts":                len(payload.Alerts),
-		"alert_events":          len(payload.AlertEvents),
-		"alert_rules":           len(payload.AlertRules),
-		"audit_logs":            len(payload.AuditLogs),
+		"users":                      len(payload.Users),
+		"tenants":                    len(payload.Tenants),
+		"network_configs":            len(payload.NetworkConfigs),
+		"servers":                    len(payload.Servers),
+		"hardware_inventories":       len(payload.Hardware),
+		"server_status_history":      len(payload.StatusHistory),
+		"retirement_records":         len(payload.RetirementRecords),
+		"images":                     len(payload.Images),
+		"install_templates":          len(payload.InstallTemplates),
+		"workflow_templates":         len(payload.WorkflowTemplates),
+		"deployments":                len(payload.Deployments),
+		"lab_validation_runs":        len(payload.LabValidationRuns),
+		"lab_validation_run_results": len(payload.LabValidationRunResults),
+		"workflow_runs":              len(payload.WorkflowRuns),
+		"task_executions":            len(payload.TaskExecutions),
+		"metric_samples":             len(payload.Metrics),
+		"log_events":                 len(payload.LogEvents),
+		"collection_jobs":            len(payload.CollectionJobs),
+		"script_jobs":                len(payload.ScriptJobs),
+		"script_executions":          len(payload.ScriptExecutions),
+		"terminal_sessions":          len(payload.TerminalSessions),
+		"alerts":                     len(payload.Alerts),
+		"alert_events":               len(payload.AlertEvents),
+		"alert_rules":                len(payload.AlertRules),
+		"audit_logs":                 len(payload.AuditLogs),
 	}
 }
 
@@ -333,6 +346,9 @@ func (h Handler) backupTargetCounts() (map[string]int64, error) {
 		{"workflow_templates", &models.WorkflowTemplate{}},
 		{"deployments", &models.Deployment{}},
 		{"boot_events", &models.BootEvent{}},
+		{"lab_validation_evidences", &models.LabValidationEvidence{}},
+		{"lab_validation_runs", &models.LabValidationRun{}},
+		{"lab_validation_run_results", &models.LabValidationRunResult{}},
 		{"metadata_tokens", &models.MetadataToken{}},
 		{"workflow_runs", &models.WorkflowRun{}},
 		{"task_executions", &models.TaskExecution{}},
@@ -409,6 +425,8 @@ func (h Handler) restoreBackupPayload(payload backupPayload, recoveryAdmin *mode
 			{"install_templates", &payload.InstallTemplates, len(payload.InstallTemplates)},
 			{"workflow_templates", &payload.WorkflowTemplates, len(payload.WorkflowTemplates)},
 			{"deployments", &payload.Deployments, len(payload.Deployments)},
+			{"lab_validation_runs", &payload.LabValidationRuns, len(payload.LabValidationRuns)},
+			{"lab_validation_run_results", &payload.LabValidationRunResults, len(payload.LabValidationRunResults)},
 			{"workflow_runs", &payload.WorkflowRuns, len(payload.WorkflowRuns)},
 			{"task_executions", &payload.TaskExecutions, len(payload.TaskExecutions)},
 			{"metric_samples", &payload.Metrics, len(payload.Metrics)},
@@ -469,6 +487,9 @@ func clearBackupTables(tx *gorm.DB) error {
 		{"bmc_endpoints", &models.BmcEndpoint{}},
 		{"metadata_tokens", &models.MetadataToken{}},
 		{"boot_events", &models.BootEvent{}},
+		{"lab_validation_evidences", &models.LabValidationEvidence{}},
+		{"lab_validation_run_results", &models.LabValidationRunResult{}},
+		{"lab_validation_runs", &models.LabValidationRun{}},
 		{"alert_events", &models.AlertEvent{}},
 		{"alerts", &models.Alert{}},
 		{"terminal_sessions", &models.TerminalSession{}},
@@ -518,6 +539,9 @@ func resetBackupTableSequences(tx *gorm.DB) error {
 		"workflow_templates",
 		"deployments",
 		"boot_events",
+		"lab_validation_evidences",
+		"lab_validation_runs",
+		"lab_validation_run_results",
 		"metadata_tokens",
 		"workflow_runs",
 		"task_executions",
@@ -632,6 +656,7 @@ func backupReferenceProblems(payload backupPayload) []string {
 	installTemplateIDs := make(map[uint]bool, len(payload.InstallTemplates))
 	workflowTemplateIDs := make(map[uint]bool, len(payload.WorkflowTemplates))
 	deploymentIDs := make(map[uint]bool, len(payload.Deployments))
+	labValidationRunIDs := make(map[uint]bool, len(payload.LabValidationRuns))
 	workflowRunIDs := make(map[uint]bool, len(payload.WorkflowRuns))
 	scriptJobIDs := make(map[uint]bool, len(payload.ScriptJobs))
 	alertIDs := make(map[uint]bool, len(payload.Alerts))
@@ -655,6 +680,9 @@ func backupReferenceProblems(payload backupPayload) []string {
 	}
 	for _, deployment := range payload.Deployments {
 		deploymentIDs[deployment.ID] = true
+	}
+	for _, run := range payload.LabValidationRuns {
+		labValidationRunIDs[run.ID] = true
 	}
 	for _, run := range payload.WorkflowRuns {
 		workflowRunIDs[run.ID] = true
@@ -709,6 +737,14 @@ func backupReferenceProblems(payload backupPayload) []string {
 			problems = append(problems, fmt.Sprintf("workflow_run %d references missing deployment %d", run.ID, run.DeploymentID))
 		}
 	}
+	for _, result := range payload.LabValidationRunResults {
+		if !labValidationRunIDs[result.RunID] {
+			problems = append(problems, fmt.Sprintf("lab_validation_run_result %d references missing lab_validation_run %d", result.ID, result.RunID))
+		}
+		if result.ServerID != 0 && !serverIDs[result.ServerID] {
+			problems = append(problems, fmt.Sprintf("lab_validation_run_result %d references missing server %d", result.ID, result.ServerID))
+		}
+	}
 	for _, task := range payload.TaskExecutions {
 		if !workflowRunIDs[task.WorkflowRunID] {
 			problems = append(problems, fmt.Sprintf("task_execution %d references missing workflow_run %d", task.ID, task.WorkflowRunID))
@@ -761,6 +797,8 @@ func backupContentProblems(payload backupPayload) []string {
 	problems = append(problems, backupTenantProblems(payload.Tenants)...)
 	problems = append(problems, backupServerProblems(payload.Servers)...)
 	problems = append(problems, backupRetirementRecordProblems(payload.RetirementRecords)...)
+	problems = append(problems, duplicateIDProblems("lab_validation_runs", payload.LabValidationRuns, func(run models.LabValidationRun) uint { return run.ID })...)
+	problems = append(problems, duplicateIDProblems("lab_validation_run_results", payload.LabValidationRunResults, func(result models.LabValidationRunResult) uint { return result.ID })...)
 	problems = append(problems, backupTenantQuotaUsageProblems(payload.Tenants, payload.Servers)...)
 	problems = append(problems, backupNetworkConfigProblems(payload.NetworkConfigs)...)
 	problems = append(problems, backupAlertRuleProblems(payload.AlertRules)...)

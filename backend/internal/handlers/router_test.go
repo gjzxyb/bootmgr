@@ -2,12 +2,15 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,9 +22,12 @@ import (
 	"baremetal-platform/backend/internal/config"
 	"baremetal-platform/backend/internal/database"
 	"baremetal-platform/backend/internal/models"
+	"baremetal-platform/backend/internal/services"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/ssh/knownhosts"
 	"gorm.io/datatypes"
+	"gorm.io/gorm"
 )
 
 func TestMVPFlow(t *testing.T) {
@@ -48,6 +54,9 @@ func TestMVPFlow(t *testing.T) {
 	if health["status"] != "ok" || health["database"] != "ok" || health["redis"] != "disabled" {
 		t.Fatalf("expected healthy local service: %#v", health)
 	}
+	if err := db.Create(&models.NetworkConfig{Name: "PXE test network", Purpose: "deployment", CIDR: "192.0.2.0/24", Status: "enabled", DHCPMode: "proxy", ProxyDHCP: true}).Error; err != nil {
+		t.Fatalf("create PXE test deployment network: %v", err)
+	}
 	readiness, readinessHeaders := requestJSONWithHeaders(t, r, http.MethodGet, "/readyz", "", nil, map[string]string{"X-Request-ID": "test-ready-001"})
 	if readinessHeaders.Get("X-Request-ID") != "test-ready-001" {
 		t.Fatalf("expected readyz X-Request-ID to be propagated, got %q", readinessHeaders.Get("X-Request-ID"))
@@ -56,7 +65,7 @@ func TestMVPFlow(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected readyz checks array: %#v", readiness)
 	}
-	for _, name := range []string{"database", "redis", "image_storage", "config"} {
+	for _, name := range []string{"database", "redis", "image_storage", "bmc_tooling", "config"} {
 		if !jsonArrayContainsField(checks, "name", name) {
 			t.Fatalf("expected readyz check %s in %#v", name, checks)
 		}
@@ -67,6 +76,13 @@ func TestMVPFlow(t *testing.T) {
 	discoveryScript := requestText(t, r, http.MethodGet, "/boot/ipxe?mac=52-54-00-DD-00-01&arch=arm64&firmware=uefi", "", nil)
 	if !contains(discoveryScript, "Baremetal discovery") {
 		t.Fatalf("expected discovery script for unknown MAC: %s", discoveryScript)
+	}
+	var httpBootEvent models.BootEvent
+	if err := db.Where("mac = ?", "52:54:00:dd:00:01").Order("id desc").First(&httpBootEvent).Error; err != nil {
+		t.Fatalf("expected HTTP iPXE boot event: %v", err)
+	}
+	if httpBootEvent.Source != "http_ipxe" {
+		t.Fatalf("expected HTTP iPXE boot event source, got %#v", httpBootEvent)
 	}
 	discoveredServers := requestJSON(t, r, http.MethodGet, "/api/v1/servers?keyword=discovered-52-54-00-dd-00-01&page=1&page_size=1", token, nil)
 	if intFromJSON(t, discoveredServers, "total") != 1 {
@@ -81,22 +97,82 @@ func TestMVPFlow(t *testing.T) {
 	if intFromJSON(t, bootEvent, "server_id") != discoveredID {
 		t.Fatalf("expected boot event to match discovered asset: %#v", bootEvent)
 	}
+	if bootEvent["source"] != "api_event" {
+		t.Fatalf("expected manual boot event source api_event: %#v", bootEvent)
+	}
 	labValidation := requestJSON(t, r, http.MethodGet, "/api/v1/system/lab-validation", token, nil)
 	if labValidation["status"] == "" {
 		t.Fatalf("expected lab validation status: %#v", labValidation)
 	}
 	labChecks, ok := labValidation["checks"].([]any)
-	if !ok || !jsonArrayContainsField(labChecks, "name", "pxe_boot_events") || !jsonArrayContainsField(labChecks, "name", "bmc_adapter") || !jsonArrayContainsField(labChecks, "name", "ssh_connectivity") {
+	if !ok || !jsonArrayContainsField(labChecks, "name", "pxe_boot_events") || !jsonArrayContainsField(labChecks, "name", "bmc_adapter") || !jsonArrayContainsField(labChecks, "name", "bmc_tooling") || !jsonArrayContainsField(labChecks, "name", "ssh_connectivity") {
 		t.Fatalf("expected lab validation checks for PXE/BMC/SSH: %#v", labValidation)
 	}
 	pxeSummary, ok := labValidation["pxe"].(map[string]any)
 	if !ok || intFromJSON(t, pxeSummary, "boot_events") < 1 {
 		t.Fatalf("expected lab validation to include PXE boot event evidence: %#v", labValidation)
 	}
+	if targets, ok := labValidation["targets"].([]any); !ok || !jsonArrayContainsField(targets, "server_id", float64(discoveredID)) {
+		t.Fatalf("expected lab validation target matrix to include discovered PXE server: %#v", labValidation)
+	}
+	inventoryOnly := models.Server{AssetNo: "BM-PXE-TARGET-001", Hostname: "pxe-target-only", PrimaryMAC: "52:54:00:dd:00:99", Status: "ready"}
+	if err := db.Create(&inventoryOnly).Error; err != nil {
+		t.Fatalf("create inventory-only PXE target: %v", err)
+	}
+	labValidation = requestJSON(t, r, http.MethodGet, "/api/v1/system/lab-validation", token, nil)
+	if targets, ok := labValidation["targets"].([]any); !ok || !jsonArrayContainsField(targets, "server_id", float64(inventoryOnly.ID)) {
+		t.Fatalf("expected lab validation target matrix to include inventory MAC target: %#v", labValidation)
+	}
 	requestExpectStatus(t, r, http.MethodPost, "/api/v1/system/lab-validation/run", token, map[string]any{"check_pxe": false, "check_bmc": false, "check_ssh": false}, http.StatusPreconditionRequired, "")
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/system/lab-validation/run", token, map[string]any{"check_pxe": true, "check_bmc": false, "check_ssh": false, "pxe_macs": []string{"not-a-mac"}}, http.StatusBadRequest, "system.lab-validation.run")
+	strictLabRun := requestJSONWithConfirm(t, r, http.MethodPost, "/api/v1/system/lab-validation/run", token, map[string]any{"strict": true, "check_pxe": true, "check_bmc": true, "check_ssh": true}, "system.lab-validation.run")
+	if strictLabRun["status"] != "error" || !jsonArrayContainsField(strictLabRun["run_results"].([]any), "kind", "strict_physical_targets") {
+		t.Fatalf("expected strict lab validation to require physical targets: %#v", strictLabRun)
+	}
+	strictLabRunID := intFromJSON(t, strictLabRun, "run_id")
+	var strictRunResults int64
+	if err := db.Model(&models.LabValidationRunResult{}).Where("run_id = ? AND kind = ?", strictLabRunID, "strict_physical_targets").Count(&strictRunResults).Error; err != nil {
+		t.Fatalf("count strict lab validation results: %v", err)
+	}
+	if strictRunResults == 0 {
+		t.Fatalf("expected strict lab validation failures to be persisted")
+	}
 	labRun := requestJSONWithConfirm(t, r, http.MethodPost, "/api/v1/system/lab-validation/run", token, map[string]any{"check_pxe": false, "check_bmc": false, "check_ssh": false}, "system.lab-validation.run")
-	if labRun["checks"] == nil {
+	if labRun["checks"] == nil || intFromJSON(t, labRun, "run_id") == 0 {
 		t.Fatalf("expected lab validation run to return a report: %#v", labRun)
+	}
+	if recentRuns, ok := labRun["recent_runs"].([]any); !ok || !jsonArrayContainsField(recentRuns, "id", float64(intFromJSON(t, labRun, "run_id"))) {
+		t.Fatalf("expected lab validation report to include recent run history: %#v", labRun)
+	}
+	requestExpectStatus(t, r, http.MethodGet, "/api/v1/system/lab-validation/runs/not-a-number", token, nil, http.StatusBadRequest, "")
+	labRunDetail := requestJSON(t, r, http.MethodGet, "/api/v1/system/lab-validation/runs/"+itoa(intFromJSON(t, strictLabRun, "run_id")), token, nil)
+	if intFromJSON(t, labRunDetail["run"].(map[string]any), "id") != intFromJSON(t, strictLabRun, "run_id") || !jsonArrayContainsField(labRunDetail["results"].([]any), "kind", "strict_physical_targets") {
+		t.Fatalf("expected lab validation run detail with persisted results: %#v", labRunDetail)
+	}
+	labRunBundle := requestJSON(t, r, http.MethodGet, "/api/v1/system/lab-validation/runs/"+itoa(intFromJSON(t, strictLabRun, "run_id"))+"/evidence-bundle", token, nil)
+	if intFromJSON(t, labRunBundle["run"].(map[string]any), "id") != intFromJSON(t, strictLabRun, "run_id") || !jsonArrayContainsField(labRunBundle["results"].([]any), "kind", "strict_physical_targets") || labRunBundle["environment"] == nil {
+		t.Fatalf("expected lab validation evidence bundle with run, results, and environment: %#v", labRunBundle)
+	}
+	if targets, ok := labRunBundle["targets"].([]any); !ok || !jsonArrayContainsField(targets, "server_id", float64(discoveredID)) {
+		t.Fatalf("expected lab validation evidence bundle to include target matrix: %#v", labRunBundle)
+	}
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, map[string]any{"kind": "pxe", "status": "ok", "summary": "physical PXE client reached iPXE"}, http.StatusPreconditionRequired, "")
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, map[string]any{"kind": "pxe", "status": "ok", "summary": "physical PXE client reached iPXE"}, http.StatusBadRequest, "system.lab-validation.evidence")
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, map[string]any{"kind": "pxe", "subject": "52:54:00:dd:00:01", "status": "ok", "summary": "physical PXE client reached iPXE"}, http.StatusBadRequest, "system.lab-validation.evidence")
+	evidence := requestJSONWithConfirm(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, map[string]any{"kind": "pxe", "subject": "52:54:00:dd:00:01", "status": "ok", "summary": "physical PXE client reached iPXE", "details": "boot.ipxe loaded from isolated deployment VLAN", "run_id": intFromJSON(t, labRun, "run_id"), "boot_event_id": httpBootEvent.ID}, "system.lab-validation.evidence")
+	if evidence["kind"] != "pxe" || evidence["status"] != "ok" || evidence["created_by"] != "admin@example.com" {
+		t.Fatalf("expected recorded lab evidence: %#v", evidence)
+	}
+	if intFromJSON(t, evidence, "boot_event_id") != int(httpBootEvent.ID) {
+		t.Fatalf("expected lab evidence to reference boot event: %#v", evidence)
+	}
+	if intFromJSON(t, evidence, "run_id") != intFromJSON(t, labRun, "run_id") {
+		t.Fatalf("expected lab evidence to reference validation run: %#v", evidence)
+	}
+	labWithEvidence := requestJSON(t, r, http.MethodGet, "/api/v1/system/lab-validation", token, nil)
+	recentEvidence, ok := labWithEvidence["recent_evidence"].([]any)
+	if !ok || !jsonArrayContainsField(recentEvidence, "summary", "physical PXE client reached iPXE") {
+		t.Fatalf("expected lab validation evidence in report: %#v", labWithEvidence)
 	}
 	requestExpectStatus(t, r, http.MethodPost, "/api/v1/users", token, map[string]any{"email": "not-an-email", "name": "Bad User", "role": "operator", "password": "Operator@123456"}, http.StatusBadRequest, "")
 	requestExpectStatus(t, r, http.MethodPost, "/api/v1/users", token, map[string]any{"email": "weak@example.com", "name": "Weak User", "role": "operator", "password": "short"}, http.StatusBadRequest, "")
@@ -465,12 +541,22 @@ func TestMVPFlow(t *testing.T) {
 		t.Fatalf("expected deleted workflow template to disappear from listing: %#v", deletedWorkflowTemplates)
 	}
 
-	networks := requestJSON(t, r, http.MethodGet, "/api/v1/network-configs?purpose=deployment&status=enabled&page=1&page_size=1", token, nil)
-	if intFromJSON(t, networks, "total") != 1 {
+	networks := requestJSON(t, r, http.MethodGet, "/api/v1/network-configs?purpose=deployment&status=enabled&page=1&page_size=10", token, nil)
+	if intFromJSON(t, networks, "total") < 1 {
 		t.Fatalf("expected demo deployment network: %#v", networks)
 	}
 	networkItems := networks["items"].([]any)
-	networkID := int(networkItems[0].(map[string]any)["id"].(float64))
+	networkID := 0
+	for _, item := range networkItems {
+		network := item.(map[string]any)
+		if network["name"] == "Demo deployment network" {
+			networkID = int(network["id"].(float64))
+			break
+		}
+	}
+	if networkID == 0 {
+		t.Fatalf("expected seeded demo deployment network in listing: %#v", networks)
+	}
 	requestExpectStatus(t, r, http.MethodPatch, "/api/v1/network-configs/"+itoa(networkID), token, map[string]any{"cidr": "not-a-cidr"}, http.StatusBadRequest, "")
 	requestExpectStatus(t, r, http.MethodPatch, "/api/v1/network-configs/"+itoa(networkID), token, map[string]any{"gateway": "203.0.113.1"}, http.StatusBadRequest, "")
 	requestExpectStatus(t, r, http.MethodPatch, "/api/v1/network-configs/"+itoa(networkID), token, map[string]any{"dhcp_mode": "rogue"}, http.StatusBadRequest, "")
@@ -506,8 +592,8 @@ func TestMVPFlow(t *testing.T) {
 	}
 	createdNetworkID := intFromJSON(t, createdNetwork, "id")
 	networkCheck := requestJSON(t, r, http.MethodPost, "/api/v1/network-configs/"+itoa(createdNetworkID)+"/check", token, map[string]any{})
-	if networkCheck["status"] != "ok" || !jsonArrayContainsField(networkCheck["checks"].([]any), "name", "deployment_usage") {
-		t.Fatalf("expected deployment network check to pass: %#v", networkCheck)
+	if networkCheck["status"] != "warning" || !jsonArrayContainsField(networkCheck["checks"].([]any), "name", "pxe_runtime") || !jsonArrayContainsField(networkCheck["checks"].([]any), "name", "deployment_usage") {
+		t.Fatalf("expected deployment network check to report disabled PXE runtime warning: %#v", networkCheck)
 	}
 	alternateNetwork := requestJSON(t, r, http.MethodPost, "/api/v1/network-configs", token, map[string]any{"name": "Alternate deployment network", "purpose": "deployment", "cidr": "192.168.201.0/24", "gateway": "192.168.201.1", "dns": "192.168.201.1", "vlan_id": 201, "dhcp_mode": "proxy", "proxy_dhcp": true, "status": "enabled"})
 	alternateNetworkID := intFromJSON(t, alternateNetwork, "id")
@@ -527,8 +613,10 @@ func TestMVPFlow(t *testing.T) {
 	requestExpectStatus(t, r, http.MethodPost, "/api/v1/servers/999999/bmc", token, map[string]any{"type": "redfish", "endpoint": "https://bmc.test", "username": "admin", "password": "secret"}, http.StatusNotFound, "bmc.upsert")
 	requestExpectStatus(t, r, http.MethodPost, "/api/v1/servers/"+itoa(serverID)+"/bmc", token, map[string]any{"type": "ilo", "endpoint": "https://bmc.test", "username": "admin", "password": "secret"}, http.StatusBadRequest, "bmc.upsert")
 	requestExpectStatus(t, r, http.MethodPost, "/api/v1/servers/"+itoa(serverID)+"/bmc", token, map[string]any{"type": "redfish", "endpoint": "bmc.test", "username": "admin", "password": "secret"}, http.StatusBadRequest, "bmc.upsert")
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/servers/"+itoa(serverID)+"/bmc", token, map[string]any{"type": "redfish", "protocol": "https", "endpoint": "http://bmc.test", "username": "admin", "password": "secret"}, http.StatusBadRequest, "bmc.upsert")
 	requestExpectStatus(t, r, http.MethodPost, "/api/v1/servers/"+itoa(serverID)+"/bmc", token, map[string]any{"type": "ipmi", "protocol": "https", "endpoint": "192.0.2.55:623", "username": "ADMIN", "password": "secret"}, http.StatusBadRequest, "bmc.upsert")
 	requestExpectStatus(t, r, http.MethodPost, "/api/v1/servers/"+itoa(serverID)+"/bmc", token, map[string]any{"type": "ipmi", "protocol": "ipmi", "endpoint": "bad host", "username": "ADMIN", "password": "secret"}, http.StatusBadRequest, "bmc.upsert")
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/servers/"+itoa(serverID)+"/bmc", token, map[string]any{"type": "ipmi", "protocol": "ipmi", "endpoint": "192.0.2.55:notaport", "username": "ADMIN", "password": "secret"}, http.StatusBadRequest, "bmc.upsert")
 	bmcResp := requestJSONWithConfirm(t, r, http.MethodPost, "/api/v1/servers/"+itoa(serverID)+"/bmc", token, map[string]any{"type": "redfish", "endpoint": "https://bmc.test", "username": "admin", "password": "secret"}, "bmc.upsert")
 	if intFromJSON(t, bmcResp, "server_id") != serverID {
 		t.Fatalf("BMC endpoint was not bound to path server id")
@@ -573,6 +661,10 @@ func TestMVPFlow(t *testing.T) {
 	bmcCheck := requestJSON(t, r, http.MethodPost, "/api/v1/servers/"+itoa(serverID)+"/bmc/check", token, map[string]any{})
 	if bmcCheck["status"] != "ok" || bmcCheck["checked_at"] == nil {
 		t.Fatalf("expected successful BMC connectivity check: %#v", bmcCheck)
+	}
+	bmcCheckProof, ok := bmcCheck["proof"].(map[string]any)
+	if !ok || bmcCheckProof["adapter"] != "simulated" || bmcCheckProof["manufacturer"] != "Simulated" {
+		t.Fatalf("expected successful BMC check to include non-secret identity proof: %#v", bmcCheck)
 	}
 	firmwareInfo := requestJSON(t, r, http.MethodGet, "/api/v1/servers/"+itoa(serverID)+"/bmc/firmware", token, nil)
 	if firmwareInfo["adapter"] != "simulated" || firmwareInfo["manufacturer"] != "Simulated" || firmwareInfo["bmc_version"] != "sim-bmc-1.0.0" {
@@ -838,6 +930,9 @@ func TestMVPFlow(t *testing.T) {
 	if _, ok := backup["retirement_records"].([]any); !ok {
 		t.Fatalf("expected backup to include retirement records section: %#v", backup)
 	}
+	if len(backup["lab_validation_runs"].([]any)) == 0 || len(backup["lab_validation_run_results"].([]any)) == 0 {
+		t.Fatalf("expected backup to include lab validation run history: %#v", backup)
+	}
 	backupValidation := requestJSON(t, r, http.MethodPost, "/api/v1/ops/backup/validate", token, backup)
 	if backupValidation["status"] == "error" {
 		t.Fatalf("expected exported backup to pass validation without errors: %#v", backupValidation)
@@ -926,6 +1021,9 @@ func TestMVPFlow(t *testing.T) {
 	restoreResp := requestJSONWithConfirm(t, restoreRouter, http.MethodPost, "/api/v1/ops/backup/restore", restoreToken, backup, "ops.backup.restore")
 	if restoreResp["status"] != "restored" || intFromJSON(t, restoreResp["imported"].(map[string]any), "servers") == 0 {
 		t.Fatalf("expected backup restore result: %#v", restoreResp)
+	}
+	if intFromJSON(t, restoreResp["imported"].(map[string]any), "lab_validation_runs") == 0 {
+		t.Fatalf("expected backup restore to import lab validation runs: %#v", restoreResp)
 	}
 	restoredLoginToken := loginForTest(t, restoreRouter)
 	if restoredLoginToken == "" {
@@ -1131,6 +1229,22 @@ func TestMVPFlow(t *testing.T) {
 	if !ok || intFromJSON(t, sshSummary, "total") < 1 {
 		t.Fatalf("expected lab validation to summarize configured SSH access: %#v", labWithEndpoints)
 	}
+	targetedLabRun := requestJSONWithConfirm(t, r, http.MethodPost, "/api/v1/system/lab-validation/run", token, map[string]any{"check_pxe": false, "check_bmc": true, "check_ssh": false, "server_ids": []int{serverID}}, "system.lab-validation.run")
+	runResults, ok := targetedLabRun["run_results"].([]any)
+	if !ok || !jsonArrayContainsField(runResults, "kind", "bmc") || !jsonArrayContainsField(runResults, "server_id", float64(serverID)) {
+		t.Fatalf("expected targeted lab run to include requested BMC server result: %#v", targetedLabRun)
+	}
+	labAfterTargetedRun := requestJSON(t, r, http.MethodGet, "/api/v1/system/lab-validation", token, nil)
+	target, ok := jsonArrayFindByField(labAfterTargetedRun["targets"].([]any), "server_id", float64(serverID))
+	if !ok {
+		t.Fatalf("expected target matrix to include targeted lab run server: %#v", labAfterTargetedRun)
+	}
+	if intFromJSON(t, target, "latest_run_id") != intFromJSON(t, targetedLabRun, "run_id") || target["latest_run_status"] != targetedLabRun["status"] || target["latest_run_kind"] != "bmc" {
+		t.Fatalf("expected target matrix to reference latest lab run: target=%#v run=%#v", target, targetedLabRun)
+	}
+	if target["latest_run_result_status"] == "" || target["latest_run_at"] == "" {
+		t.Fatalf("expected target matrix to include latest run result status/time: %#v", target)
+	}
 
 	requestExpectStatus(t, r, http.MethodPost, "/api/v1/servers/999999/collections", token, map[string]any{}, http.StatusNotFound, "")
 	job := requestJSON(t, r, http.MethodPost, "/api/v1/servers/"+itoa(serverID)+"/collections", token, map[string]any{})
@@ -1269,6 +1383,43 @@ func TestMVPFlow(t *testing.T) {
 	requestExpectStatus(t, r, http.MethodPost, "/api/v1/servers/"+itoa(intFromJSON(t, scrappedServer, "id"))+"/retire", token, map[string]any{}, http.StatusConflict, "server.retire")
 }
 
+func TestPXEReadinessProbesRuntimeListeners(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "ipxe.efi"), []byte("uefi loader"), 0o644); err != nil {
+		t.Fatalf("write uefi bootfile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "undionly.kpxe"), []byte("bios loader"), 0o644); err != nil {
+		t.Fatalf("write bios bootfile: %v", err)
+	}
+	cfg := config.Config{
+		AppEnv:                "test",
+		BootServicesEnabled:   true,
+		BootServiceMode:       "proxy",
+		BootBindInterface:     "test-lab",
+		BootDHCPListenAddr:    freeUDPAddr(t),
+		BootDHCPServerIP:      "192.168.100.10",
+		BootTFTPListenAddr:    freeUDPAddr(t),
+		BootTFTPRoot:          root,
+		BootTFTPBootfileUEFI:  "ipxe.efi",
+		BootTFTPBootfileBIOS:  "undionly.kpxe",
+		BootBaseURL:           "http://boot.test",
+		ImageStorageDir:       t.TempDir(),
+		ImageUploadMaxBytes:   1024 * 1024,
+		ImageUploadMaxMBValid: true,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := services.NewPXEService(nil, cfg, t.Logf).Start(ctx); err != nil {
+		t.Fatalf("start PXE runtime: %v", err)
+	}
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer probeCancel()
+	status, message := pxeReadinessStatus(probeCtx, cfg, config.BootRuntimeIssues(cfg))
+	if status != "ok" || !strings.Contains(message, "TFTP OACK blksize=1024") || !strings.Contains(message, "DHCP bootfile=ipxe.efi") {
+		t.Fatalf("expected readiness to probe DHCP/TFTP listeners, got status=%q message=%q", status, message)
+	}
+}
+
 func TestDeploymentPreflightRequiresBMCConnectivity(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	redfish := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1313,8 +1464,12 @@ func TestDeploymentPreflightRequiresBMCConnectivity(t *testing.T) {
 		t.Fatalf("new BMC endpoint should be unknown before connectivity check: %#v", bmcResp)
 	}
 	checkResp := requestJSONExpectStatus(t, r, http.MethodPost, "/api/v1/servers/"+itoa(int(server.ID))+"/bmc/check", token, map[string]any{}, http.StatusBadGateway, "")
-	if checkResp["status"] != "error" || !contains(checkResp["detail"].(string), "returned 500") {
+	if checkResp["error"] != "bmc connectivity check failed" || checkResp["status"] != "error" || checkResp["checked_at"] == nil || !contains(checkResp["detail"].(string), "returned 500") {
 		t.Fatalf("expected failed BMC check to expose connectivity status: %#v", checkResp)
+	}
+	proof, ok := checkResp["proof"].(map[string]any)
+	if !ok || proof["adapter"] != "redfish" || proof["endpoint_status"] != "error" || proof["stage"] != "connectivity" {
+		t.Fatalf("expected failed BMC check to include connectivity proof context: %#v", checkResp)
 	}
 	var failedCheckAudits int64
 	if err := db.Model(&models.AuditLog{}).Where("action = ? AND resource_type = ? AND resource_id = ?", "bmc.check", "server", itoa(int(server.ID))).Count(&failedCheckAudits).Error; err != nil {
@@ -1325,7 +1480,7 @@ func TestDeploymentPreflightRequiresBMCConnectivity(t *testing.T) {
 	}
 
 	deploymentResp := requestJSONExpectStatus(t, r, http.MethodPost, "/api/v1/deployments", token, deploymentPayload(map[string]any{"server_id": server.ID, "image_id": image.ID, "template_id": installTemplate.ID, "workflow_id": workflowTemplate.ID}), http.StatusBadRequest, "deployment.create")
-	if !jsonArrayContainsString(deploymentResp["problems"].([]any), "bmc connectivity check failed: redfish GET /redfish/v1 returned 500") {
+	if !jsonArrayContainsString(deploymentResp["problems"].([]any), "bmc connectivity check failed: redfish GET /redfish/v1 returned 500: bmc unavailable") {
 		t.Fatalf("expected deployment preflight to require reachable BMC: %#v", deploymentResp)
 	}
 	var deployments int64
@@ -1341,6 +1496,84 @@ func TestDeploymentPreflightRequiresBMCConnectivity(t *testing.T) {
 	}
 	if endpoint.Status != "error" || endpoint.LastCheckedAt == nil {
 		t.Fatalf("expected failed BMC preflight to update endpoint status: %#v", endpoint)
+	}
+}
+
+func TestBMCFailureProofClassifiesConfigAndConnectivity(t *testing.T) {
+	now := time.Now().UTC()
+	endpoint := models.BmcEndpoint{Status: "error", LastCheckedAt: &now}
+	configProof := bmcFailureProof("redfish", endpoint, errors.New("BMC endpoint type \"ipmi\" does not match BMC_ADAPTER=redfish"))
+	if configProof.Adapter != "redfish" || configProof.EndpointStatus != "error" || configProof.Stage != "config" || configProof.LastCheckedAt == nil {
+		t.Fatalf("expected config BMC failure proof, got %#v", configProof)
+	}
+	connectivityProof := bmcFailureProof("redfish", endpoint, errors.New("redfish GET /redfish/v1 returned 500"))
+	if connectivityProof.Stage != "connectivity" {
+		t.Fatalf("expected connectivity BMC failure proof, got %#v", connectivityProof)
+	}
+}
+
+func TestBMCCheckWarnsWhenIdentityProofIsEmpty(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	redfish := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/redfish/v1":
+			_, _ = w.Write([]byte(`{"Systems":{"@odata.id":"/redfish/v1/Systems"}}`))
+		case "/redfish/v1/Systems":
+			_, _ = w.Write([]byte(`{"Members":[{"@odata.id":"/redfish/v1/Systems/1"}]}`))
+		case "/redfish/v1/Systems/1":
+			_, _ = w.Write([]byte(`{"@odata.id":"/redfish/v1/Systems/1"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer redfish.Close()
+
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:bmc-empty-identity?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "redfish", CollectorMode: "simulated", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	r := NewRouter(db, cfg)
+	token := loginForTest(t, r)
+
+	server := models.Server{AssetNo: "BM-BMC-EMPTY-IDENTITY", Hostname: "bmc-empty-identity", Status: "ready", Architecture: "x86_64"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	requestJSONWithConfirm(t, r, http.MethodPost, "/api/v1/servers/"+itoa(int(server.ID))+"/bmc", token, map[string]any{"type": "redfish", "protocol": "http", "endpoint": redfish.URL, "username": "admin", "password": "Secret@123"}, "bmc.upsert")
+	checkResp := requestJSON(t, r, http.MethodPost, "/api/v1/servers/"+itoa(int(server.ID))+"/bmc/check", token, map[string]any{})
+	proof, ok := checkResp["proof"].(map[string]any)
+	if checkResp["status"] != "ok" || !ok || proof["adapter"] != "redfish" || !strings.Contains(checkResp["proof_error"].(string), "returned no manufacturer") {
+		t.Fatalf("expected BMC check to warn when identity proof is empty: %#v", checkResp)
+	}
+}
+
+func TestProductionRejectsPlainHTTPRedfishEndpoint(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := config.Config{
+		AppEnv: "production", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:bmc-production-redfish-https?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "redfish", RedfishInsecureTLS: false, CollectorMode: "simulated", BootBaseURL: "https://boot.example.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	r := NewRouter(db, cfg)
+	token := loginForTest(t, r)
+
+	server := models.Server{AssetNo: "BM-BMC-PROD-HTTPS", Hostname: "bmc-prod-https", Status: "ready", Architecture: "x86_64"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/servers/"+itoa(int(server.ID))+"/bmc", token, map[string]any{"type": "redfish", "protocol": "http", "endpoint": "http://bmc.prod.test", "username": "admin", "password": "Secret@123"}, http.StatusBadRequest, "bmc.upsert")
+
+	bmcResp := requestJSONWithConfirm(t, r, http.MethodPost, "/api/v1/servers/"+itoa(int(server.ID))+"/bmc", token, map[string]any{"type": "redfish", "protocol": "https", "endpoint": "https://bmc.prod.test", "username": "admin", "password": "Secret@123"}, "bmc.upsert")
+	if bmcResp["protocol"] != "https" || bmcResp["endpoint"] != "https://bmc.prod.test" {
+		t.Fatalf("expected production to accept HTTPS Redfish endpoint: %#v", bmcResp)
 	}
 }
 
@@ -1462,7 +1695,7 @@ func TestDeploymentConcurrencyQueuesPendingWork(t *testing.T) {
 	serverB := models.Server{AssetNo: "BM-QUEUE-002", Hostname: "queue-node-2", Status: "ready", Architecture: "x86_64"}
 	image := models.Image{Name: "Queue image", OSFamily: "ubuntu", OSVersion: "24.04", Architecture: "x86_64", FilePath: tempImageFile(t, cfg.ImageStorageDir), Status: "enabled", TestStatus: "tested_passed"}
 	network := models.NetworkConfig{Name: "Queue deployment network", Purpose: "deployment", CIDR: "192.168.252.0/24", Gateway: "192.168.252.1", DHCPMode: "proxy", Status: "enabled"}
-	workflowTemplate := models.WorkflowTemplate{Name: "Queue workflow", Version: "v1", Status: "enabled", Definition: datatypes.JSON([]byte(`{"steps":[{"name":"step 1","action":"install_os"},{"name":"step 2","action":"install_os"},{"name":"step 3","action":"install_os"},{"name":"step 4","action":"install_os"},{"name":"step 5","action":"install_os"},{"name":"step 6","action":"install_os"}]}`))}
+	workflowTemplate := models.WorkflowTemplate{Name: "Queue workflow", Version: "v1", Status: "enabled", Definition: datatypes.JSON([]byte(queueWorkflowDefinition(12)))}
 	for _, row := range []any{&serverA, &serverB, &image, &network, &workflowTemplate} {
 		if err := db.Create(row).Error; err != nil {
 			t.Fatalf("create queue fixture: %v", err)
@@ -1489,13 +1722,1240 @@ func TestDeploymentConcurrencyQueuesPendingWork(t *testing.T) {
 	deploymentAID := int(deployments[0].(map[string]any)["id"].(float64))
 	deploymentBID := int(deployments[1].(map[string]any)["id"].(float64))
 
-	waitForDeploymentStatus(t, r, token, deploymentAID, 2*time.Second, "running")
-	queued := requestJSON(t, r, http.MethodGet, "/api/v1/deployments/"+itoa(deploymentBID), token, nil)
-	if queued["status"] != "pending" {
-		t.Fatalf("second deployment should remain pending while the only worker is busy: %#v", queued)
+	waitForOneRunningOnePending(t, r, token, deploymentAID, deploymentBID, 10*time.Second)
+	waitForDeploymentStatus(t, r, token, deploymentAID, 20*time.Second, "success")
+	waitForDeploymentStatus(t, r, token, deploymentBID, 20*time.Second, "success")
+}
+
+func TestLabValidationRunOptionsAcceptLegacyPXEArch(t *testing.T) {
+	opts, err := normalizeLabValidationRunOptions(labValidationRunOptions{})
+	if err != nil {
+		t.Fatalf("default PXE arch should be accepted: %v", err)
 	}
-	waitForDeploymentStatus(t, r, token, deploymentAID, 6*time.Second, "success")
-	waitForDeploymentStatus(t, r, token, deploymentBID, 6*time.Second, "success")
+	if opts.pxeArch != 9 {
+		t.Fatalf("empty pxe_arch should default to UEFI x86_64 arch 9, got %d", opts.pxeArch)
+	}
+	if opts.SSHProbeCommand != services.DefaultSSHCheckCommand {
+		t.Fatalf("empty ssh_probe_command should default to safe probe, got %q", opts.SSHProbeCommand)
+	}
+	opts, err = normalizeLabValidationRunOptions(labValidationRunOptions{SSHProbeCommand: "printf lab-proof"})
+	if err != nil || opts.SSHProbeCommand != "printf lab-proof" {
+		t.Fatalf("single-line ssh_probe_command should be accepted, opts=%#v err=%v", opts, err)
+	}
+	if _, err := normalizeLabValidationRunOptions(labValidationRunOptions{SSHProbeCommand: "hostname\nid"}); err == nil {
+		t.Fatalf("multi-line ssh_probe_command should be rejected")
+	}
+	legacyArch := uint16(0)
+	opts, err = normalizeLabValidationRunOptions(labValidationRunOptions{PXEArch: &legacyArch})
+	if err != nil || opts.pxeArch != 0 {
+		t.Fatalf("legacy BIOS pxe_arch should be accepted, opts=%#v err=%v", opts, err)
+	}
+	uefiArch := uint16(7)
+	opts, err = normalizeLabValidationRunOptions(labValidationRunOptions{PXEArch: &uefiArch})
+	if err != nil || opts.pxeArch != 7 {
+		t.Fatalf("UEFI pxe_arch should be accepted, opts=%#v err=%v", opts, err)
+	}
+	badArch := uint16(12)
+	if _, err := normalizeLabValidationRunOptions(labValidationRunOptions{PXEArch: &badArch}); err == nil {
+		t.Fatalf("unsupported pxe_arch should be rejected")
+	}
+}
+
+func TestSameLabSubjectNormalizesMACFormats(t *testing.T) {
+	if !sameLabSubject("52-54-00-DD-00-01", "52:54:00:dd:00:01") {
+		t.Fatalf("expected MAC subjects with different delimiters/case to match")
+	}
+	if sameLabSubject("52:54:00:dd:00:01", "52:54:00:dd:00:02") {
+		t.Fatalf("different MAC subjects should not match")
+	}
+	if !sameLabSubject("PXE-LAB-RUN-1", "pxe-lab-run-1") {
+		t.Fatalf("non-MAC subjects should remain case-insensitive")
+	}
+}
+
+func TestStrictPXEBootEventRejectsAPIOnlySource(t *testing.T) {
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:pxe-api-source?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "simulated", CollectorMode: "simulated", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	h := Handler{db: db, cfg: cfg, bmc: services.NewBMCService(db, cfg)}
+	for _, event := range []models.BootEvent{
+		{MAC: "52:54:00:aa:00:02", Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "192.0.2.2", Source: ""},
+		{MAC: "52:54:00:aa:00:03", Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "192.0.2.3", Source: "unknown"},
+	} {
+		if err := db.Create(&event).Error; err != nil {
+			t.Fatalf("create non-physical boot event: %v", err)
+		}
+		result := h.runLabPXEBootEventCheck(event.MAC)
+		if result.Status != "failed" || !strings.Contains(result.Message, "requires http_ipxe or pxe_dhcp") {
+			t.Fatalf("expected strict PXE check to reject non-physical source %q: %#v", event.Source, result)
+		}
+	}
+	apiEvent := models.BootEvent{MAC: "52:54:00:aa:00:01", Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "127.0.0.1", Source: "api_event"}
+	if err := db.Create(&apiEvent).Error; err != nil {
+		t.Fatalf("create api boot event: %v", err)
+	}
+	result := h.runLabPXEBootEventCheck("52:54:00:aa:00:01")
+	if result.Status != "failed" || !strings.Contains(result.Message, "api_event") {
+		t.Fatalf("expected strict PXE check to reject api_event source: %#v", result)
+	}
+	httpEvent := models.BootEvent{MAC: "52:54:00:aa:00:01", Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "192.0.2.10", Source: "http_ipxe"}
+	if err := db.Create(&httpEvent).Error; err != nil {
+		t.Fatalf("create http boot event: %v", err)
+	}
+	result = h.runLabPXEBootEventCheck("52:54:00:aa:00:01")
+	if result.Status != "success" || !strings.Contains(result.Message, "http_ipxe") {
+		t.Fatalf("expected strict PXE check to accept http_ipxe source: %#v", result)
+	}
+	laterAPIEvent := models.BootEvent{MAC: "52:54:00:aa:00:01", Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "127.0.0.1", Source: "api_event"}
+	if err := db.Create(&laterAPIEvent).Error; err != nil {
+		t.Fatalf("create later api boot event: %v", err)
+	}
+	result = h.runLabPXEBootEventCheck("52:54:00:aa:00:01")
+	if result.Status != "success" || !strings.Contains(result.Message, "http_ipxe") {
+		t.Fatalf("expected strict PXE check to prefer fresh physical event over later api_event: %#v", result)
+	}
+
+	stalePhysicalEvent := models.BootEvent{MAC: "52:54:00:aa:00:04", Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "192.0.2.44", Source: "http_ipxe", CreatedAt: time.Now().UTC().Add(-8 * 24 * time.Hour)}
+	if err := db.Create(&stalePhysicalEvent).Error; err != nil {
+		t.Fatalf("create stale physical boot event: %v", err)
+	}
+	result = h.runLabPXEBootEventCheck("52:54:00:aa:00:04")
+	if result.Status != "failed" || !strings.Contains(result.Message, "fresh event") {
+		t.Fatalf("expected strict PXE check to reject stale physical event: %#v", result)
+	}
+}
+
+func TestStrictPXEBootEventRequiresRequestedServerMatch(t *testing.T) {
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:pxe-requested-server-match?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "simulated", CollectorMode: "simulated", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	server := models.Server{AssetNo: "BM-PXE-TARGET-001", Hostname: "pxe-target", PrimaryMAC: "52:54:00:aa:00:08", Status: "ready"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	h := Handler{db: db, cfg: cfg, bmc: services.NewBMCService(db, cfg)}
+
+	otherEvent := models.BootEvent{MAC: "52:54:00:aa:00:09", Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "192.0.2.90", Source: "http_ipxe"}
+	if err := db.Create(&otherEvent).Error; err != nil {
+		t.Fatalf("create other boot event: %v", err)
+	}
+	result := h.runLabPXEBootEventCheck(otherEvent.MAC, server.ID)
+	if result.Status != "failed" || !strings.Contains(result.Message, "does not match requested server_ids") {
+		t.Fatalf("expected strict PXE check to reject MAC outside requested server targets: %#v", result)
+	}
+
+	targetEvent := models.BootEvent{MAC: server.PrimaryMAC, Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "192.0.2.91", Source: "http_ipxe"}
+	if err := db.Create(&targetEvent).Error; err != nil {
+		t.Fatalf("create target boot event: %v", err)
+	}
+	result = h.runLabPXEBootEventCheck(server.PrimaryMAC, server.ID)
+	if result.Status != "success" || result.ServerID != server.ID || result.AssetNo != server.AssetNo {
+		t.Fatalf("expected unbound PXE boot event to match requested server primary MAC: %#v", result)
+	}
+
+	otherServer := models.Server{AssetNo: "BM-PXE-TARGET-002", Hostname: "pxe-other", PrimaryMAC: "52:54:00:aa:00:10", Status: "ready"}
+	if err := db.Create(&otherServer).Error; err != nil {
+		t.Fatalf("create other server: %v", err)
+	}
+	explicitOtherEvent := models.BootEvent{MAC: server.PrimaryMAC, Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "192.0.2.92", Source: "http_ipxe", ServerID: &otherServer.ID}
+	if err := db.Create(&explicitOtherEvent).Error; err != nil {
+		t.Fatalf("create explicit other boot event: %v", err)
+	}
+	result = h.runLabPXEBootEventCheck(server.PrimaryMAC, server.ID)
+	if result.Status != "failed" || !strings.Contains(result.Message, "does not match requested server_ids") {
+		t.Fatalf("expected explicit mismatched server_id to reject PXE proof: %#v", result)
+	}
+}
+
+func TestLabValidationTargetsPreferPhysicalPXEEventOverLaterAPIEvent(t *testing.T) {
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:pxe-target-physical-preference?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "simulated", CollectorMode: "simulated", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	server := models.Server{AssetNo: "BM-PXE-PREF-001", Hostname: "pxe-preference", PrimaryMAC: "52:54:00:aa:00:05", Status: "ready"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	now := time.Now().UTC()
+	physical := models.BootEvent{MAC: server.PrimaryMAC, Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "192.0.2.55", Source: "http_ipxe", ServerID: &server.ID, CreatedAt: now.Add(-time.Minute)}
+	if err := db.Create(&physical).Error; err != nil {
+		t.Fatalf("create physical boot event: %v", err)
+	}
+	apiOnly := models.BootEvent{MAC: server.PrimaryMAC, Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "127.0.0.1", Source: "api_event", ServerID: &server.ID, CreatedAt: now}
+	if err := db.Create(&apiOnly).Error; err != nil {
+		t.Fatalf("create api boot event: %v", err)
+	}
+	h := Handler{db: db, cfg: cfg, bmc: services.NewBMCService(db, cfg)}
+	targets, readyCount := h.labValidationTargets()
+	if readyCount != 0 || len(targets) != 1 {
+		t.Fatalf("expected one incomplete target, ready=%d targets=%#v", readyCount, targets)
+	}
+	if targets[0].PXEStatus != "ok" || targets[0].PXEBootEventID == nil || *targets[0].PXEBootEventID != physical.ID {
+		t.Fatalf("expected target to prefer physical PXE event over later api_event: %#v", targets[0])
+	}
+}
+
+func TestHTTPIPXESourceRequiresDeploymentNetwork(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:http-ipxe-source-network?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "simulated", CollectorMode: "simulated", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	r := NewRouter(db, cfg)
+
+	_ = requestTextWithRemote(t, r, http.MethodGet, "/boot/ipxe?mac=52:54:00:aa:10:01&arch=x86_64&firmware=uefi", "", nil, "203.0.113.10:1234")
+	var outsideEvent models.BootEvent
+	if err := db.Where("mac = ?", "52:54:00:aa:10:01").Order("id desc").First(&outsideEvent).Error; err != nil {
+		t.Fatalf("load outside HTTP iPXE boot event: %v", err)
+	}
+	if outsideEvent.Source != "api_event" {
+		t.Fatalf("expected non-deployment HTTP iPXE request to be non-physical api_event, got %#v", outsideEvent)
+	}
+	h := Handler{db: db, cfg: cfg, bmc: services.NewBMCService(db, cfg)}
+	if result := h.runLabPXEBootEventCheck("52:54:00:aa:10:01"); result.Status != "failed" || !strings.Contains(result.Message, "api_event") {
+		t.Fatalf("expected strict PXE check to reject non-deployment HTTP iPXE source: %#v", result)
+	}
+
+	network := models.NetworkConfig{Name: "Lab deployment VLAN", Purpose: "deployment", CIDR: "192.0.2.0/24", Status: "enabled", DHCPMode: "proxy", ProxyDHCP: true}
+	if err := db.Create(&network).Error; err != nil {
+		t.Fatalf("create deployment network: %v", err)
+	}
+	_ = requestTextWithRemote(t, r, http.MethodGet, "/boot/ipxe?mac=52:54:00:aa:10:02&arch=x86_64&firmware=uefi", "", nil, "192.0.2.55:1234")
+	var insideEvent models.BootEvent
+	if err := db.Where("mac = ?", "52:54:00:aa:10:02").Order("id desc").First(&insideEvent).Error; err != nil {
+		t.Fatalf("load inside HTTP iPXE boot event: %v", err)
+	}
+	if insideEvent.Source != "http_ipxe" {
+		t.Fatalf("expected deployment-network HTTP iPXE request to be physical http_ipxe, got %#v", insideEvent)
+	}
+	if result := h.runLabPXEBootEventCheck("52:54:00:aa:10:02"); result.Status != "success" || !strings.Contains(result.Message, "http_ipxe") {
+		t.Fatalf("expected strict PXE check to accept deployment-network HTTP iPXE source: %#v", result)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/boot/ipxe?mac=52:54:00:aa:10:03&arch=x86_64&firmware=uefi", nil)
+	req.RemoteAddr = "192.0.2.56:1234"
+	req.Header.Set(labValidationHTTPProbeHeader, "1")
+	res := httptest.NewRecorder()
+	r.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected lab HTTP probe iPXE request to succeed, got %d: %s", res.Code, res.Body.String())
+	}
+	var probeEvent models.BootEvent
+	if err := db.Where("mac = ?", "52:54:00:aa:10:03").Order("id desc").First(&probeEvent).Error; err != nil {
+		t.Fatalf("load lab HTTP probe boot event: %v", err)
+	}
+	if probeEvent.Source != "api_event" {
+		t.Fatalf("expected lab HTTP probe request to be non-physical api_event, got %#v", probeEvent)
+	}
+	if result := h.runLabPXEBootEventCheck("52:54:00:aa:10:03"); result.Status != "failed" || !strings.Contains(result.Message, "api_event") {
+		t.Fatalf("expected strict PXE check to reject lab HTTP probe source: %#v", result)
+	}
+}
+
+func TestLabEvidenceRejectsAPIOnlyBootEventSource(t *testing.T) {
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:lab-evidence-api-source?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "redfish", CollectorMode: "simulated", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	server := models.Server{AssetNo: "BM-PXE-EVIDENCE", Hostname: "pxe-evidence", Status: "ready", Architecture: "x86_64", PrimaryMAC: "52:54:00:aa:00:02"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	apiEvent := models.BootEvent{MAC: "52:54:00:aa:00:02", Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "127.0.0.1", Source: "api_event"}
+	if err := db.Create(&apiEvent).Error; err != nil {
+		t.Fatalf("create api boot event: %v", err)
+	}
+	h := Handler{db: db, cfg: cfg, bmc: services.NewBMCService(db, cfg)}
+
+	pxeEvidence := models.LabValidationEvidence{Kind: "pxe", Subject: "52:54:00:aa:00:02", Status: "ok", Summary: "pxe evidence", CreatedBy: "tester@example.com"}
+	if err := h.attachLabEvidenceReferences(&pxeEvidence, nil, nil, &apiEvent.ID); err == nil || !strings.Contains(err.Error(), "api_event") {
+		t.Fatalf("expected ok PXE evidence to reject api_event boot event, err=%v evidence=%#v", err, pxeEvidence)
+	}
+	fullEvidence := models.LabValidationEvidence{Kind: "full", Subject: "full-chain", Status: "ok", Summary: "full evidence", CreatedBy: "tester@example.com"}
+	if err := h.attachLabEvidenceReferences(&fullEvidence, nil, &server.ID, &apiEvent.ID); err == nil || !strings.Contains(err.Error(), "api_event") {
+		t.Fatalf("expected ok full evidence to reject api_event boot event, err=%v evidence=%#v", err, fullEvidence)
+	}
+	now := time.Now().UTC()
+	bmc := models.BmcEndpoint{ServerID: server.ID, Type: "redfish", Protocol: "https", Endpoint: "https://bmc.pxe-evidence.test", Username: "admin", Status: "ok", LastCheckedAt: &now}
+	if err := db.Create(&bmc).Error; err != nil {
+		t.Fatalf("create bmc endpoint: %v", err)
+	}
+	ssh := models.SSHAccess{ServerID: server.ID, Host: "192.0.2.61", Port: 22, Username: "root", AuthType: "password", Status: "ok", LastCheckedAt: &now}
+	if err := db.Create(&ssh).Error; err != nil {
+		t.Fatalf("create ssh access: %v", err)
+	}
+	storedBadEvidence := models.LabValidationEvidence{
+		Kind: "full", Subject: "full-chain", Status: "ok", Summary: "historical full evidence with api-only boot event", CreatedBy: "tester@example.com",
+		ServerID: &server.ID, BootEventID: &apiEvent.ID, BmcEndpointID: &bmc.ID, SSHAccessID: &ssh.ID,
+	}
+	if err := db.Create(&storedBadEvidence).Error; err != nil {
+		t.Fatalf("create historical bad evidence: %v", err)
+	}
+	targets, readyCount := h.labValidationTargets()
+	if readyCount != 0 || len(targets) != 1 || targets[0].EvidenceStatus == "ok" || targets[0].FullChainReady {
+		t.Fatalf("historical api_event evidence must not make a target ready: ready=%d targets=%#v", readyCount, targets)
+	}
+
+	httpEvent := models.BootEvent{MAC: "52:54:00:aa:00:02", Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "192.0.2.60", Source: "http_ipxe"}
+	if err := db.Create(&httpEvent).Error; err != nil {
+		t.Fatalf("create http boot event: %v", err)
+	}
+	pxeEvidence = models.LabValidationEvidence{Kind: "pxe", Subject: "52:54:00:aa:00:02", Status: "ok", Summary: "pxe evidence", CreatedBy: "tester@example.com"}
+	if err := h.attachLabEvidenceReferences(&pxeEvidence, nil, &server.ID, &httpEvent.ID); err != nil {
+		t.Fatalf("expected ok PXE evidence to accept http_ipxe boot event: %v", err)
+	}
+}
+
+func TestLabEvidenceRejectsBMCAdapterMismatch(t *testing.T) {
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:lab-bmc-adapter-mismatch?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "redfish", CollectorMode: "simulated", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	now := time.Now().UTC()
+	server := models.Server{AssetNo: "BM-BMC-MISMATCH", Hostname: "bmc-mismatch", Status: "ready", Architecture: "x86_64"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	endpoint := models.BmcEndpoint{ServerID: server.ID, Type: "ipmi", Protocol: "ipmi", Endpoint: "10.0.0.5", Username: "admin", Status: "ok", LastCheckedAt: &now}
+	if err := db.Create(&endpoint).Error; err != nil {
+		t.Fatalf("create bmc endpoint: %v", err)
+	}
+	h := Handler{db: db, cfg: cfg, bmc: services.NewBMCService(db, cfg)}
+	evidence := models.LabValidationEvidence{Kind: "bmc", Subject: "bmc-mismatch", Status: "ok", Summary: "bmc evidence", CreatedBy: "tester@example.com"}
+	if err := h.attachLabEvidenceReferences(&evidence, nil, &server.ID, nil); err == nil || !strings.Contains(err.Error(), "current BMC_ADAPTER") {
+		t.Fatalf("expected BMC evidence to reject adapter mismatch, err=%v evidence=%#v", err, evidence)
+	}
+	storedMismatchEvidence := models.LabValidationEvidence{Kind: "bmc", Subject: "bmc-mismatch", Status: "ok", Summary: "historical bmc evidence", CreatedBy: "tester@example.com", ServerID: &server.ID, BmcEndpointID: &endpoint.ID}
+	if err := db.Create(&storedMismatchEvidence).Error; err != nil {
+		t.Fatalf("create historical bmc mismatch evidence: %v", err)
+	}
+	targets, readyCount := h.labValidationTargets()
+	if readyCount != 0 || len(targets) != 1 || targets[0].BMCStatus != "adapter_mismatch" || targets[0].EvidenceStatus == "ok" || !strings.Contains(strings.Join(targets[0].BlockingReasons, "; "), "BMC endpoint type") {
+		t.Fatalf("expected target matrix to flag BMC adapter mismatch: ready=%d targets=%#v", readyCount, targets)
+	}
+}
+
+func TestProductionLabValidationRejectsPlainHTTPRedfishEndpoint(t *testing.T) {
+	cfg := config.Config{
+		AppEnv: "production", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:lab-production-redfish-https?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "redfish", RedfishInsecureTLS: false, CollectorMode: "simulated", BootBaseURL: "https://boot.example.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	now := time.Now().UTC()
+	server := models.Server{AssetNo: "BM-BMC-PROD-POLICY", Hostname: "bmc-prod-policy", Status: "ready", Architecture: "x86_64"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	endpoint := models.BmcEndpoint{ServerID: server.ID, Type: "redfish", Protocol: "http", Endpoint: "http://bmc.prod-policy.test", Username: "admin", Status: "ok", LastCheckedAt: &now}
+	if err := db.Create(&endpoint).Error; err != nil {
+		t.Fatalf("create bmc endpoint: %v", err)
+	}
+	h := Handler{db: db, cfg: cfg, bmc: services.NewBMCService(db, cfg)}
+
+	evidence := models.LabValidationEvidence{Kind: "bmc", Subject: "bmc-prod-policy", Status: "ok", Summary: "bmc evidence", CreatedBy: "tester@example.com"}
+	if err := h.attachLabEvidenceReferences(&evidence, nil, &server.ID, nil); err == nil || !strings.Contains(err.Error(), "production Redfish endpoint must use https") {
+		t.Fatalf("expected production HTTP Redfish evidence to be rejected, err=%v evidence=%#v", err, evidence)
+	}
+	targets, readyCount := h.labValidationTargets()
+	if readyCount != 0 || len(targets) != 1 || targets[0].BMCStatus != "adapter_mismatch" || !strings.Contains(strings.Join(targets[0].BlockingReasons, "; "), "production Redfish endpoint must use https") {
+		t.Fatalf("expected target matrix to flag production HTTP Redfish endpoint: ready=%d targets=%#v", readyCount, targets)
+	}
+	report := labValidationReport{Status: "ok"}
+	h.fillBMCLabValidation(&report)
+	if !labCheckContains(report.Checks, "bmc_connectivity", "error", "Redfish security policy") {
+		t.Fatalf("expected BMC connectivity check to flag Redfish security policy: %#v", report.Checks)
+	}
+	results := h.runLabBMCChecks(context.Background(), 10, []uint{server.ID}, true)
+	if len(results) != 1 || results[0].Status != "failed" || !strings.Contains(results[0].Message, "production Redfish endpoint must use https") {
+		t.Fatalf("expected strict BMC run to reject production HTTP Redfish before probing: %#v", results)
+	}
+	var details map[string]any
+	if err := json.Unmarshal(results[0].Details, &details); err != nil {
+		t.Fatalf("expected strict BMC config failure details JSON: %v raw=%s", err, string(results[0].Details))
+	}
+	if details["adapter"] != "redfish" || details["stage"] != "config" || details["endpoint_status"] != "ok" {
+		t.Fatalf("expected strict BMC config failure proof details: %#v", details)
+	}
+}
+
+func TestProductionLabValidationRequiresKnownHostsForSSHProof(t *testing.T) {
+	cfg := config.Config{
+		AppEnv: "production", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:lab-production-ssh-known-hosts?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "simulated", CollectorMode: "ssh", SSHOperationsMode: "ssh", SSHHostKeyPolicy: "insecure_ignore", BootBaseURL: "https://boot.example.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	now := time.Now().UTC()
+	server := models.Server{AssetNo: "BM-SSH-PROD-POLICY", Hostname: "ssh-prod-policy", Status: "ready", Architecture: "x86_64"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	ssh := models.SSHAccess{ServerID: server.ID, Host: "192.0.2.20", Port: 22, Username: "root", AuthType: "password", Status: "ok", LastCheckedAt: &now}
+	if err := db.Create(&ssh).Error; err != nil {
+		t.Fatalf("create ssh access: %v", err)
+	}
+	h := Handler{db: db, cfg: cfg, bmc: services.NewBMCService(db, cfg)}
+
+	evidence := models.LabValidationEvidence{Kind: "ssh", Subject: "ssh-prod-policy", Status: "ok", Summary: "ssh evidence", CreatedBy: "tester@example.com"}
+	if err := h.attachLabEvidenceReferences(&evidence, nil, &server.ID, nil); err == nil || !strings.Contains(err.Error(), "production SSH validation requires SSH_HOST_KEY_POLICY=known_hosts") {
+		t.Fatalf("expected production insecure SSH evidence to be rejected, err=%v evidence=%#v", err, evidence)
+	}
+	targets, readyCount := h.labValidationTargets()
+	if readyCount != 0 || len(targets) != 1 || targets[0].SSHStatus != "policy_mismatch" || !strings.Contains(strings.Join(targets[0].BlockingReasons, "; "), "production SSH validation requires SSH_HOST_KEY_POLICY=known_hosts") {
+		t.Fatalf("expected target matrix to flag SSH host key policy: ready=%d targets=%#v", readyCount, targets)
+	}
+	report := labValidationReport{Status: "ok"}
+	h.fillSSHLabValidation(&report)
+	if !labCheckContains(report.Checks, "ssh_modes", "error", "SSH_HOST_KEY_POLICY=known_hosts") {
+		t.Fatalf("expected SSH mode check to flag host key policy: %#v", report.Checks)
+	}
+	results := h.runLabSSHChecks(context.Background(), 10, []uint{server.ID}, services.DefaultSSHCheckCommand)
+	if len(results) != 1 || results[0].Status != "failed" || !strings.Contains(results[0].Message, "production SSH validation requires SSH_HOST_KEY_POLICY=known_hosts") {
+		t.Fatalf("expected strict SSH run to reject insecure host key policy before probing: %#v", results)
+	}
+}
+
+func TestReadinessAndLabValidationReportKnownHostsCoverage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	knownHostsPath := filepath.Join(t.TempDir(), "known_hosts")
+	if err := os.WriteFile(knownHostsPath, []byte("other.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"), 0o600); err != nil {
+		t.Fatalf("write known_hosts: %v", err)
+	}
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:known-hosts-coverage?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "simulated", CollectorMode: "ssh", SSHOperationsMode: "ssh", SSHHostKeyPolicy: "known_hosts", SSHKnownHostsPath: knownHostsPath, SSHConnectTimeout: time.Second, BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	server := models.Server{AssetNo: "BM-KNOWN-HOSTS", Hostname: "known-hosts-node", Status: "ready", Architecture: "x86_64"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := db.Create(&models.SSHAccess{ServerID: server.ID, Host: "missing.example.com", Port: 22, Username: "root", AuthType: "password", Status: "configured"}).Error; err != nil {
+		t.Fatalf("create ssh access: %v", err)
+	}
+	r := NewRouter(db, cfg)
+	token := loginForTest(t, r)
+
+	readyz := requestJSON(t, r, http.MethodGet, "/readyz", "", nil)
+	if readyz["status"] != "degraded" || !jsonCheckContains(readyz["checks"].([]any), "ssh_known_hosts", "error", "missing.example.com") {
+		t.Fatalf("expected readyz to report missing known_hosts target: %#v", readyz)
+	}
+	report := requestJSON(t, r, http.MethodGet, "/api/v1/system/lab-validation", token, nil)
+	if !jsonCheckContains(report["checks"].([]any), "ssh_known_hosts", "error", "missing.example.com") {
+		t.Fatalf("expected lab validation to report missing known_hosts target: %#v", report)
+	}
+}
+
+func TestReadinessAcceptsHashedKnownHostsCoverage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	knownHostsPath := filepath.Join(t.TempDir(), "known_hosts")
+	line := knownhosts.HashHostname("hashed.example.com") + " ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
+	if err := os.WriteFile(knownHostsPath, []byte(line), 0o600); err != nil {
+		t.Fatalf("write known_hosts: %v", err)
+	}
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:hashed-known-hosts-coverage?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "simulated", CollectorMode: "ssh", SSHOperationsMode: "ssh", SSHHostKeyPolicy: "known_hosts", SSHKnownHostsPath: knownHostsPath, SSHConnectTimeout: time.Second, BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	server := models.Server{AssetNo: "BM-HASHED-KNOWN-HOSTS", Hostname: "hashed-known-hosts-node", Status: "ready", Architecture: "x86_64"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := db.Create(&models.SSHAccess{ServerID: server.ID, Host: "hashed.example.com", Port: 22, Username: "root", AuthType: "password", Status: "configured"}).Error; err != nil {
+		t.Fatalf("create ssh access: %v", err)
+	}
+	r := NewRouter(db, cfg)
+
+	readyz := requestJSON(t, r, http.MethodGet, "/readyz", "", nil)
+	if !jsonCheckContains(readyz["checks"].([]any), "ssh_known_hosts", "ok", "hashed host pattern") {
+		t.Fatalf("expected readyz to accept hashed known_hosts target coverage: %#v", readyz)
+	}
+}
+
+func TestBMCToolingStatusForIPMI(t *testing.T) {
+	original := lookExecutable
+	t.Cleanup(func() { lookExecutable = original })
+
+	lookExecutable = func(name string) (string, error) {
+		if name != "ipmitool" {
+			t.Fatalf("unexpected executable lookup %q", name)
+		}
+		return "", os.ErrNotExist
+	}
+	status, message := bmcToolingStatus("ipmi")
+	if status != "error" || !strings.Contains(message, "ipmitool") {
+		t.Fatalf("expected missing ipmitool error, got status=%q message=%q", status, message)
+	}
+
+	lookExecutable = func(name string) (string, error) {
+		return "/usr/bin/ipmitool", nil
+	}
+	status, message = bmcToolingStatus("ipmi")
+	if status != "ok" || !strings.Contains(message, "/usr/bin/ipmitool") {
+		t.Fatalf("expected ipmitool ok, got status=%q message=%q", status, message)
+	}
+
+	status, message = bmcToolingStatus("redfish")
+	if status != "ok" || !strings.Contains(message, "HTTP") {
+		t.Fatalf("expected redfish built-in tooling ok, got status=%q message=%q", status, message)
+	}
+}
+
+func TestStrictLabBMCCheckRecordsFirmwareIdentity(t *testing.T) {
+	redfish := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "admin" || pass != "Secret@123" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/redfish/v1":
+			_ = json.NewEncoder(w).Encode(map[string]any{"RedfishVersion": "1.15.0"})
+		case "/redfish/v1/Systems":
+			_ = json.NewEncoder(w).Encode(map[string]any{"Members": []map[string]string{{"@odata.id": "/redfish/v1/Systems/System.1"}}})
+		case "/redfish/v1/Systems/System.1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"@odata.id":       "/redfish/v1/Systems/System.1",
+				"PowerState":      "On",
+				"Manufacturer":    "Dell Inc.",
+				"Model":           "PowerEdge R650",
+				"SerialNumber":    "LAB-BMC-001",
+				"BiosVersion":     "2.10.1",
+				"FirmwareVersion": "system-fw",
+			})
+		case "/redfish/v1/Managers":
+			_ = json.NewEncoder(w).Encode(map[string]any{"Members": []map[string]string{{"@odata.id": "/redfish/v1/Managers/iDRAC.1"}}})
+		case "/redfish/v1/Managers/iDRAC.1":
+			_ = json.NewEncoder(w).Encode(map[string]any{"FirmwareVersion": "7.10.30.00", "Model": "iDRAC9"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer redfish.Close()
+
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:strict-bmc-identity?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "strict-bmc-identity-key", BMCAdapter: "redfish", CollectorMode: "simulated", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	server := models.Server{AssetNo: "BM-BMC-IDENTITY", Hostname: "bmc-identity", Status: "ready", Architecture: "x86_64"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	credential, err := services.NewCredentialService(db, cfg).Store("strict-bmc-password", "bmc", "admin", "Secret@123", "tester@example.com")
+	if err != nil {
+		t.Fatalf("store credential: %v", err)
+	}
+	endpoint := models.BmcEndpoint{ServerID: server.ID, Type: "redfish", Protocol: "http", Endpoint: redfish.URL, Username: "admin", EncryptedPasswordRef: itoa(int(credential.ID)), Status: "unknown"}
+	if err := db.Create(&endpoint).Error; err != nil {
+		t.Fatalf("create bmc endpoint: %v", err)
+	}
+	h := Handler{db: db, cfg: cfg, bmc: services.NewBMCService(db, cfg)}
+	results := h.runLabBMCChecks(context.Background(), 10, []uint{server.ID}, true)
+	if len(results) != 1 || results[0].Status != "success" || !strings.Contains(results[0].Message, "manufacturer=Dell Inc.") || !strings.Contains(results[0].Message, "serial=LAB-BMC-001") || !strings.Contains(results[0].Message, "bmc=7.10.30.00") {
+		t.Fatalf("expected strict BMC identity proof in result: %#v", results)
+	}
+	var details map[string]any
+	if err := json.Unmarshal(results[0].Details, &details); err != nil {
+		t.Fatalf("expected BMC identity details JSON: %v details=%s", err, string(results[0].Details))
+	}
+	if details["manufacturer"] != "Dell Inc." || details["serial_number"] != "LAB-BMC-001" || details["bmc_version"] != "7.10.30.00" {
+		t.Fatalf("expected structured BMC identity details: %#v", details)
+	}
+	run := models.LabValidationRun{Status: "running", Strict: true, CheckBMC: true, Limit: 10, ServerIDs: labJSONValue([]uint{server.ID}), RequestedBy: "tester@example.com", RequestID: "strict-bmc-details", StartedAt: time.Now().UTC()}
+	if err := db.Create(&run).Error; err != nil {
+		t.Fatalf("create lab validation run: %v", err)
+	}
+	if err := h.persistLabValidationRunResults(run.ID, results); err != nil {
+		t.Fatalf("persist lab validation run result: %v", err)
+	}
+	var stored models.LabValidationRunResult
+	if err := db.Where("run_id = ? AND kind = ?", run.ID, "bmc").First(&stored).Error; err != nil {
+		t.Fatalf("load stored BMC run result: %v", err)
+	}
+	if err := json.Unmarshal(stored.Details, &details); err != nil || details["model"] != "PowerEdge R650" {
+		t.Fatalf("expected persisted BMC identity details, err=%v details=%#v raw=%s", err, details, string(stored.Details))
+	}
+}
+
+func TestStrictLabBMCCheckRecordsConnectivityFailureProof(t *testing.T) {
+	redfish := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bmc unavailable", http.StatusInternalServerError)
+	}))
+	defer redfish.Close()
+
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:strict-bmc-connectivity-failure?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "strict-bmc-connectivity-key", BMCAdapter: "redfish", CollectorMode: "simulated", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	server := models.Server{AssetNo: "BM-BMC-CONN-FAIL", Hostname: "bmc-connectivity-failure", Status: "ready", Architecture: "x86_64"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	credential, err := services.NewCredentialService(db, cfg).Store("strict-bmc-connectivity-password", "bmc", "admin", "Secret@123", "tester@example.com")
+	if err != nil {
+		t.Fatalf("store credential: %v", err)
+	}
+	endpoint := models.BmcEndpoint{ServerID: server.ID, Type: "redfish", Protocol: "http", Endpoint: redfish.URL, Username: "admin", EncryptedPasswordRef: itoa(int(credential.ID)), Status: "unknown"}
+	if err := db.Create(&endpoint).Error; err != nil {
+		t.Fatalf("create bmc endpoint: %v", err)
+	}
+	h := Handler{db: db, cfg: cfg, bmc: services.NewBMCService(db, cfg)}
+	results := h.runLabBMCChecks(context.Background(), 10, []uint{server.ID}, true)
+	if len(results) != 1 || results[0].Status != "failed" || !strings.Contains(results[0].Message, "returned 500") {
+		t.Fatalf("expected strict BMC connectivity failure result: %#v", results)
+	}
+	var details map[string]any
+	if err := json.Unmarshal(results[0].Details, &details); err != nil {
+		t.Fatalf("expected strict BMC connectivity failure details JSON: %v raw=%s", err, string(results[0].Details))
+	}
+	if details["adapter"] != "redfish" || details["stage"] != "connectivity" || details["endpoint_status"] != "error" || details["last_checked_at"] == nil {
+		t.Fatalf("expected strict BMC connectivity failure proof details: %#v", details)
+	}
+}
+
+func TestLabRemoteCommandDetailsIncludesSSHProof(t *testing.T) {
+	detailsJSON := labRemoteCommandDetails("printf proof", services.RemoteCommandResult{
+		ExitCode:         17,
+		Stdout:           "proof-host\nLinux lab 6.1.0 x86_64",
+		Stderr:           "permission warning",
+		HostKeyPolicy:    "known_hosts",
+		HostKeyVerified:  true,
+		HostKeyAlgorithm: "ssh-ed25519",
+		HostKeySHA256:    "SHA256:testfingerprint",
+		HostKeyHost:      "[192.0.2.10]:22",
+		HostKeyRemote:    "192.0.2.10:22",
+	}, errors.New("remote command failed"))
+	var details map[string]any
+	if err := json.Unmarshal(detailsJSON, &details); err != nil {
+		t.Fatalf("expected SSH details JSON: %v raw=%s", err, string(detailsJSON))
+	}
+	if details["command"] != "printf proof" || details["exit_code"] != float64(17) {
+		t.Fatalf("expected command and exit code details: %#v", details)
+	}
+	if !strings.Contains(details["stdout"].(string), "proof-host") || !strings.Contains(details["stderr"].(string), "permission warning") || !strings.Contains(details["error"].(string), "remote command failed") {
+		t.Fatalf("expected stdout/stderr/error details: %#v", details)
+	}
+	if details["host_key_policy"] != "known_hosts" || details["host_key_verified"] != true || details["host_key_algorithm"] != "ssh-ed25519" || details["host_key_sha256"] != "SHA256:testfingerprint" {
+		t.Fatalf("expected SSH host key proof details: %#v", details)
+	}
+}
+
+func TestLabSSHResultHasCommandProofRequiresKnownHostsAndStdout(t *testing.T) {
+	result := labValidationRunResult{
+		Status:  "success",
+		Details: datatypes.JSON([]byte(`{"command":"true","exit_code":0}`)),
+	}
+	if labSSHResultHasCommandProof(result) {
+		t.Fatalf("SSH proof without stdout must not count")
+	}
+	result.Details = datatypes.JSON([]byte(`{"command":"printf proof","exit_code":0,"stdout":"proof-host Linux x86_64"}`))
+	if labSSHResultHasCommandProof(result) {
+		t.Fatalf("SSH proof without known_hosts host key verification must not count")
+	}
+	result.Details = datatypes.JSON([]byte(`{"command":"printf proof","exit_code":0,"stdout":"proof-host Linux x86_64","host_key_policy":"insecure_ignore","host_key_verified":false,"host_key_algorithm":"ssh-ed25519","host_key_sha256":"SHA256:test"}`))
+	if labSSHResultHasCommandProof(result) {
+		t.Fatalf("SSH proof with insecure host key policy must not count")
+	}
+	result.Details = datatypes.JSON([]byte(`{"command":"printf proof","exit_code":0,"stdout":"proof-host Linux x86_64","host_key_policy":"known_hosts","host_key_verified":true,"host_key_algorithm":"ssh-ed25519","host_key_sha256":"SHA256:test"}`))
+	if !labSSHResultHasCommandProof(result) {
+		t.Fatalf("SSH proof with known_hosts verification, command, exit_code=0, and stdout should count")
+	}
+	result.Details = datatypes.JSON([]byte(`{"command":"printf proof","exit_code":0,"stdout":"proof-host","host_key_policy":"known_hosts","host_key_verified":true,"host_key_algorithm":"ssh-ed25519","host_key_sha256":"SHA256:test","error":"unexpected"}`))
+	if labSSHResultHasCommandProof(result) {
+		t.Fatalf("SSH proof with an error field must not count")
+	}
+}
+
+func TestSSHCheckProofPayloadIncludesHostKeyProof(t *testing.T) {
+	payload := sshCheckProofPayload("printf proof", services.RemoteCommandResult{
+		ExitCode:         0,
+		Stdout:           "proof-host Linux x86_64\n",
+		HostKeyPolicy:    "known_hosts",
+		HostKeyVerified:  true,
+		HostKeyAlgorithm: "ssh-ed25519",
+		HostKeySHA256:    "SHA256:testfingerprint",
+		HostKeyHost:      "[192.0.2.10]:22",
+		HostKeyRemote:    "192.0.2.10:22",
+	})
+	if payload["command"] != "printf proof" || payload["exit_code"] != 0 || payload["host_key_policy"] != "known_hosts" || payload["host_key_verified"] != true || payload["host_key_algorithm"] != "ssh-ed25519" || payload["host_key_sha256"] != "SHA256:testfingerprint" {
+		t.Fatalf("expected SSH check proof fields, got %#v", payload)
+	}
+	if !strings.Contains(payload["stdout"].(string), "proof-host") {
+		t.Fatalf("expected SSH check proof stdout, got %#v", payload)
+	}
+}
+
+func TestSSHCheckProofPayloadIncludesFailureStage(t *testing.T) {
+	payload := sshCheckProofPayload("printf proof", services.RemoteCommandResult{
+		ExitCode:        -1,
+		FailureStage:    "handshake",
+		HostKeyPolicy:   "known_hosts",
+		HostKeyVerified: false,
+		HostKeySHA256:   "SHA256:mismatch",
+	})
+	if payload["stage"] != "handshake" || payload["host_key_policy"] != "known_hosts" || payload["host_key_verified"] != false || payload["host_key_sha256"] != "SHA256:mismatch" {
+		t.Fatalf("expected SSH failure proof fields, got %#v", payload)
+	}
+}
+
+func TestLabBMCResultHasIdentityProofRequiresPhysicalAdapter(t *testing.T) {
+	result := labValidationRunResult{
+		Status:  "success",
+		Details: datatypes.JSON([]byte(`{"manufacturer":"Dell Inc.","model":"PowerEdge R650"}`)),
+	}
+	if labBMCResultHasIdentityProof(result) {
+		t.Fatalf("BMC proof without redfish/ipmi adapter must not count")
+	}
+	result.Details = datatypes.JSON([]byte(`{"adapter":"simulated","manufacturer":"Dell Inc.","model":"PowerEdge R650"}`))
+	if labBMCResultHasIdentityProof(result) {
+		t.Fatalf("simulated BMC proof must not count")
+	}
+	result.Details = datatypes.JSON([]byte(`{"adapter":"redfish","manufacturer":"Dell Inc.","model":"PowerEdge R650"}`))
+	if !labBMCResultHasIdentityProof(result) {
+		t.Fatalf("redfish BMC proof with identity fields should count")
+	}
+	result.Details = datatypes.JSON([]byte(`{"adapter":"ipmi","manufacturer_id":"674","product_id":"256","device_id":"32"}`))
+	if !labBMCResultHasIdentityProof(result) {
+		t.Fatalf("ipmi BMC proof with hardware IDs should count")
+	}
+}
+
+func TestLabOperatorChecklistRequiresRunProofDetails(t *testing.T) {
+	h := Handler{}
+	now := time.Now().UTC()
+	serverID := uint(42)
+	detail := labValidationRunDetail{
+		Run: labValidationRunSummary{
+			ID: 101, Strict: true, CheckPXE: true, CheckBMC: true, CheckSSH: true,
+			ServerIDs: []uint{serverID}, PXEMACs: []string{"52:54:00:aa:bb:cc"},
+		},
+		Results: []labValidationRunResult{
+			{RunID: 101, Kind: "bmc", ServerID: serverID, Status: "success", Message: "BMC connectivity passed", CheckedAt: &now},
+			{RunID: 101, Kind: "ssh", ServerID: serverID, Status: "success", Message: "SSH probe passed", CheckedAt: &now},
+		},
+	}
+	bootEventID := uint(7)
+	target := labValidationTarget{
+		ServerID: serverID, AssetNo: "BM-CHECKLIST-PROOF", PrimaryMAC: "52:54:00:aa:bb:cc",
+		PXEStatus: "ok", PXEBootEventID: &bootEventID, BMCStatus: "ok", SSHStatus: "ok",
+	}
+	checklist := h.labOperatorChecklist(detail, []labValidationTarget{target}, []labBootEvent{{ID: bootEventID, MAC: "52:54:00:aa:bb:cc", Source: "http_ipxe"}})
+	if labChecklistHas(checklist, serverID, "bmc_identity", "ok") || labChecklistHas(checklist, serverID, "ssh_command", "ok") {
+		t.Fatalf("checklist must not mark BMC/SSH proof ok without structured run details: %#v", checklist)
+	}
+	if !labChecklistHas(checklist, serverID, "bmc_identity", "warning") || !labChecklistHas(checklist, serverID, "ssh_command", "warning") {
+		t.Fatalf("expected BMC/SSH checklist warnings for missing proof details: %#v", checklist)
+	}
+}
+
+func TestNetworkBootRuntimeStatusForPhysicalPXE(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "ipxe.efi"), []byte("uefi"), 0o644); err != nil {
+		t.Fatalf("write uefi bootfile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "undionly.kpxe"), []byte("bios"), 0o644); err != nil {
+		t.Fatalf("write bios bootfile: %v", err)
+	}
+	cfg := config.Config{
+		BootServicesEnabled:  true,
+		BootServiceMode:      "proxy",
+		BootBindInterface:    "vlan100",
+		BootDHCPListenAddr:   "192.168.100.10:67",
+		BootDHCPServerIP:     "192.168.100.10",
+		BootTFTPListenAddr:   "192.168.100.10:69",
+		BootTFTPRoot:         root,
+		BootTFTPBootfileUEFI: "ipxe.efi",
+		BootTFTPBootfileBIOS: "undionly.kpxe",
+	}
+	network := models.NetworkConfig{Purpose: "deployment", Status: "enabled", CIDR: "192.168.100.0/24", DHCPMode: "proxy", ProxyDHCP: true}
+	status, message := networkBootRuntimeStatus(cfg, network)
+	if status != "ok" || !strings.Contains(message, "ProxyDHCP and TFTP runtime are enabled") {
+		t.Fatalf("expected matching proxy runtime to pass, got status=%q message=%q", status, message)
+	}
+
+	cfg.BootDHCPServerIP = "192.168.101.10"
+	status, message = networkBootRuntimeStatus(cfg, network)
+	if status != "warning" || !strings.Contains(message, "BOOT_DHCP_SERVER_IP") {
+		t.Fatalf("expected DHCP server IP outside deployment CIDR warning, got status=%q message=%q", status, message)
+	}
+	cfg.BootDHCPServerIP = "192.168.100.10"
+	cfg.BootTFTPListenAddr = "192.168.101.10:69"
+	status, message = networkBootRuntimeStatus(cfg, network)
+	if status != "warning" || !strings.Contains(message, "BOOT_TFTP_LISTEN_ADDR") {
+		t.Fatalf("expected TFTP listen IP outside deployment CIDR warning, got status=%q message=%q", status, message)
+	}
+	cfg.BootTFTPListenAddr = "192.168.100.10:69"
+
+	cfg.BootServiceMode = "external"
+	status, message = networkBootRuntimeStatus(cfg, network)
+	if status != "warning" || !strings.Contains(message, "starts only TFTP") {
+		t.Fatalf("expected mode mismatch warning, got status=%q message=%q", status, message)
+	}
+}
+
+func TestLabEvidenceRequiresFreshOKEvidence(t *testing.T) {
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:lab-evidence-freshness?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "redfish", CollectorMode: "simulated", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	oldTime := time.Now().UTC().Add(-labEvidenceFreshnessWindow - time.Hour)
+	for _, kind := range []string{"pxe", "bmc", "ssh"} {
+		row := models.LabValidationEvidence{Kind: kind, Subject: "old-" + kind, Status: "ok", Summary: "old evidence", CreatedBy: "tester@example.com", CreatedAt: oldTime}
+		if err := db.Create(&row).Error; err != nil {
+			t.Fatalf("create old evidence: %v", err)
+		}
+	}
+	h := Handler{db: db, cfg: cfg, bmc: services.NewBMCService(db, cfg)}
+	report := labValidationReport{Status: "ok"}
+	h.fillLabEvidence(&report)
+	if !labCheckContains(report.Checks, "physical_evidence", "warning", "missing fresh ok physical evidence") {
+		t.Fatalf("expected stale evidence to warn, checks=%#v", report.Checks)
+	}
+
+	server := models.Server{AssetNo: "BM-EVIDENCE-FRESH", Hostname: "evidence-fresh", Status: "ready", Architecture: "x86_64"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create evidence server: %v", err)
+	}
+	bootEvent := models.BootEvent{MAC: "52:54:00:aa:42:00", Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "192.0.2.42", Source: "http_ipxe"}
+	if err := db.Create(&bootEvent).Error; err != nil {
+		t.Fatalf("create fresh boot event: %v", err)
+	}
+	now := time.Now().UTC()
+	bmc := models.BmcEndpoint{ServerID: server.ID, Type: "redfish", Protocol: "https", Endpoint: "https://bmc.evidence.test", Username: "admin", Status: "ok", LastCheckedAt: &now}
+	if err := db.Create(&bmc).Error; err != nil {
+		t.Fatalf("create fresh bmc endpoint: %v", err)
+	}
+	ssh := models.SSHAccess{ServerID: server.ID, Host: "192.0.2.42", Port: 22, Username: "root", AuthType: "password", Status: "ok", LastCheckedAt: &now}
+	if err := db.Create(&ssh).Error; err != nil {
+		t.Fatalf("create fresh ssh access: %v", err)
+	}
+	run := createStrictFullEvidenceRun(t, db, server.ID, bootEvent.MAC, server.ID)
+	fresh := models.LabValidationEvidence{
+		Kind: "full", Subject: "rack-a validation run", Status: "ok", Summary: "fresh full-chain evidence", CreatedBy: "tester@example.com",
+		RunID: &run.ID, ServerID: &server.ID, BootEventID: &bootEvent.ID, BmcEndpointID: &bmc.ID, SSHAccessID: &ssh.ID,
+	}
+	if err := db.Create(&fresh).Error; err != nil {
+		t.Fatalf("create fresh evidence: %v", err)
+	}
+	report = labValidationReport{Status: "ok"}
+	h.fillLabEvidence(&report)
+	if !labCheckContains(report.Checks, "physical_evidence", "ok", "within 7d") {
+		t.Fatalf("expected fresh full evidence to pass, checks=%#v", report.Checks)
+	}
+	staleCheckedAt := time.Now().UTC().Add(-labEvidenceFreshnessWindow - time.Minute)
+	if err := db.Model(&ssh).Updates(map[string]any{"last_checked_at": staleCheckedAt}).Error; err != nil {
+		t.Fatalf("stale ssh reference: %v", err)
+	}
+	report = labValidationReport{Status: "ok"}
+	h.fillLabEvidence(&report)
+	if !labCheckContains(report.Checks, "physical_evidence", "warning", "missing fresh ok physical evidence") {
+		t.Fatalf("expected stale referenced SSH check to invalidate full evidence, checks=%#v", report.Checks)
+	}
+}
+
+func TestStrictFullChainTargetAcceptsPXEBootEventMatchedByMAC(t *testing.T) {
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:lab-full-chain-target?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "redfish", CollectorMode: "ssh", SSHOperationsMode: "ssh", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	now := time.Now().UTC()
+	server := models.Server{AssetNo: "BM-FULL-CHAIN", Hostname: "full-chain", Status: "ready", Architecture: "x86_64", PrimaryMAC: "52-54-00-AA-BB-CC"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	bootEvent := models.BootEvent{MAC: "52:54:00:aa:bb:cc", Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "192.0.2.50", Source: "http_ipxe", CreatedAt: now}
+	if err := db.Create(&bootEvent).Error; err != nil {
+		t.Fatalf("create boot event: %v", err)
+	}
+	bmc := models.BmcEndpoint{ServerID: server.ID, Type: "redfish", Protocol: "https", Endpoint: "https://bmc.full-chain.test", Username: "admin", Status: "ok", PowerState: "on", LastCheckedAt: &now}
+	if err := db.Create(&bmc).Error; err != nil {
+		t.Fatalf("create bmc endpoint: %v", err)
+	}
+	ssh := models.SSHAccess{ServerID: server.ID, Host: "192.0.2.51", Port: 22, Username: "root", AuthType: "password", Status: "ok", LastCheckedAt: &now}
+	if err := db.Create(&ssh).Error; err != nil {
+		t.Fatalf("create ssh access: %v", err)
+	}
+	terminal := models.TerminalSession{ServerID: server.ID, Status: "closed", Mode: "ssh", RequestedBy: "tester@example.com", Reason: "full-chain proof", Transcript: "printf terminal-ok\nterminal-ok\nexit_code=0", OpenedAt: now, ClosedAt: &now}
+	if err := db.Create(&terminal).Error; err != nil {
+		t.Fatalf("create terminal session: %v", err)
+	}
+	scriptJob := models.ScriptJob{Name: "ssh proof script", Status: "success", RequestedBy: "tester@example.com", StartedAt: &now, FinishedAt: &now}
+	if err := db.Create(&scriptJob).Error; err != nil {
+		t.Fatalf("create script job: %v", err)
+	}
+	scriptExecution := models.ScriptExecution{ScriptJobID: scriptJob.ID, ServerID: server.ID, Status: "success", ExitCode: 0, Stdout: "script-ok", StartedAt: &now, FinishedAt: &now}
+	if err := db.Create(&scriptExecution).Error; err != nil {
+		t.Fatalf("create script execution: %v", err)
+	}
+	logEvent := models.LogEvent{ServerID: server.ID, Source: "hardware", Level: "info", Message: "SSH hardware log collection for full-chain\nkernel: Linux lab 6.1", TraceID: "trace-full-chain", OccurredAt: now}
+	if err := db.Create(&logEvent).Error; err != nil {
+		t.Fatalf("create log event: %v", err)
+	}
+	h := Handler{db: db, cfg: cfg, bmc: services.NewBMCService(db, cfg)}
+	targets, readyCount := h.labValidationTargets()
+	if readyCount != 0 || len(targets) != 1 || targets[0].PXEStatus != "ok" || targets[0].PXEBootEventID == nil || *targets[0].PXEBootEventID != bootEvent.ID {
+		t.Fatalf("expected PXE target to match boot event by primary MAC without full readiness: ready=%d targets=%#v", readyCount, targets)
+	}
+	results := h.strictFullChainTargetResults([]uint{server.ID})
+	if len(results) != 1 || results[0].Kind != "full_chain_target" || results[0].Status != "failed" || !strings.Contains(results[0].Message, "full-chain evidence") {
+		t.Fatalf("expected strict full-chain target to fail before evidence: %#v", results)
+	}
+	terminalRefs := h.labTerminalSessionsForBundle(map[uint]bool{server.ID: true})
+	if len(terminalRefs) != 1 || terminalRefs[0].Mode != "ssh" || !strings.Contains(terminalRefs[0].Transcript, "exit_code=0") {
+		t.Fatalf("expected lab evidence bundle terminal transcript ref: %#v", terminalRefs)
+	}
+	scriptRefs := h.labScriptExecutionsForBundle(map[uint]bool{server.ID: true})
+	if len(scriptRefs) != 1 || scriptRefs[0].ScriptJobID != scriptJob.ID || scriptRefs[0].JobName != "ssh proof script" || !strings.Contains(scriptRefs[0].Stdout, "script-ok") {
+		t.Fatalf("expected lab evidence bundle script execution ref: %#v", scriptRefs)
+	}
+	logRefs := h.labLogEventsForBundle(map[uint]bool{server.ID: true})
+	if len(logRefs) != 1 || logRefs[0].Source != "hardware" || !strings.Contains(logRefs[0].Message, "SSH hardware log collection") {
+		t.Fatalf("expected lab evidence bundle log event ref: %#v", logRefs)
+	}
+	evidence := models.LabValidationEvidence{Kind: "full", Subject: "full-chain", Status: "ok", Summary: "full-chain physical evidence", CreatedBy: "tester@example.com"}
+	if err := h.attachLabEvidenceReferences(&evidence, nil, &server.ID, &bootEvent.ID); err != nil {
+		if !strings.Contains(err.Error(), "run_id is required") {
+			t.Fatalf("expected missing run_id to reject full evidence, got: %v", err)
+		}
+	} else {
+		t.Fatalf("expected missing run_id to reject full evidence")
+	}
+	weakRun := createStrictFullEvidenceRun(t, db, server.ID, bootEvent.MAC, 0)
+	if err := db.Model(&models.LabValidationRunResult{}).
+		Where("run_id = ? AND kind IN ?", weakRun.ID, []string{"bmc", "ssh"}).
+		Update("details", datatypes.JSON(nil)).Error; err != nil {
+		t.Fatalf("clear weak strict run proof details: %v", err)
+	}
+	weakEvidence := models.LabValidationEvidence{
+		Kind: "full", Subject: "weak-full-chain", Status: "ok", Summary: "historical weak full-chain evidence", CreatedBy: "tester@example.com",
+		RunID: &weakRun.ID, ServerID: &server.ID, BootEventID: &bootEvent.ID, BmcEndpointID: &bmc.ID, SSHAccessID: &ssh.ID, CreatedAt: now,
+	}
+	if err := db.Create(&weakEvidence).Error; err != nil {
+		t.Fatalf("create weak full evidence: %v", err)
+	}
+	results = h.strictFullChainTargetResults([]uint{server.ID})
+	if len(results) != 1 || results[0].Status != "failed" || !strings.Contains(results[0].Message, "full-chain evidence") {
+		t.Fatalf("expected weak historical full evidence without proof details to keep target blocked: %#v", results)
+	}
+
+	run := createStrictFullEvidenceRun(t, db, server.ID, bootEvent.MAC, 0)
+	detail, err := h.labValidationRunDetail(run.ID)
+	if err != nil {
+		t.Fatalf("load strict run detail before evidence: %v", err)
+	}
+	bundle := h.buildLabValidationEvidenceBundle(detail)
+	for _, kind := range []string{"pxe", "bmc", "ssh", "full"} {
+		if !labEvidenceCandidateHas(bundle.EvidenceCandidates, kind, server.ID, bootEvent.ID) {
+			t.Fatalf("expected evidence bundle to expose %s candidate before full evidence is recorded: %#v", kind, bundle.EvidenceCandidates)
+		}
+	}
+	evidence = models.LabValidationEvidence{Kind: "full", Subject: "full-chain", Status: "ok", Summary: "full-chain physical evidence", CreatedBy: "tester@example.com"}
+	if err := h.attachLabEvidenceReferences(&evidence, &run.ID, &server.ID, &bootEvent.ID); err != nil {
+		t.Fatalf("attach full evidence by MAC-matched boot event and strict run: %v", err)
+	}
+	if evidence.ServerID == nil || *evidence.ServerID != server.ID || evidence.BootEventID == nil || *evidence.BootEventID != bootEvent.ID {
+		t.Fatalf("expected full evidence to reference server and boot event: %#v", evidence)
+	}
+	if err := db.Create(&evidence).Error; err != nil {
+		t.Fatalf("create full evidence: %v", err)
+	}
+	results = h.strictFullChainTargetResults([]uint{server.ID})
+	if len(results) != 1 || results[0].Status != "success" {
+		t.Fatalf("expected strict full-chain target to pass after evidence: %#v", results)
+	}
+	detail, err = h.labValidationRunDetail(run.ID)
+	if err != nil {
+		t.Fatalf("load strict run detail: %v", err)
+	}
+	bundle = h.buildLabValidationEvidenceBundle(detail)
+	if !labChecklistHas(bundle.OperatorChecklist, server.ID, "pxe_boot_event", "ok") ||
+		!labChecklistHas(bundle.OperatorChecklist, server.ID, "bmc_identity", "ok") ||
+		!labChecklistHas(bundle.OperatorChecklist, server.ID, "ssh_command", "ok") ||
+		!labChecklistHas(bundle.OperatorChecklist, server.ID, "full_chain_evidence", "ok") {
+		t.Fatalf("expected operator checklist to capture full physical proof path: %#v", bundle.OperatorChecklist)
+	}
+}
+
+func TestLabEvidenceAPIRequiresStrictFullChainRun(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:lab-full-evidence-api?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "redfish", CollectorMode: "ssh", SSHOperationsMode: "ssh", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	r := NewRouter(db, cfg)
+	token := loginForTest(t, r)
+
+	now := time.Now().UTC()
+	server := models.Server{AssetNo: "BM-FULL-EVIDENCE-API", Hostname: "full-evidence-api", Status: "ready", Architecture: "x86_64", PrimaryMAC: "52:54:00:aa:66:01"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	bootEvent := models.BootEvent{MAC: "52:54:00:aa:66:01", Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "192.0.2.66", Source: "http_ipxe", ServerID: &server.ID, CreatedAt: now}
+	if err := db.Create(&bootEvent).Error; err != nil {
+		t.Fatalf("create boot event: %v", err)
+	}
+	bmc := models.BmcEndpoint{ServerID: server.ID, Type: "redfish", Protocol: "https", Endpoint: "https://bmc.full-evidence-api.test", Username: "admin", Status: "ok", LastCheckedAt: &now}
+	if err := db.Create(&bmc).Error; err != nil {
+		t.Fatalf("create bmc endpoint: %v", err)
+	}
+	ssh := models.SSHAccess{ServerID: server.ID, Host: "192.0.2.67", Port: 22, Username: "root", AuthType: "password", Status: "ok", LastCheckedAt: &now}
+	if err := db.Create(&ssh).Error; err != nil {
+		t.Fatalf("create ssh access: %v", err)
+	}
+
+	payload := map[string]any{
+		"kind": "full", "subject": "full-evidence-api", "status": "ok", "summary": "physical full-chain validation",
+		"server_id": server.ID, "boot_event_id": bootEvent.ID,
+	}
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, payload, http.StatusBadRequest, "system.lab-validation.evidence")
+
+	finished := now
+	nonStrictRun := models.LabValidationRun{
+		Status: "ok", Strict: false, CheckPXE: true, CheckBMC: true, CheckSSH: true, Limit: 20,
+		ServerIDs: labJSONValue([]uint{server.ID}), PXEMACs: labJSONValue([]string{bootEvent.MAC}),
+		PXEArch: 9, RequestedBy: "tester@example.com", RequestID: "non-strict-full-evidence", StartedAt: now, FinishedAt: &finished,
+	}
+	if err := db.Create(&nonStrictRun).Error; err != nil {
+		t.Fatalf("create non-strict run: %v", err)
+	}
+	payload["run_id"] = nonStrictRun.ID
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, payload, http.StatusBadRequest, "system.lab-validation.evidence")
+
+	weakStrictRun := createStrictFullEvidenceRun(t, db, server.ID, bootEvent.MAC, server.ID)
+	if err := db.Model(&models.LabValidationRunResult{}).
+		Where("run_id = ? AND kind IN ?", weakStrictRun.ID, []string{"bmc", "ssh"}).
+		Update("details", datatypes.JSON(nil)).Error; err != nil {
+		t.Fatalf("clear weak strict run proof details: %v", err)
+	}
+	payload["run_id"] = weakStrictRun.ID
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, payload, http.StatusBadRequest, "system.lab-validation.evidence")
+
+	strictRun := createStrictFullEvidenceRun(t, db, server.ID, bootEvent.MAC, server.ID)
+	payload["run_id"] = strictRun.ID
+	evidence := requestJSONWithConfirm(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, payload, "system.lab-validation.evidence")
+	if evidence["kind"] != "full" || intFromJSON(t, evidence, "run_id") != int(strictRun.ID) || intFromJSON(t, evidence, "server_id") != int(server.ID) || intFromJSON(t, evidence, "boot_event_id") != int(bootEvent.ID) {
+		t.Fatalf("expected API to record full evidence with strict run references: %#v", evidence)
+	}
+}
+
+func TestLabEvidenceAPIRequiresBMCAndSSHProofRuns(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:lab-bmc-ssh-evidence-api?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "redfish", CollectorMode: "ssh", SSHOperationsMode: "ssh", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	r := NewRouter(db, cfg)
+	token := loginForTest(t, r)
+
+	now := time.Now().UTC()
+	server := models.Server{AssetNo: "BM-BMC-SSH-EVIDENCE", Hostname: "bmc-ssh-evidence", Status: "ready", Architecture: "x86_64", PrimaryMAC: "52:54:00:aa:77:01"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	bmc := models.BmcEndpoint{ServerID: server.ID, Type: "redfish", Protocol: "https", Endpoint: "https://bmc.bmc-ssh-evidence.test", Username: "admin", Status: "ok", LastCheckedAt: &now}
+	if err := db.Create(&bmc).Error; err != nil {
+		t.Fatalf("create bmc endpoint: %v", err)
+	}
+	ssh := models.SSHAccess{ServerID: server.ID, Host: "192.0.2.77", Port: 22, Username: "root", AuthType: "password", Status: "ok", LastCheckedAt: &now}
+	if err := db.Create(&ssh).Error; err != nil {
+		t.Fatalf("create ssh access: %v", err)
+	}
+
+	bmcPayload := map[string]any{
+		"kind": "bmc", "subject": "bmc-ssh-evidence redfish", "status": "ok", "summary": "physical BMC identity evidence",
+		"server_id": server.ID,
+	}
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, bmcPayload, http.StatusBadRequest, "system.lab-validation.evidence")
+
+	finished := now
+	nonStrictRun := models.LabValidationRun{
+		Status: "ok", Strict: false, CheckPXE: false, CheckBMC: true, CheckSSH: true, Limit: 20,
+		ServerIDs: labJSONValue([]uint{server.ID}), PXEMACs: labJSONValue([]string{}),
+		PXEArch: 9, RequestedBy: "tester@example.com", RequestID: "non-strict-bmc-ssh-evidence", StartedAt: now, FinishedAt: &finished,
+	}
+	if err := db.Create(&nonStrictRun).Error; err != nil {
+		t.Fatalf("create non-strict run: %v", err)
+	}
+	bmcPayload["run_id"] = nonStrictRun.ID
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, bmcPayload, http.StatusBadRequest, "system.lab-validation.evidence")
+
+	weakBMCRun := createStrictFullEvidenceRun(t, db, server.ID, server.PrimaryMAC, server.ID)
+	if err := db.Model(&models.LabValidationRunResult{}).
+		Where("run_id = ? AND kind = ?", weakBMCRun.ID, "bmc").
+		Update("details", datatypes.JSON(nil)).Error; err != nil {
+		t.Fatalf("clear weak BMC proof details: %v", err)
+	}
+	bmcPayload["run_id"] = weakBMCRun.ID
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, bmcPayload, http.StatusBadRequest, "system.lab-validation.evidence")
+
+	strictBMCRun := createStrictFullEvidenceRun(t, db, server.ID, server.PrimaryMAC, server.ID)
+	bmcPayload["run_id"] = strictBMCRun.ID
+	bmcEvidence := requestJSONWithConfirm(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, bmcPayload, "system.lab-validation.evidence")
+	if bmcEvidence["kind"] != "bmc" || intFromJSON(t, bmcEvidence, "run_id") != int(strictBMCRun.ID) || intFromJSON(t, bmcEvidence, "server_id") != int(server.ID) {
+		t.Fatalf("expected API to record BMC evidence with strict proof run references: %#v", bmcEvidence)
+	}
+
+	sshPayload := map[string]any{
+		"kind": "ssh", "subject": "192.0.2.77", "status": "ok", "summary": "physical SSH command proof",
+		"server_id": server.ID,
+	}
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, sshPayload, http.StatusBadRequest, "system.lab-validation.evidence")
+
+	weakSSHRun := createStrictFullEvidenceRun(t, db, server.ID, server.PrimaryMAC, server.ID)
+	if err := db.Model(&models.LabValidationRunResult{}).
+		Where("run_id = ? AND kind = ?", weakSSHRun.ID, "ssh").
+		Update("details", datatypes.JSON(nil)).Error; err != nil {
+		t.Fatalf("clear weak SSH proof details: %v", err)
+	}
+	sshPayload["run_id"] = weakSSHRun.ID
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, sshPayload, http.StatusBadRequest, "system.lab-validation.evidence")
+
+	weakSSHNoStdoutRun := createStrictFullEvidenceRun(t, db, server.ID, server.PrimaryMAC, server.ID)
+	if err := db.Model(&models.LabValidationRunResult{}).
+		Where("run_id = ? AND kind = ?", weakSSHNoStdoutRun.ID, "ssh").
+		Update("details", datatypes.JSON([]byte(`{"command":"true","exit_code":0}`))).Error; err != nil {
+		t.Fatalf("set weak SSH proof without stdout: %v", err)
+	}
+	sshPayload["run_id"] = weakSSHNoStdoutRun.ID
+	requestExpectStatus(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, sshPayload, http.StatusBadRequest, "system.lab-validation.evidence")
+
+	strictSSHRun := createStrictFullEvidenceRun(t, db, server.ID, server.PrimaryMAC, server.ID)
+	sshPayload["run_id"] = strictSSHRun.ID
+	sshEvidence := requestJSONWithConfirm(t, r, http.MethodPost, "/api/v1/system/lab-validation/evidence", token, sshPayload, "system.lab-validation.evidence")
+	if sshEvidence["kind"] != "ssh" || intFromJSON(t, sshEvidence, "run_id") != int(strictSSHRun.ID) || intFromJSON(t, sshEvidence, "server_id") != int(server.ID) {
+		t.Fatalf("expected API to record SSH evidence with strict proof run references: %#v", sshEvidence)
+	}
+}
+
+func TestHistoricalBMCAndSSHEvidenceRequiresProofRuns(t *testing.T) {
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:lab-historical-bmc-ssh-proof?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "redfish", CollectorMode: "ssh", SSHOperationsMode: "ssh", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	now := time.Now().UTC()
+	server := models.Server{AssetNo: "BM-HISTORICAL-PROOF", Hostname: "historical-proof", Status: "ready", Architecture: "x86_64", PrimaryMAC: "52:54:00:aa:88:01"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	endpoint := models.BmcEndpoint{ServerID: server.ID, Type: "redfish", Protocol: "https", Endpoint: "https://bmc.historical-proof.test", Username: "admin", Status: "ok", LastCheckedAt: &now}
+	if err := db.Create(&endpoint).Error; err != nil {
+		t.Fatalf("create bmc endpoint: %v", err)
+	}
+	access := models.SSHAccess{ServerID: server.ID, Host: "192.0.2.88", Port: 22, Username: "root", AuthType: "password", Status: "ok", LastCheckedAt: &now}
+	if err := db.Create(&access).Error; err != nil {
+		t.Fatalf("create ssh access: %v", err)
+	}
+	h := Handler{db: db, cfg: cfg, bmc: services.NewBMCService(db, cfg)}
+	freshCutoff := now.Add(-labEvidenceFreshnessWindow)
+
+	weakBMCRun := createStrictFullEvidenceRun(t, db, server.ID, server.PrimaryMAC, server.ID)
+	if err := db.Model(&models.LabValidationRunResult{}).
+		Where("run_id = ? AND kind = ?", weakBMCRun.ID, "bmc").
+		Update("details", datatypes.JSON(nil)).Error; err != nil {
+		t.Fatalf("clear weak BMC proof details: %v", err)
+	}
+	weakBMC := models.LabValidationEvidence{Kind: "bmc", Subject: "historical weak bmc", Status: "ok", Summary: "old weak bmc evidence", CreatedBy: "tester@example.com", RunID: &weakBMCRun.ID, ServerID: &server.ID, BmcEndpointID: &endpoint.ID, CreatedAt: now}
+	if h.labEvidenceCountsAsFreshOK(weakBMC, freshCutoff) {
+		t.Fatalf("historical BMC evidence without structured run proof must not count as fresh ok")
+	}
+	strictBMCRun := createStrictFullEvidenceRun(t, db, server.ID, server.PrimaryMAC, server.ID)
+	goodBMC := models.LabValidationEvidence{Kind: "bmc", Subject: "historical good bmc", Status: "ok", Summary: "old good bmc evidence", CreatedBy: "tester@example.com", RunID: &strictBMCRun.ID, ServerID: &server.ID, BmcEndpointID: &endpoint.ID, CreatedAt: now}
+	if !h.labEvidenceCountsAsFreshOK(goodBMC, freshCutoff) {
+		t.Fatalf("BMC evidence with structured run proof should count as fresh ok")
+	}
+
+	weakSSHRun := createStrictFullEvidenceRun(t, db, server.ID, server.PrimaryMAC, server.ID)
+	if err := db.Model(&models.LabValidationRunResult{}).
+		Where("run_id = ? AND kind = ?", weakSSHRun.ID, "ssh").
+		Update("details", datatypes.JSON(nil)).Error; err != nil {
+		t.Fatalf("clear weak SSH proof details: %v", err)
+	}
+	weakSSH := models.LabValidationEvidence{Kind: "ssh", Subject: "historical weak ssh", Status: "ok", Summary: "old weak ssh evidence", CreatedBy: "tester@example.com", RunID: &weakSSHRun.ID, ServerID: &server.ID, SSHAccessID: &access.ID, CreatedAt: now}
+	if h.labEvidenceCountsAsFreshOK(weakSSH, freshCutoff) {
+		t.Fatalf("historical SSH evidence without command proof must not count as fresh ok")
+	}
+	weakSSHNoStdoutRun := createStrictFullEvidenceRun(t, db, server.ID, server.PrimaryMAC, server.ID)
+	if err := db.Model(&models.LabValidationRunResult{}).
+		Where("run_id = ? AND kind = ?", weakSSHNoStdoutRun.ID, "ssh").
+		Update("details", datatypes.JSON([]byte(`{"command":"true","exit_code":0}`))).Error; err != nil {
+		t.Fatalf("set weak historical SSH proof without stdout: %v", err)
+	}
+	weakSSHNoStdout := models.LabValidationEvidence{Kind: "ssh", Subject: "historical weak ssh no stdout", Status: "ok", Summary: "old weak ssh evidence", CreatedBy: "tester@example.com", RunID: &weakSSHNoStdoutRun.ID, ServerID: &server.ID, SSHAccessID: &access.ID, CreatedAt: now}
+	if h.labEvidenceCountsAsFreshOK(weakSSHNoStdout, freshCutoff) {
+		t.Fatalf("historical SSH evidence without stdout proof must not count as fresh ok")
+	}
+	strictSSHRun := createStrictFullEvidenceRun(t, db, server.ID, server.PrimaryMAC, server.ID)
+	goodSSH := models.LabValidationEvidence{Kind: "ssh", Subject: "historical good ssh", Status: "ok", Summary: "old good ssh evidence", CreatedBy: "tester@example.com", RunID: &strictSSHRun.ID, ServerID: &server.ID, SSHAccessID: &access.ID, CreatedAt: now}
+	if !h.labEvidenceCountsAsFreshOK(goodSSH, freshCutoff) {
+		t.Fatalf("SSH evidence with command proof should count as fresh ok")
+	}
 }
 
 func TestMetricRetentionWindow(t *testing.T) {
@@ -2049,6 +3509,27 @@ func waitForDeploymentStatus(t *testing.T, r http.Handler, token string, deploym
 	return nil
 }
 
+func waitForOneRunningOnePending(t *testing.T, r http.Handler, token string, firstID int, secondID int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var first map[string]any
+	var second map[string]any
+	for time.Now().Before(deadline) {
+		first = requestJSON(t, r, http.MethodGet, "/api/v1/deployments/"+itoa(firstID), token, nil)
+		second = requestJSON(t, r, http.MethodGet, "/api/v1/deployments/"+itoa(secondID), token, nil)
+		firstStatus, _ := first["status"].(string)
+		secondStatus, _ := second["status"].(string)
+		if (firstStatus == "running" && secondStatus == "pending") || (firstStatus == "pending" && secondStatus == "running") {
+			return
+		}
+		if firstStatus == "success" && secondStatus == "success" {
+			t.Fatalf("both deployments completed before queue state was observed: first=%#v second=%#v", first, second)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("deployments did not show one running and one pending within %s; first=%#v second=%#v", timeout, first, second)
+}
+
 func itoa(v int) string {
 	if v == 0 {
 		return "0"
@@ -2080,6 +3561,19 @@ func tempImageFile(t *testing.T, dir string) string {
 	}
 	t.Cleanup(func() { _ = os.Remove(file.Name()) })
 	return file.Name()
+}
+
+func freeUDPAddr(t *testing.T) string {
+	t.Helper()
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("listen free UDP port: %v", err)
+	}
+	addr := conn.LocalAddr().String()
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close free UDP probe socket: %v", err)
+	}
+	return addr
 }
 
 func contains(text, needle string) bool {
@@ -2126,6 +3620,30 @@ func jsonArrayContainsField(rows []any, key string, expected any) bool {
 	return false
 }
 
+func jsonArrayFindByField(rows []any, key string, expected any) (map[string]any, bool) {
+	for _, row := range rows {
+		obj, ok := row.(map[string]any)
+		if ok && obj[key] == expected {
+			return obj, true
+		}
+	}
+	return nil, false
+}
+
+func jsonCheckContains(rows []any, name string, status string, messageNeedle string) bool {
+	for _, row := range rows {
+		obj, ok := row.(map[string]any)
+		if !ok || obj["name"] != name || obj["status"] != status {
+			continue
+		}
+		message, _ := obj["message"].(string)
+		if strings.Contains(message, messageNeedle) {
+			return true
+		}
+	}
+	return false
+}
+
 func statusCount(rows []any, status string) int {
 	count := 0
 	for _, row := range rows {
@@ -2149,6 +3667,71 @@ func jsonArrayFieldContains(rows []any, key string, needle string) bool {
 		}
 	}
 	return false
+}
+
+func labCheckContains(checks []labValidationCheck, name string, status string, messageNeedle string) bool {
+	for _, check := range checks {
+		if check.Name == name && check.Status == status && strings.Contains(check.Message, messageNeedle) {
+			return true
+		}
+	}
+	return false
+}
+
+func labChecklistHas(items []labOperatorChecklistItem, serverID uint, step string, status string) bool {
+	for _, item := range items {
+		if item.ServerID == serverID && item.Step == step && item.Status == status {
+			return true
+		}
+	}
+	return false
+}
+
+func labEvidenceCandidateHas(items []labEvidenceCandidate, kind string, serverID uint, bootEventID uint) bool {
+	for _, item := range items {
+		if item.Kind != kind {
+			continue
+		}
+		switch kind {
+		case "pxe":
+			if item.BootEventID == bootEventID && (item.ServerID == 0 || item.ServerID == serverID) {
+				return true
+			}
+		case "bmc", "ssh":
+			if item.ServerID == serverID {
+				return true
+			}
+		case "full":
+			if item.ServerID == serverID && item.BootEventID == bootEventID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func createStrictFullEvidenceRun(t *testing.T, db *gorm.DB, serverID uint, mac string, pxeResultServerID uint) models.LabValidationRun {
+	t.Helper()
+	now := time.Now().UTC()
+	run := models.LabValidationRun{
+		Status: "error", Strict: true, CheckPXE: true, CheckBMC: true, CheckSSH: true, Limit: 20,
+		ServerIDs: labJSONValue([]uint{serverID}), PXEMACs: labJSONValue([]string{mac}),
+		PXEArch: 9, SSHProbeCommand: services.DefaultSSHCheckCommand, RequestedBy: "tester@example.com",
+		RequestID: "test-full-chain-run", StartedAt: now, FinishedAt: &now,
+	}
+	if err := db.Create(&run).Error; err != nil {
+		t.Fatalf("create strict full evidence run: %v", err)
+	}
+	results := []models.LabValidationRunResult{
+		{RunID: run.ID, Kind: "pxe_boot_event", ServerID: pxeResultServerID, AssetNo: mac, Status: "success", Message: "PXE boot event for " + mac + " recorded via http_ipxe", CheckedAt: &now},
+		{RunID: run.ID, Kind: "bmc", ServerID: serverID, Status: "success", Message: "BMC connectivity and identity probe passed", Details: labBMCFirmwareDetails(services.BMCFirmwareInfo{Adapter: "redfish", Manufacturer: "Dell", Model: "PowerEdge R650", SerialNumber: "LAB-SERIAL-001"}), CheckedAt: &now},
+		{RunID: run.ID, Kind: "ssh", ServerID: serverID, Status: "success", Message: "SSH probe passed: exit_code=0; host_key_policy=known_hosts; host_key_verified=true", Details: labRemoteCommandDetails(services.DefaultSSHCheckCommand, services.RemoteCommandResult{ExitCode: 0, Stdout: "ok lab-ssh tester Linux x86_64", HostKeyPolicy: "known_hosts", HostKeyVerified: true, HostKeyAlgorithm: "ssh-ed25519", HostKeySHA256: "SHA256:testfingerprint", HostKeyHost: "[192.0.2.88]:22", HostKeyRemote: "192.0.2.88:22"}, nil), CheckedAt: &now},
+		{RunID: run.ID, Kind: "full_chain_target", ServerID: serverID, Status: "failed", Message: "full-chain target is not ready: full-chain evidence is not fresh ok", CheckedAt: &now},
+	}
+	if err := db.Create(&results).Error; err != nil {
+		t.Fatalf("create strict full evidence run results: %v", err)
+	}
+	return run
 }
 
 func idByField(t *testing.T, rows []any, key string, expected any) int {
@@ -2233,4 +3816,20 @@ func metadataTokenFromIPXE(t *testing.T, script string) string {
 		t.Fatalf("empty metadata token in %s", script)
 	}
 	return token
+}
+
+func queueWorkflowDefinition(steps int) string {
+	if steps < 1 {
+		steps = 1
+	}
+	var b strings.Builder
+	b.WriteString(`{"steps":[`)
+	for i := 1; i <= steps; i++ {
+		if i > 1 {
+			b.WriteByte(',')
+		}
+		b.WriteString(fmt.Sprintf(`{"name":"step %d","action":"install_os"}`, i))
+	}
+	b.WriteString(`]}`)
+	return b.String()
 }

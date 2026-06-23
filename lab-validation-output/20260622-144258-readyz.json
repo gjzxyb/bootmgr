@@ -1,0 +1,62 @@
+{
+  "status": "degraded",
+  "checks": [
+    {
+      "name": "database",
+      "status": "ok",
+      "message": "database ping succeeded"
+    },
+    {
+      "name": "redis",
+      "status": "ok",
+      "message": "redis is disabled"
+    },
+    {
+      "name": "image_storage",
+      "status": "ok",
+      "message": "image storage is writable"
+    },
+    {
+      "name": "bmc_tooling",
+      "status": "ok",
+      "message": "BMC_ADAPTER does not require external tooling"
+    },
+    {
+      "name": "ssh_known_hosts",
+      "status": "ok",
+      "message": "SSH known_hosts coverage is not required while SSH modes are simulated"
+    },
+    {
+      "name": "pxe_services",
+      "status": "ok",
+      "message": "PXE/DHCP/TFTP listeners are disabled"
+    },
+    {
+      "name": "config",
+      "status": "warning",
+      "message": "configuration has warnings"
+    }
+  ],
+  "config_issues": [
+    {
+      "level": "warning",
+      "key": "JWT_SECRET",
+      "message": "JWT_SECRET must be changed from the development default and contain at least 32 characters"
+    },
+    {
+      "level": "warning",
+      "key": "CREDENTIAL_KEY",
+      "message": "CREDENTIAL_KEY must be changed from the development default and contain at least 32 characters"
+    },
+    {
+      "level": "warning",
+      "key": "ADMIN_PASSWORD",
+      "message": "ADMIN_PASSWORD must be changed from the development default"
+    },
+    {
+      "level": "warning",
+      "key": "BOOT_SERVICES_ENABLED",
+      "message": "real PXE/DHCP/TFTP listeners are disabled"
+    }
+  ]
+}

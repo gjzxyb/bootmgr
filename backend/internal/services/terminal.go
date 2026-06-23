@@ -102,9 +102,7 @@ func (s TerminalService) RunCommand(sessionID uint, requestedBy, command string)
 		if strings.TrimSpace(result.Stderr) != "" {
 			transcript = appendTerminalTranscript(transcript, "stderr:\n"+strings.TrimSpace(result.Stderr))
 		}
-		if err != nil || result.ExitCode != 0 {
-			transcript = appendTerminalTranscript(transcript, fmt.Sprintf("exit_code=%d", result.ExitCode))
-		}
+		transcript = appendTerminalTranscript(transcript, fmt.Sprintf("exit_code=%d", result.ExitCode))
 		if err != nil {
 			transcript = appendTerminalTranscript(transcript, "error: "+err.Error())
 		}

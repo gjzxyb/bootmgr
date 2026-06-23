@@ -1,16 +1,24 @@
 package config
 
 import (
+	"bufio"
+	"crypto/hmac"
+	"crypto/sha1"
+	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 var hostnamePattern = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$`)
@@ -60,10 +68,13 @@ type Config struct {
 	AdminPassword         string
 	CredentialKey         string
 	BMCAdapter            string
+	RedfishInsecureTLS    bool
+	RedfishCACertPath     string
 	CollectorMode         string
 	BootBaseURL           string
 	SSHOperationsMode     string
 	SSHHostKeyPolicy      string
+	SSHKnownHostsPath     string
 	SSHConnectTimeout     time.Duration
 	SSHConnectTimeoutRaw  string
 	SSHConnectTimeoutOK   bool
@@ -84,6 +95,18 @@ type Issue struct {
 type ValidationResult struct {
 	Errors   []Issue `json:"errors"`
 	Warnings []Issue `json:"warnings"`
+}
+
+type KnownHostsTarget struct {
+	Host string
+	Port int
+}
+
+type KnownHostsCoverage struct {
+	Total         int
+	Matched       int
+	HashedEntries int
+	Missing       []KnownHostsTarget
 }
 
 func Load() Config {
@@ -142,10 +165,13 @@ func Load() Config {
 		AdminPassword:         env("ADMIN_PASSWORD", "Admin@123456"),
 		CredentialKey:         env("CREDENTIAL_KEY", "dev-only-32-byte-credential-key!!"),
 		BMCAdapter:            normalize(env("BMC_ADAPTER", "simulated")),
+		RedfishInsecureTLS:    envBool("REDFISH_INSECURE_TLS", !IsProduction(appEnv)),
+		RedfishCACertPath:     env("REDFISH_CA_CERT_PATH", ""),
 		CollectorMode:         normalize(env("COLLECTOR_MODE", "simulated")),
 		BootBaseURL:           env("BOOT_BASE_URL", "http://localhost:8080"),
 		SSHOperationsMode:     normalize(env("SSH_OPERATIONS_MODE", "simulated")),
 		SSHHostKeyPolicy:      normalize(env("SSH_HOST_KEY_POLICY", "insecure_ignore")),
+		SSHKnownHostsPath:     env("SSH_KNOWN_HOSTS_PATH", ""),
 		SSHConnectTimeout:     time.Duration(sshConnectTimeoutSeconds) * time.Second,
 		SSHConnectTimeoutRaw:  sshConnectTimeoutRaw,
 		SSHConnectTimeoutOK:   sshConnectTimeoutOK,
@@ -212,6 +238,11 @@ func Validate(cfg Config) ValidationResult {
 	default:
 		result.addEnvironmentIssue(production, "DB_DRIVER", fmt.Sprintf("unsupported DB_DRIVER %q; use postgres or sqlite", cfg.DBDriver))
 	}
+	if strings.TrimSpace(cfg.DatabaseURL) == "" {
+		result.addEnvironmentIssue(production, "DATABASE_URL", "DATABASE_URL must not be empty")
+	} else if production && containsPlaceholder(cfg.DatabaseURL, "REPLACE_ME") {
+		result.addError("DATABASE_URL", "DATABASE_URL must replace placeholder values before production startup")
+	}
 	if cfg.DBConnectMaxAttempts < 1 || (cfg.DBConnectAttemptsRaw != "" && !cfg.DBConnectAttemptsOK) {
 		result.addEnvironmentIssue(production, "DB_CONNECT_MAX_ATTEMPTS", "DB_CONNECT_MAX_ATTEMPTS must be a positive integer")
 	}
@@ -230,6 +261,10 @@ func Validate(cfg Config) ValidationResult {
 		}
 		if err := validateUDPListenAddr(cfg.BootTFTPListenAddr); err != nil {
 			result.addEnvironmentIssue(production, "BOOT_TFTP_LISTEN_ADDR", err.Error())
+		} else if production {
+			if err := validateProductionUDPListenHost(cfg.BootTFTPListenAddr); err != nil {
+				result.addError("BOOT_TFTP_LISTEN_ADDR", err.Error())
+			}
 		}
 		if strings.TrimSpace(cfg.BootTFTPRoot) == "" {
 			result.addEnvironmentIssue(production, "BOOT_TFTP_ROOT", "BOOT_TFTP_ROOT must not be empty when BOOT_SERVICES_ENABLED=true")
@@ -240,6 +275,10 @@ func Validate(cfg Config) ValidationResult {
 		if normalize(cfg.BootServiceMode) != "external" {
 			if err := validateUDPListenAddr(cfg.BootDHCPListenAddr); err != nil {
 				result.addEnvironmentIssue(production, "BOOT_DHCP_LISTEN_ADDR", err.Error())
+			} else if production {
+				if err := validateProductionUDPListenHost(cfg.BootDHCPListenAddr); err != nil {
+					result.addError("BOOT_DHCP_LISTEN_ADDR", err.Error())
+				}
 			}
 			if err := validateNonLocalIPv4(cfg.BootDHCPServerIP); err != nil {
 				result.addEnvironmentIssue(production, "BOOT_DHCP_SERVER_IP", err.Error())
@@ -260,17 +299,32 @@ func Validate(cfg Config) ValidationResult {
 	if production && normalize(cfg.BMCAdapter) == "simulated" {
 		result.addWarning("BMC_ADAPTER", "production should use BMC_ADAPTER=redfish or ipmi for physical hardware validation")
 	}
+	if production && normalize(cfg.BMCAdapter) == "redfish" && cfg.RedfishInsecureTLS {
+		result.addError("REDFISH_INSECURE_TLS", "production Redfish validation requires TLS certificate verification; set REDFISH_INSECURE_TLS=false and trust the BMC CA")
+	}
+	if strings.TrimSpace(cfg.RedfishCACertPath) != "" {
+		if err := validateCACertFile(cfg.RedfishCACertPath); err != nil {
+			result.addEnvironmentIssue(production, "REDFISH_CA_CERT_PATH", err.Error())
+		}
+	}
 	if !oneOf(normalize(cfg.CollectorMode), "simulated", "ssh") {
 		result.addEnvironmentIssue(production, "COLLECTOR_MODE", fmt.Sprintf("unsupported COLLECTOR_MODE %q; use simulated or ssh", cfg.CollectorMode))
 	}
 	if !oneOf(normalize(cfg.SSHOperationsMode), "simulated", "ssh") {
 		result.addEnvironmentIssue(production, "SSH_OPERATIONS_MODE", fmt.Sprintf("unsupported SSH_OPERATIONS_MODE %q; use simulated or ssh", cfg.SSHOperationsMode))
 	}
-	if !oneOf(normalize(cfg.SSHHostKeyPolicy), "insecure_ignore") {
-		result.addEnvironmentIssue(production, "SSH_HOST_KEY_POLICY", "SSH_HOST_KEY_POLICY currently supports insecure_ignore")
+	if !oneOf(normalize(cfg.SSHHostKeyPolicy), "insecure_ignore", "known_hosts") {
+		result.addEnvironmentIssue(production, "SSH_HOST_KEY_POLICY", "SSH_HOST_KEY_POLICY must be insecure_ignore or known_hosts")
+	}
+	if normalize(cfg.SSHHostKeyPolicy) == "known_hosts" {
+		if strings.TrimSpace(cfg.SSHKnownHostsPath) == "" {
+			result.addEnvironmentIssue(production, "SSH_KNOWN_HOSTS_PATH", "SSH_KNOWN_HOSTS_PATH is required when SSH_HOST_KEY_POLICY=known_hosts")
+		} else if err := validateKnownHostsFile(cfg.SSHKnownHostsPath); err != nil {
+			result.addEnvironmentIssue(production, "SSH_KNOWN_HOSTS_PATH", err.Error())
+		}
 	}
 	if production && normalize(cfg.SSHHostKeyPolicy) == "insecure_ignore" && (normalize(cfg.CollectorMode) == "ssh" || normalize(cfg.SSHOperationsMode) == "ssh") {
-		result.addWarning("SSH_HOST_KEY_POLICY", "SSH host key verification is disabled; restrict SSH access to a controlled lab network until known_hosts support is configured")
+		result.addError("SSH_HOST_KEY_POLICY", "production SSH modes require SSH_HOST_KEY_POLICY=known_hosts and a readable SSH_KNOWN_HOSTS_PATH")
 	}
 	if cfg.SSHConnectTimeout <= 0 || (cfg.SSHConnectTimeoutRaw != "" && !cfg.SSHConnectTimeoutOK) {
 		result.addEnvironmentIssue(production, "SSH_CONNECT_TIMEOUT_SECONDS", "SSH_CONNECT_TIMEOUT_SECONDS must be a positive integer")
@@ -558,6 +612,226 @@ func isPlaceholder(value string, placeholders ...string) bool {
 	return false
 }
 
+func containsPlaceholder(value string, placeholders ...string) bool {
+	normalized := strings.ToUpper(strings.TrimSpace(value))
+	for _, placeholder := range placeholders {
+		if strings.Contains(normalized, strings.ToUpper(placeholder)) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateCACertFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("CA certificate file is not readable: %w", err)
+	}
+	if info.IsDir() {
+		return errors.New("CA certificate path must point to a PEM file, not a directory")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read CA certificate file: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(data) {
+		return errors.New("CA certificate file must contain at least one PEM certificate")
+	}
+	return nil
+}
+
+func validateKnownHostsFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("SSH_KNOWN_HOSTS_PATH is not readable: %w", err)
+	}
+	if info.IsDir() {
+		return errors.New("SSH_KNOWN_HOSTS_PATH must point to a known_hosts file, not a directory")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("read SSH_KNOWN_HOSTS_PATH: %w", err)
+	}
+	defer file.Close()
+	hasEntry := false
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		hasEntry = true
+		break
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read SSH_KNOWN_HOSTS_PATH: %w", err)
+	}
+	if !hasEntry {
+		return errors.New("SSH_KNOWN_HOSTS_PATH must contain at least one host key entry")
+	}
+	if _, err := knownhosts.New(path); err != nil {
+		return fmt.Errorf("parse SSH_KNOWN_HOSTS_PATH: %w", err)
+	}
+	return nil
+}
+
+func CheckKnownHostsCoverage(path string, targets []KnownHostsTarget) (KnownHostsCoverage, error) {
+	coverage := KnownHostsCoverage{Total: len(targets)}
+	if err := validateKnownHostsFile(path); err != nil {
+		return coverage, err
+	}
+	patterns, hashedEntries, err := knownHostsPatterns(path)
+	if err != nil {
+		return coverage, err
+	}
+	coverage.HashedEntries = hashedEntries
+	for _, target := range targets {
+		if knownHostsTargetCovered(patterns, target) {
+			coverage.Matched++
+			continue
+		}
+		coverage.Missing = append(coverage.Missing, target)
+	}
+	return coverage, nil
+}
+
+func KnownHostsTargetLabel(target KnownHostsTarget) string {
+	host := strings.TrimSpace(target.Host)
+	port := target.Port
+	if port <= 0 {
+		port = 22
+	}
+	if port == 22 {
+		return host
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+type knownHostPattern struct {
+	Value   string
+	Negated bool
+}
+
+func knownHostsPatterns(path string) ([]knownHostPattern, int, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read SSH_KNOWN_HOSTS_PATH: %w", err)
+	}
+	defer file.Close()
+	patterns := []knownHostPattern{}
+	hashedEntries := 0
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		hostFieldIndex := 0
+		if strings.HasPrefix(fields[0], "@") {
+			hostFieldIndex = 1
+		}
+		if len(fields) <= hostFieldIndex {
+			continue
+		}
+		for _, raw := range strings.Split(fields[hostFieldIndex], ",") {
+			value := strings.TrimSpace(raw)
+			if value == "" {
+				continue
+			}
+			negated := strings.HasPrefix(value, "!")
+			value = strings.TrimPrefix(value, "!")
+			if value == "" {
+				continue
+			}
+			if strings.HasPrefix(value, "|") {
+				hashedEntries++
+			} else {
+				value = strings.ToLower(value)
+			}
+			patterns = append(patterns, knownHostPattern{Value: value, Negated: negated})
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, 0, fmt.Errorf("read SSH_KNOWN_HOSTS_PATH: %w", err)
+	}
+	return patterns, hashedEntries, nil
+}
+
+func knownHostsTargetCovered(patterns []knownHostPattern, target KnownHostsTarget) bool {
+	candidates := knownHostsTargetCandidates(target)
+	matched := false
+	for _, pattern := range patterns {
+		for _, candidate := range candidates {
+			if knownHostPatternMatches(pattern.Value, candidate) {
+				if pattern.Negated {
+					return false
+				}
+				matched = true
+				break
+			}
+		}
+	}
+	return matched
+}
+
+func knownHostsTargetCandidates(target KnownHostsTarget) []string {
+	host := strings.ToLower(strings.Trim(strings.TrimSpace(target.Host), "[]"))
+	if host == "" {
+		return nil
+	}
+	port := target.Port
+	if port <= 0 {
+		port = 22
+	}
+	candidates := []string{host}
+	if port != 22 {
+		candidates = append(candidates, strings.ToLower(net.JoinHostPort(host, strconv.Itoa(port))))
+		if !strings.Contains(host, ":") {
+			candidates = append(candidates, fmt.Sprintf("[%s]:%d", host, port))
+		}
+		candidates = append(candidates, fmt.Sprintf("%s:%d", host, port))
+	}
+	return candidates
+}
+
+func knownHostPatternMatches(pattern, candidate string) bool {
+	pattern = strings.TrimSpace(pattern)
+	candidate = strings.ToLower(strings.TrimSpace(candidate))
+	if strings.HasPrefix(pattern, "|") {
+		return knownHostHashMatches(pattern, candidate)
+	}
+	pattern = strings.ToLower(pattern)
+	if pattern == candidate {
+		return true
+	}
+	if strings.ContainsAny(pattern, "*?") {
+		if ok, err := pathpkg.Match(pattern, candidate); err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
+func knownHostHashMatches(pattern, candidate string) bool {
+	parts := strings.Split(pattern, "|")
+	if len(parts) != 4 || parts[0] != "" || parts[1] != "1" {
+		return false
+	}
+	salt, err := base64.StdEncoding.DecodeString(parts[2])
+	if err != nil {
+		return false
+	}
+	expected, err := base64.StdEncoding.DecodeString(parts[3])
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha1.New, salt)
+	_, _ = mac.Write([]byte(candidate))
+	return hmac.Equal(mac.Sum(nil), expected)
+}
+
 func validateHTTPBaseURL(raw string) error {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
@@ -626,6 +900,23 @@ func validateUDPListenAddr(raw string) error {
 	}
 	if !hostnamePattern.MatchString(host) {
 		return fmt.Errorf("listen address %q has an invalid host", value)
+	}
+	return nil
+}
+
+func validateProductionUDPListenHost(raw string) error {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(raw))
+	if err != nil {
+		return err
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return errors.New("production listen address must include an explicit deployment-network host/IP instead of binding all interfaces")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsUnspecified() || ip.IsLoopback() {
+			return errors.New("production listen address must use a deployment-network IP, not unspecified or loopback")
+		}
 	}
 	return nil
 }
