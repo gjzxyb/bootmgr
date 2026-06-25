@@ -17,6 +17,7 @@ import (
 	"baremetal-platform/backend/internal/models"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -104,6 +105,9 @@ func (h Handler) uploadImage(c *gin.Context) {
 		status = "enabled"
 	}
 	imageMeta := models.Image{Name: name, OSFamily: c.PostForm("os_family"), OSVersion: c.PostForm("os_version"), Architecture: architecture, Status: status}
+	if rawTags := strings.TrimSpace(c.PostForm("tags")); rawTags != "" {
+		imageMeta.Tags = datatypes.JSON([]byte(rawTags))
+	}
 	if err := normalizeImage(&imageMeta, false, h.cfg.ImageStorageDir); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -150,6 +154,7 @@ func (h Handler) uploadImage(c *gin.Context) {
 		SHA256:       hex.EncodeToString(hash.Sum(nil)),
 		Status:       imageMeta.Status,
 		TestStatus:   "tested_passed",
+		Tags:         imageMeta.Tags,
 		CreatedBy:    email,
 	}
 	if err := h.db.Create(&row).Error; err != nil {

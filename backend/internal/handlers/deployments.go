@@ -34,6 +34,35 @@ type deploymentCreatePayload struct {
 	EraseConfirmed bool           `json:"erase_confirmed"`
 }
 
+type deploymentPreflightPayload struct {
+	ServerID  uint   `json:"server_id"`
+	ServerIDs []uint `json:"server_ids"`
+	deploymentCreatePayload
+}
+
+type deploymentPreflightCheck struct {
+	Name    string `json:"name"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
+
+type deploymentPreflightTarget struct {
+	ServerID        uint                       `json:"server_id"`
+	Status          string                     `json:"status"`
+	PowerControl    string                     `json:"power_control"`
+	Checks          []deploymentPreflightCheck `json:"checks"`
+	Problems        []string                   `json:"problems"`
+	Warnings        []string                   `json:"warnings"`
+	OperatorActions []string                   `json:"operator_actions"`
+}
+
+type deploymentPreflightResponse struct {
+	Status   string                      `json:"status"`
+	Targets  []deploymentPreflightTarget `json:"targets"`
+	Problems []string                    `json:"problems"`
+	Warnings []string                    `json:"warnings"`
+}
+
 type deploymentCreateParams struct {
 	ServerID         uint
 	ImageID          uint
@@ -188,6 +217,73 @@ func (h Handler) createDeploymentBatch(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"created": len(rows), "deployments": rows})
 }
 
+func (h Handler) preflightDeployment(c *gin.Context) {
+	var req deploymentPreflightPayload
+	if !bind(c, &req) {
+		return
+	}
+	serverIDs, ok := h.validateDeploymentPreflightPayload(c, req)
+	if !ok {
+		return
+	}
+	response := deploymentPreflightResponse{Status: "ok", Targets: make([]deploymentPreflightTarget, 0, len(serverIDs)), Problems: []string{}, Warnings: []string{}}
+	for _, serverID := range serverIDs {
+		target := h.buildDeploymentPreflight(c, serverID, req.ImageID, req.TemplateID, req.WorkflowID, req.NetworkID)
+		response.Targets = append(response.Targets, target)
+		for _, problem := range target.Problems {
+			response.Problems = append(response.Problems, fmt.Sprintf("server %d: %s", serverID, problem))
+		}
+		for _, warning := range target.Warnings {
+			response.Warnings = append(response.Warnings, fmt.Sprintf("server %d: %s", serverID, warning))
+		}
+		if len(target.Problems) > 0 {
+			response.Status = "blocked"
+		}
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+func (h Handler) validateDeploymentPreflightPayload(c *gin.Context, req deploymentPreflightPayload) ([]uint, bool) {
+	serverIDs := req.ServerIDs
+	if len(serverIDs) == 0 && req.ServerID != 0 {
+		serverIDs = []uint{req.ServerID}
+	}
+	if len(serverIDs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "server_id or server_ids is required"})
+		return nil, false
+	}
+	normalized, err := normalizeDeploymentServerIDs(serverIDs, maxBatchDeployments)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return nil, false
+	}
+	if req.ImageID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "image_id is required"})
+		return nil, false
+	}
+	if req.TemplateID != nil && *req.TemplateID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "template_id must be greater than 0"})
+		return nil, false
+	}
+	if req.WorkflowID != nil && *req.WorkflowID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workflow_id must be greater than 0"})
+		return nil, false
+	}
+	if req.NetworkID != nil && *req.NetworkID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "network_id must be greater than 0"})
+		return nil, false
+	}
+	if _, err := normalizeOptionalJSONObject(req.Variables, "variables"); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return nil, false
+	}
+	if _, err := normalizeDeploymentErasePolicy(req.ErasePolicy); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return nil, false
+	}
+	return normalized, true
+}
+
 func (h Handler) validateDeploymentCreatePayload(c *gin.Context, serverID uint, req deploymentCreatePayload) (datatypes.JSON, string, bool) {
 	if serverID == 0 || req.ImageID == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "server_id and image_id are required"})
@@ -291,17 +387,92 @@ func normalizeDeploymentServerIDs(ids []uint, limit int) ([]uint, error) {
 }
 
 func (h Handler) deploymentPreflight(c *gin.Context, serverID, imageID uint, templateID *uint, workflowID *uint, networkID *uint) []string {
+	return h.buildDeploymentPreflight(c, serverID, imageID, templateID, workflowID, networkID).Problems
+}
+
+func (h Handler) buildDeploymentPreflight(c *gin.Context, serverID, imageID uint, templateID *uint, workflowID *uint, networkID *uint) deploymentPreflightTarget {
+	result := deploymentPreflightTarget{ServerID: serverID, Status: "ok", PowerControl: "manual", Checks: []deploymentPreflightCheck{}, Problems: []string{}, Warnings: []string{}, OperatorActions: []string{}}
 	problems := h.images.Preflight(serverID, imageID, templateID, workflowID)
-	if preflightHas(problems, "server not found") || preflightHas(problems, "bmc endpoint not configured") {
-		return problems
+	result.Problems = append(result.Problems, problems...)
+	if preflightHas(problems, "server not found") {
+		result.Status = "blocked"
+		result.Checks = append(result.Checks, deploymentPreflightCheck{Name: "target", Status: "error", Message: "server not found"})
+		return result
 	}
-	problems = append(problems, h.deploymentNetworkPreflight(networkID)...)
+	if len(problems) > 0 {
+		result.Checks = append(result.Checks, deploymentPreflightCheck{Name: "target", Status: "error", Message: strings.Join(problems, "; ")})
+	} else {
+		result.Checks = append(result.Checks, deploymentPreflightCheck{Name: "target", Status: "ok", Message: "server, image, templates, and default deployment network are deployable"})
+	}
+	activeProblems := h.deploymentActiveDeploymentPreflight(serverID)
+	result.Problems = append(result.Problems, activeProblems...)
+	if len(activeProblems) > 0 {
+		result.Checks = append(result.Checks, deploymentPreflightCheck{Name: "active_deployment", Status: "error", Message: strings.Join(activeProblems, "; ")})
+	} else {
+		result.Checks = append(result.Checks, deploymentPreflightCheck{Name: "active_deployment", Status: "ok", Message: "no active deployment is using this server"})
+	}
+	networkProblems := h.deploymentNetworkPreflight(networkID)
+	result.Problems = append(result.Problems, networkProblems...)
+	if len(networkProblems) > 0 {
+		result.Checks = append(result.Checks, deploymentPreflightCheck{Name: "network", Status: "error", Message: strings.Join(networkProblems, "; ")})
+	} else if networkID != nil {
+		result.Checks = append(result.Checks, deploymentPreflightCheck{Name: "network", Status: "ok", Message: "selected deployment network is enabled"})
+	}
+	var bmcEndpoint models.BmcEndpoint
+	bmcLookup := h.db.Where("server_id = ?", serverID).Limit(1).Find(&bmcEndpoint)
+	if bmcLookup.Error != nil {
+		problem := "bmc endpoint lookup failed: " + bmcLookup.Error.Error()
+		result.Problems = append(result.Problems, problem)
+		result.Checks = append(result.Checks, deploymentPreflightCheck{Name: "bmc", Status: "error", Message: problem})
+		result.Status = deploymentPreflightStatus(result.Problems)
+		return result
+	}
+	if bmcLookup.RowsAffected == 0 {
+		warning := "bmc endpoint not configured; use manual power control, PXE boot, and SSH or physical evidence for this target"
+		result.Warnings = append(result.Warnings, warning)
+		result.OperatorActions = append(result.OperatorActions, manualDeploymentOperatorActions()...)
+		result.Checks = append(result.Checks, deploymentPreflightCheck{Name: "bmc", Status: "warning", Message: warning})
+		result.Status = deploymentPreflightStatus(result.Problems)
+		return result
+	}
+	result.PowerControl = "bmc"
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 	if _, err := h.bmc.Check(ctx, fmt.Sprint(serverID)); err != nil {
-		problems = append(problems, "bmc connectivity check failed: "+err.Error())
+		problem := "bmc connectivity check failed: " + err.Error()
+		result.Problems = append(result.Problems, problem)
+		result.Checks = append(result.Checks, deploymentPreflightCheck{Name: "bmc", Status: "error", Message: problem})
+	} else {
+		result.Checks = append(result.Checks, deploymentPreflightCheck{Name: "bmc", Status: "ok", Message: fmt.Sprintf("%s endpoint is reachable", bmcEndpoint.Type)})
 	}
-	return problems
+	result.Status = deploymentPreflightStatus(result.Problems)
+	return result
+}
+
+func manualDeploymentOperatorActions() []string {
+	return []string{
+		"人工开机或重启目标服务器，并在启动菜单选择部署网卡 PXE/Network Boot",
+		"确认平台收到该服务器 MAC 对应的 PXE/iPXE 启动事件",
+		"安装完成后通过 SSH 检查或录入物理证据完成验收闭环",
+	}
+}
+
+func deploymentPreflightStatus(problems []string) string {
+	if len(problems) > 0 {
+		return "blocked"
+	}
+	return "ok"
+}
+
+func (h Handler) deploymentActiveDeploymentPreflight(serverID uint) []string {
+	var activeDeployments int64
+	if err := h.db.Model(&models.Deployment{}).Where("server_id = ? AND status IN ?", serverID, activeDeploymentStatuses()).Count(&activeDeployments).Error; err != nil {
+		return []string{"active deployment lookup failed: " + err.Error()}
+	}
+	if activeDeployments > 0 {
+		return []string{"server already has an active deployment"}
+	}
+	return nil
 }
 
 func (h Handler) deploymentNetworkPreflight(networkID *uint) []string {
@@ -363,6 +534,11 @@ func (h Handler) requireDeploymentSlot(c *gin.Context, serverID uint) bool {
 func (h Handler) getDeployment(c *gin.Context) {
 	var row models.Deployment
 	if notFound(c, h.db.First(&row, c.Param("id")).Error) {
+		return
+	}
+	_ = h.workflow.ReconcileDeployment(row.ID)
+	if err := h.db.First(&row, row.ID).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, row)
@@ -465,6 +641,11 @@ func (h Handler) retryDeployment(c *gin.Context) {
 func (h Handler) deploymentLogs(c *gin.Context) {
 	var deployment models.Deployment
 	if notFound(c, h.db.First(&deployment, c.Param("id")).Error) {
+		return
+	}
+	_ = h.workflow.ReconcileDeployment(deployment.ID)
+	if err := h.db.First(&deployment, deployment.ID).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	var runs []models.WorkflowRun

@@ -137,6 +137,7 @@ func (h Handler) checkSSHAccess(c *gin.Context) {
 		return
 	}
 	h.audit.Record(actorID, actorEmail, "ssh.check", "server", c.Param("id"), "medium", c.ClientIP(), c.Request.UserAgent(), c.GetString("request_id"))
+	h.workflow.ReconcileActiveDeploymentForServer(uint(serverID))
 	c.JSON(http.StatusOK, gin.H{"status": access.Status, "checked_at": access.LastCheckedAt, "proof": sshCheckProofPayload(command, proof)})
 }
 

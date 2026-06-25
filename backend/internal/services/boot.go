@@ -3,6 +3,7 @@ package services
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -143,7 +144,31 @@ func (s BootService) installScript(server models.Server, deployment models.Deplo
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("#!ipxe\necho Installing %s with deployment %d\nset image-url %s/images/%d/file\nset metadata-url %s/metadata/by-token/%s\nset metadata-token %s\necho Image URL: ${image-url}\necho Metadata URL: ${metadata-url}\nchain %s/boot/linux-installer.ipxe || shell\n", server.Hostname, deployment.ID, s.baseURL, deployment.ImageID, s.baseURL, token.Token, token.Token, s.baseURL), nil
+	var image models.Image
+	if err := s.db.First(&image, deployment.ImageID).Error; err != nil {
+		return "", err
+	}
+	spec := s.installerBootSpec(image, deployment, token)
+	var builder strings.Builder
+	builder.WriteString("#!ipxe\n")
+	builder.WriteString(fmt.Sprintf("echo Installing %s with deployment %d\n", server.Hostname, deployment.ID))
+	builder.WriteString(fmt.Sprintf("set base-url %s\n", s.baseURL))
+	builder.WriteString(fmt.Sprintf("set image-url %s/images/%d/file\n", s.baseURL, deployment.ImageID))
+	builder.WriteString(fmt.Sprintf("set metadata-url %s/metadata/by-token/%s\n", s.baseURL, token.Token))
+	builder.WriteString(fmt.Sprintf("set metadata-token %s\n", token.Token))
+	if spec.KernelURL != "" {
+		builder.WriteString(fmt.Sprintf("set kernel-url %s\n", spec.KernelURL))
+	}
+	if spec.InitrdURL != "" {
+		builder.WriteString(fmt.Sprintf("set initrd-url %s\n", spec.InitrdURL))
+	}
+	if spec.KernelParams != "" {
+		builder.WriteString(fmt.Sprintf("set kernel-params %s\n", spec.KernelParams))
+	}
+	builder.WriteString("echo Image URL: ${image-url}\n")
+	builder.WriteString("echo Metadata URL: ${metadata-url}\n")
+	builder.WriteString(fmt.Sprintf("chain %s/boot/linux-installer.ipxe || shell\n", s.baseURL))
+	return builder.String(), nil
 }
 
 func (s BootService) DiscoveryScript() string {
@@ -151,7 +176,117 @@ func (s BootService) DiscoveryScript() string {
 }
 
 func (s BootService) LinuxInstallerScript() string {
-	return "#!ipxe\necho Starting Linux installer\necho image-url: ${image-url}\necho metadata-url: ${metadata-url}\necho This MVP exposes image and metadata URLs for the installer environment.\nshell\n"
+	return "#!ipxe\n" +
+		"echo Starting Linux installer\n" +
+		"echo image-url: ${image-url}\n" +
+		"echo metadata-url: ${metadata-url}\n" +
+		"isset ${kernel-url} || goto missing_boot_config\n" +
+		"isset ${initrd-url} || goto missing_boot_config\n" +
+		"echo kernel-url: ${kernel-url}\n" +
+		"echo initrd-url: ${initrd-url}\n" +
+		"kernel ${kernel-url} ${kernel-params} || goto boot_failed\n" +
+		"initrd ${initrd-url} || goto boot_failed\n" +
+		"boot || goto boot_failed\n" +
+		":missing_boot_config\n" +
+		"echo Missing kernel-url or initrd-url.\n" +
+		"echo Configure image tags or deployment variables: kernel_url, initrd_url, kernel_params.\n" +
+		"echo Boot assets can be served from ${base-url}/boot-assets/...\n" +
+		"shell\n" +
+		":boot_failed\n" +
+		"echo Linux installer boot failed.\n" +
+		"shell\n"
+}
+
+type installerBootSpec struct {
+	KernelURL    string
+	InitrdURL    string
+	KernelParams string
+}
+
+func (s BootService) installerBootSpec(image models.Image, deployment models.Deployment, token models.MetadataToken) installerBootSpec {
+	imageValues := jsonObject(image.Tags)
+	deploymentValues := jsonObject(deployment.Variables)
+	context := map[string]string{
+		"base_url":       s.baseURL,
+		"image_url":      fmt.Sprintf("%s/images/%d/file", s.baseURL, deployment.ImageID),
+		"metadata_url":   fmt.Sprintf("%s/metadata/by-token/%s", s.baseURL, token.Token),
+		"metadata_token": token.Token,
+	}
+	spec := installerBootSpec{
+		KernelURL:    s.bootURL(bootString(deploymentValues, imageValues, "kernel_url", "boot_kernel_url", "pxe_kernel_url")),
+		InitrdURL:    s.bootURL(bootString(deploymentValues, imageValues, "initrd_url", "boot_initrd_url", "pxe_initrd_url")),
+		KernelParams: expandBootTemplate(bootString(deploymentValues, imageValues, "kernel_params", "boot_kernel_params", "pxe_kernel_params", "cmdline"), context),
+	}
+	if spec.KernelParams == "" && spec.KernelURL != "" && spec.InitrdURL != "" {
+		spec.KernelParams = defaultKernelParams(image)
+	}
+	return spec
+}
+
+func (s BootService) bootURL(raw string) string {
+	value := strings.TrimSpace(strings.ReplaceAll(raw, "\\", "/"))
+	if value == "" {
+		return ""
+	}
+	if strings.Contains(value, "://") {
+		return value
+	}
+	if strings.HasPrefix(value, "/") {
+		return s.baseURL + value
+	}
+	return s.baseURL + "/boot-assets/" + strings.TrimLeft(value, "/")
+}
+
+func jsonObject(raw []byte) map[string]any {
+	if len(raw) == 0 || strings.TrimSpace(string(raw)) == "" || strings.TrimSpace(string(raw)) == "null" {
+		return nil
+	}
+	var object map[string]any
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return nil
+	}
+	return object
+}
+
+func bootString(primary map[string]any, fallback map[string]any, keys ...string) string {
+	for _, values := range []map[string]any{primary, fallback} {
+		for _, key := range keys {
+			if value, ok := values[key]; ok {
+				switch typed := value.(type) {
+				case string:
+					if trimmed := strings.TrimSpace(typed); trimmed != "" {
+						return trimmed
+					}
+				case fmt.Stringer:
+					if trimmed := strings.TrimSpace(typed.String()); trimmed != "" {
+						return trimmed
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func expandBootTemplate(value string, context map[string]string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	for key, replacement := range context {
+		for _, pattern := range []string{"{{" + key + "}}", "{" + key + "}"} {
+			value = strings.ReplaceAll(value, pattern, replacement)
+		}
+	}
+	return value
+}
+
+func defaultKernelParams(image models.Image) string {
+	osFamily := strings.ToLower(strings.TrimSpace(image.OSFamily))
+	if strings.Contains(osFamily, "ubuntu") {
+		return "ip=dhcp boot=casper netboot=url url=${image-url} autoinstall ds=nocloud-net;s=${metadata-url}/"
+	}
+	return "ip=dhcp"
 }
 
 func normalizeMAC(mac string) string {

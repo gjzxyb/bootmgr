@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"context"
+	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"baremetal-platform/backend/internal/cache"
@@ -45,12 +47,13 @@ func NewRouter(db *gorm.DB, cfg config.Config) *gin.Engine {
 	if len(corsOrigins) == 0 {
 		corsOrigins = config.DefaultCORSAllowedOrigins()
 	}
-	r.Use(cors.New(cors.Config{AllowOrigins: corsOrigins, AllowMethods: []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"}, AllowHeaders: []string{"Authorization", "Content-Type", "X-Confirm-Action", "X-Request-ID"}, ExposeHeaders: []string{"X-Request-ID"}}))
+	r.Use(cors.New(cors.Config{AllowOrigins: corsOrigins, AllowOriginFunc: developmentViteOriginAllowed(cfg), AllowMethods: []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"}, AllowHeaders: []string{"Authorization", "Content-Type", "X-Confirm-Action", "X-Request-ID"}, ExposeHeaders: []string{"X-Request-ID"}}))
 	r.GET("/healthz", h.healthz)
 	r.GET("/readyz", h.readyz)
 	r.GET("/boot/ipxe", h.renderIPXE)
 	r.GET("/boot/discovery.ipxe", h.discoveryIPXE)
 	r.GET("/boot/linux-installer.ipxe", h.linuxInstallerIPXE)
+	r.GET("/boot-assets/*path", h.serveBootAsset)
 	r.POST("/boot/events", h.recordBootEvent)
 	r.GET("/metadata/instance-id", h.metadataInstanceIDByClientIP)
 	r.GET("/metadata/hostname", h.metadataHostnameByClientIP)
@@ -69,6 +72,9 @@ func NewRouter(db *gorm.DB, cfg config.Config) *gin.Engine {
 	r.GET("/metadata/by-token/:token/network", h.metadataNetworkByToken)
 	r.GET("/metadata/by-token/:token/ssh-keys", h.metadataSSHKeysByToken)
 	r.GET("/metadata/by-token/:token/userdata", h.metadataUserdataByToken)
+	r.GET("/metadata/by-token/:token/user-data", h.metadataNoCloudUserDataByToken)
+	r.GET("/metadata/by-token/:token/meta-data", h.metadataNoCloudMetaDataByToken)
+	r.GET("/metadata/by-token/:token/vendor-data", h.metadataNoCloudVendorDataByToken)
 	r.GET("/userdata/by-token/:token", h.metadataUserdataByToken)
 	r.GET("/metadata/by-mac/:mac/:field", h.metadataByMAC)
 	r.GET("/userdata/by-mac/:mac", h.metadataUserdataByMAC)
@@ -147,6 +153,7 @@ func NewRouter(db *gorm.DB, cfg config.Config) *gin.Engine {
 	protected.DELETE("/workflow-templates/:id", adminOnly, middleware.RequireConfirmation("workflow_template.delete"), h.deleteWorkflowTemplate)
 
 	protected.GET("/deployments", h.listDeployments)
+	protected.POST("/deployments/preflight", adminOrOps, h.preflightDeployment)
 	protected.POST("/deployments", adminOrOps, middleware.RequireConfirmation("deployment.create"), h.createDeployment)
 	protected.POST("/deployments/batch", adminOrOps, middleware.RequireConfirmation("deployment.batch-create"), h.createDeploymentBatch)
 	protected.GET("/deployments/:id", h.getDeployment)
@@ -186,7 +193,26 @@ func NewRouter(db *gorm.DB, cfg config.Config) *gin.Engine {
 
 	protected.GET("/audit-logs", h.listAuditLogs)
 	protected.GET("/audit-logs/:id", h.getAuditLog)
+	h.workflow.ReconcileRunningDeployments()
 	return r
+}
+
+func developmentViteOriginAllowed(cfg config.Config) func(string) bool {
+	if config.IsProduction(cfg.AppEnv) {
+		return nil
+	}
+	return func(origin string) bool {
+		u, err := url.Parse(origin)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Port() != "5173" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+			return false
+		}
+		host := u.Hostname()
+		if host == "localhost" {
+			return true
+		}
+		ip := net.ParseIP(host)
+		return ip != nil && (ip.IsLoopback() || ip.IsPrivate())
+	}
 }
 
 func (h Handler) healthz(c *gin.Context) {

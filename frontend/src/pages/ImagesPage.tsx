@@ -6,6 +6,11 @@ import { canManage, isAdmin } from '../authz';
 
 const statusColor = (status: string) => status === 'enabled' ? 'blue' : 'default';
 const testColor = (status: string) => status === 'tested_passed' ? 'green' : status === 'test_failed' ? 'red' : 'orange';
+const defaultBootTags = {
+  kernel_url: 'ubuntu-24.04/casper/vmlinuz',
+  initrd_url: 'ubuntu-24.04/casper/initrd',
+  kernel_params: 'ip=dhcp boot=casper netboot=url url={{image_url}} autoinstall ds=nocloud-net;s={{metadata_url}}/'
+};
 const formatBytes = (value?: number) => {
   if (!value) return '-';
   if (value < 1024) return `${value} B`;
@@ -42,19 +47,31 @@ export function ImagesPage({ role }: { role?: string }) {
   const openCreate = () => {
     setEditing(null);
     setUploadFile(null);
-    form.setFieldsValue({ architecture: 'x86_64', status: 'enabled', test_status: 'untested' });
+    form.setFieldsValue({ architecture: 'x86_64', status: 'enabled', test_status: 'untested', tags_text: JSON.stringify(defaultBootTags, null, 2) });
     setOpen(true);
   };
 
   const openEdit = (image: Image) => {
     setEditing(image);
     setUploadFile(null);
-    form.setFieldsValue(image);
+    form.setFieldsValue({ ...image, tags_text: image.tags ? JSON.stringify(image.tags, null, 2) : '' });
     setOpen(true);
   };
 
   const save = async () => {
     const values = await form.validateFields();
+    const rawTags = String(values.tags_text || '').trim();
+    delete values.tags_text;
+    if (rawTags) {
+      try {
+        values.tags = JSON.parse(rawTags);
+      } catch {
+        form.setFields([{ name: 'tags_text', errors: ['请输入合法 JSON'] }]);
+        return;
+      }
+    } else {
+      values.tags = null;
+    }
     if (editing) {
       await api.patch(`/images/${editing.id}`, values);
       msg.success('镜像已更新');
@@ -62,7 +79,7 @@ export function ImagesPage({ role }: { role?: string }) {
       const body = new FormData();
       body.append('file', uploadFile);
       Object.entries(values).forEach(([key, value]) => {
-        if (value !== undefined && value !== null && value !== '') body.append(key, String(value));
+        if (value !== undefined && value !== null && value !== '') body.append(key, key === 'tags' ? JSON.stringify(value) : String(value));
       });
       await api.post('/images/upload', body);
       msg.success('镜像已上传并校验');
@@ -152,6 +169,9 @@ export function ImagesPage({ role }: { role?: string }) {
         <Form.Item name="status" label="状态"><Select options={['enabled', 'disabled'].map(v => ({ value: v, label: v }))} /></Form.Item>
         <Form.Item name="test_status" label="测试状态"><Select disabled options={['untested', 'tested_passed', 'test_failed'].map(v => ({ value: v, label: v }))} /></Form.Item>
         <Form.Item name="file_path" label="文件路径"><Input /></Form.Item>
+        <Form.Item name="tags_text" label="启动参数 JSON">
+          <Input.TextArea autoSize={{ minRows: 5, maxRows: 10 }} />
+        </Form.Item>
         <Form.Item name="sha256" label="SHA256"><Input disabled /></Form.Item>
       </Form>
     </Modal>

@@ -34,7 +34,7 @@ func TestMVPFlow(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cfg := config.Config{
 		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
-		DBDriver: "sqlite", DatabaseURL: "file::memory:?cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "simulated", CollectorMode: "simulated", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: true,
+		DBDriver: "sqlite", DatabaseURL: "file::memory:?cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "simulated", CollectorMode: "simulated", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, BootTFTPRoot: filepath.Join(t.TempDir(), "tftp"), EnableDemoSeeder: true,
 	}
 	db, err := database.Connect(cfg)
 	if err != nil {
@@ -429,6 +429,15 @@ func TestMVPFlow(t *testing.T) {
 	if patchedImage["test_status"] != "untested" || patchedImage["sha256"] == "client-supplied" || int(patchedImage["size_bytes"].(float64)) != 0 {
 		t.Fatalf("image update should ignore client verification fields: %#v", patchedImage)
 	}
+	bootTags := map[string]any{
+		"kernel_url":    "ubuntu-24.04/casper/vmlinuz",
+		"initrd_url":    "ubuntu-24.04/casper/initrd",
+		"kernel_params": "ip=dhcp boot=casper netboot=url url={{image_url}} autoinstall ds=nocloud-net;s={{metadata_url}}/",
+	}
+	patchedImage = requestJSON(t, r, http.MethodPatch, "/api/v1/images/"+itoa(imageID), token, map[string]any{"tags": bootTags})
+	if tags, ok := patchedImage["tags"].(map[string]any); !ok || tags["kernel_url"] != "ubuntu-24.04/casper/vmlinuz" {
+		t.Fatalf("expected image boot tags to be stored: %#v", patchedImage)
+	}
 	filteredImages := requestJSON(t, r, http.MethodGet, "/api/v1/images?keyword=Ubuntu&os_family=ubuntu&architecture=x86_64&status=enabled&test_status=untested&page=1&page_size=1", token, nil)
 	if intFromJSON(t, filteredImages, "total") != 1 || intFromJSON(t, filteredImages, "page_size") != 1 {
 		t.Fatalf("expected filtered image pagination: %#v", filteredImages)
@@ -604,9 +613,10 @@ func TestMVPFlow(t *testing.T) {
 	disabledOverlap := requestJSON(t, r, http.MethodPost, "/api/v1/network-configs", token, map[string]any{"name": "Disabled overlapping deployment network", "purpose": "deployment", "cidr": "192.168.200.128/25", "gateway": "192.168.200.129", "status": "disabled"})
 	requestExpectStatus(t, r, http.MethodPatch, "/api/v1/network-configs/"+itoa(intFromJSON(t, disabledOverlap, "id")), token, map[string]any{"status": "enabled"}, http.StatusBadRequest, "")
 
-	preflightResp = requestJSONExpectStatus(t, r, http.MethodPost, "/api/v1/deployments", token, deploymentPayload(map[string]any{"server_id": importedID, "image_id": imageID, "template_id": installTemplateID, "workflow_id": workflowTemplateID}), http.StatusBadRequest, "deployment.create")
-	if !jsonArrayContainsString(preflightResp["problems"].([]any), "bmc endpoint not configured") {
-		t.Fatalf("expected deployment preflight to require BMC endpoint: %#v", preflightResp)
+	unverifiedNoBMCResp := requestJSONExpectStatus(t, r, http.MethodPost, "/api/v1/deployments", token, deploymentPayload(map[string]any{"server_id": importedID, "image_id": imageID, "template_id": installTemplateID, "workflow_id": workflowTemplateID}), http.StatusBadRequest, "deployment.create")
+	unverifiedNoBMCProblems := unverifiedNoBMCResp["problems"].([]any)
+	if !jsonArrayContainsString(unverifiedNoBMCProblems, "image is not verified") || jsonArrayContainsString(unverifiedNoBMCProblems, "bmc endpoint not configured") {
+		t.Fatalf("expected no-BMC preflight to keep image verification gate without requiring BMC: %#v", unverifiedNoBMCResp)
 	}
 	requestExpectStatus(t, r, http.MethodGet, "/api/v1/servers/"+itoa(serverID)+"/bmc/firmware", token, nil, http.StatusNotFound, "")
 	requestExpectStatus(t, r, http.MethodPost, "/api/v1/servers/"+itoa(serverID)+"/bmc", token, map[string]any{"type": "redfish", "endpoint": "https://bmc.test", "username": "admin", "password": "secret"}, http.StatusPreconditionRequired, "")
@@ -710,10 +720,12 @@ func TestMVPFlow(t *testing.T) {
 	if !jsonArrayContainsString(invalidNetworkResp["problems"].([]any), "deployment network not found") {
 		t.Fatalf("expected selected deployment network to be validated: %#v", invalidNetworkResp)
 	}
-	preflightResp = requestJSONExpectStatus(t, r, http.MethodPost, "/api/v1/deployments", token, deploymentPayload(map[string]any{"server_id": importedID, "image_id": imageID, "template_id": installTemplateID, "workflow_id": workflowTemplateID}), http.StatusBadRequest, "deployment.create")
-	if !jsonArrayContainsString(preflightResp["problems"].([]any), "bmc endpoint not configured") {
-		t.Fatalf("expected verified deployment preflight to require BMC endpoint: %#v", preflightResp)
+	noBMCAfterVerifyResp := requestJSONWithConfirm(t, r, http.MethodPost, "/api/v1/deployments", token, deploymentPayload(map[string]any{"server_id": importedID, "image_id": imageID, "template_id": installTemplateID, "workflow_id": workflowTemplateID}), "deployment.create")
+	if intFromJSON(t, noBMCAfterVerifyResp, "server_id") != importedID || noBMCAfterVerifyResp["status"] != "pending" {
+		t.Fatalf("expected verified no-BMC server deployment to remain allowed: %#v", noBMCAfterVerifyResp)
 	}
+	requestJSONWithConfirm(t, r, http.MethodPost, "/api/v1/deployments/"+itoa(intFromJSON(t, noBMCAfterVerifyResp, "id"))+"/cancel", token, map[string]any{}, "deployment.cancel")
+	requestJSON(t, r, http.MethodPatch, "/api/v1/servers/"+itoa(importedID), token, map[string]any{"status": "ready"})
 	served := requestText(t, r, http.MethodGet, "/images/"+itoa(imageID)+"/file", "", nil)
 	if served != "test image content" {
 		t.Fatalf("unexpected served image content: %q", served)
@@ -748,8 +760,18 @@ func TestMVPFlow(t *testing.T) {
 	if err := db.Where("deployment_id = ?", uint(deploymentID)).First(&deploymentMetadataToken).Error; err != nil {
 		t.Fatalf("expected deployment metadata token: %v", err)
 	}
+	assetDir := filepath.Join(cfg.BootTFTPRoot, "assets", "ubuntu-24.04", "casper")
+	if err := os.MkdirAll(assetDir, 0o755); err != nil {
+		t.Fatalf("create boot asset dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(assetDir, "vmlinuz"), []byte("test kernel"), 0o644); err != nil {
+		t.Fatalf("write boot asset: %v", err)
+	}
 	ipxe := requestText(t, r, http.MethodGet, "/boot/ipxe?mac=52:54:00:aa:bb:cc&arch=x86_64&firmware=uefi", "", nil)
 	if !contains(ipxe, "#!ipxe") || !contains(ipxe, "image-url") || !contains(ipxe, "http://boot.test/images/"+itoa(imageID)+"/file") || !contains(ipxe, "http://boot.test/metadata/by-token/") {
+		t.Fatalf("unexpected ipxe script: %s", ipxe)
+	}
+	if !contains(ipxe, "set kernel-url http://boot.test/boot-assets/ubuntu-24.04/casper/vmlinuz") || !contains(ipxe, "set initrd-url http://boot.test/boot-assets/ubuntu-24.04/casper/initrd") || !contains(ipxe, "set kernel-params ip=dhcp boot=casper netboot=url url=http://boot.test/images/"+itoa(imageID)+"/file autoinstall ds=nocloud-net;s=http://boot.test/metadata/by-token/") {
 		t.Fatalf("unexpected ipxe script: %s", ipxe)
 	}
 	metadataToken := metadataTokenFromIPXE(t, ipxe)
@@ -764,9 +786,14 @@ func TestMVPFlow(t *testing.T) {
 		t.Fatalf("boot event script should redact metadata token: %s", deploymentBootEvent.Script)
 	}
 	installer := requestText(t, r, http.MethodGet, "/boot/linux-installer.ipxe", "", nil)
-	if !contains(installer, "${image-url}") || !contains(installer, "${metadata-url}") {
+	if !contains(installer, "${image-url}") || !contains(installer, "${metadata-url}") || !contains(installer, "kernel ${kernel-url} ${kernel-params}") || !contains(installer, "initrd ${initrd-url}") || !contains(installer, "boot || goto boot_failed") || !contains(installer, "Missing kernel-url or initrd-url") {
 		t.Fatalf("unexpected installer script: %s", installer)
 	}
+	bootAsset := requestText(t, r, http.MethodGet, "/boot-assets/ubuntu-24.04/casper/vmlinuz", "", nil)
+	if bootAsset != "test kernel" {
+		t.Fatalf("unexpected boot asset content: %q", bootAsset)
+	}
+	requestExpectStatus(t, r, http.MethodGet, "/boot-assets/%2e%2e/secret", "", nil, http.StatusBadRequest, "")
 	discovery := requestText(t, r, http.MethodGet, "/boot/discovery.ipxe", "", nil)
 	if !contains(discovery, "http://boot.test") {
 		t.Fatalf("unexpected discovery script: %s", discovery)
@@ -836,6 +863,18 @@ func TestMVPFlow(t *testing.T) {
 	tokenUserdata := requestText(t, r, http.MethodGet, "/metadata/by-token/"+metadataToken+"/userdata", "", nil)
 	if !contains(tokenUserdata, "#cloud-config") || !contains(tokenUserdata, "hostname: test-node") {
 		t.Fatalf("expected rendered token cloud-config userdata, got %q", tokenUserdata)
+	}
+	noCloudUserdata := requestText(t, r, http.MethodGet, "/metadata/by-token/"+metadataToken+"/user-data", "", nil)
+	if !contains(noCloudUserdata, "#cloud-config") || !contains(noCloudUserdata, "hostname: test-node") {
+		t.Fatalf("expected rendered NoCloud user-data, got %q", noCloudUserdata)
+	}
+	noCloudMetadata := requestText(t, r, http.MethodGet, "/metadata/by-token/"+metadataToken+"/meta-data", "", nil)
+	if !contains(noCloudMetadata, "instance-id: server-"+itoa(serverID)) || !contains(noCloudMetadata, "local-hostname: test-node") {
+		t.Fatalf("expected rendered NoCloud meta-data, got %q", noCloudMetadata)
+	}
+	noCloudVendorData := requestText(t, r, http.MethodGet, "/metadata/by-token/"+metadataToken+"/vendor-data", "", nil)
+	if noCloudVendorData != "" {
+		t.Fatalf("expected empty NoCloud vendor-data, got %q", noCloudVendorData)
 	}
 	ipUserdata := requestText(t, r, http.MethodGet, "/userdata/by-ip/192.168.200.50", "", nil)
 	if !contains(ipUserdata, "#cloud-config") || !contains(ipUserdata, "hostname: test-node") {
@@ -1420,6 +1459,240 @@ func TestPXEReadinessProbesRuntimeListeners(t *testing.T) {
 	}
 }
 
+func TestDeploymentPreflightAllowsServerWithoutBMC(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:no-bmc-preflight?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "redfish", CollectorMode: "simulated", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	r := NewRouter(db, cfg)
+	token := loginForTest(t, r)
+
+	server := models.Server{AssetNo: "BM-NO-BMC-PREFLIGHT", Hostname: "no-bmc-preflight", Status: "ready", Architecture: "x86_64", PrimaryMAC: "18:65:71:fb:d6:c4"}
+	image := models.Image{Name: "No BMC preflight image", OSFamily: "ubuntu", OSVersion: "24.04", Architecture: "x86_64", FilePath: tempImageFile(t, cfg.ImageStorageDir), Status: "enabled", TestStatus: "tested_passed"}
+	network := models.NetworkConfig{Name: "No BMC preflight network", Purpose: "deployment", CIDR: "192.168.251.0/24", Gateway: "192.168.251.1", DHCPMode: "proxy", Status: "enabled"}
+	installTemplate := models.InstallTemplate{Name: "No BMC preflight install", TemplateType: "cloud-init", Content: "#cloud-config\n", Status: "enabled"}
+	workflowTemplate := models.WorkflowTemplate{Name: "No BMC preflight workflow", Version: "v1", Status: "enabled", Definition: datatypes.JSON([]byte(`{"steps":[{"name":"install","action":"install_os"}]}`))}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := db.Create(&image).Error; err != nil {
+		t.Fatalf("create image: %v", err)
+	}
+	if err := db.Create(&network).Error; err != nil {
+		t.Fatalf("create network: %v", err)
+	}
+	if err := db.Create(&installTemplate).Error; err != nil {
+		t.Fatalf("create install template: %v", err)
+	}
+	if err := db.Create(&workflowTemplate).Error; err != nil {
+		t.Fatalf("create workflow template: %v", err)
+	}
+
+	deployPayload := deploymentPayload(map[string]any{"server_id": server.ID, "image_id": image.ID, "template_id": installTemplate.ID, "workflow_id": workflowTemplate.ID, "network_id": network.ID})
+	preflightResp := requestJSON(t, r, http.MethodPost, "/api/v1/deployments/preflight", token, deployPayload)
+	if preflightResp["status"] != "ok" {
+		t.Fatalf("expected no-BMC preflight to pass: %#v", preflightResp)
+	}
+	if problems, ok := preflightResp["problems"].([]any); !ok || len(problems) != 0 {
+		t.Fatalf("expected top-level preflight problems to be an empty array: %#v", preflightResp["problems"])
+	}
+	preflightTargets := preflightResp["targets"].([]any)
+	if len(preflightTargets) != 1 {
+		t.Fatalf("expected one preflight target: %#v", preflightResp)
+	}
+	preflightTarget := preflightTargets[0].(map[string]any)
+	if preflightTarget["status"] != "ok" || preflightTarget["power_control"] != "manual" {
+		t.Fatalf("expected no-BMC target to use manual power path: %#v", preflightTarget)
+	}
+	if problems, ok := preflightTarget["problems"].([]any); !ok || len(problems) != 0 {
+		t.Fatalf("expected target preflight problems to be an empty array: %#v", preflightTarget["problems"])
+	}
+	if !jsonArrayContainsString(preflightTarget["warnings"].([]any), "bmc endpoint not configured; use manual power control, PXE boot, and SSH or physical evidence for this target") {
+		t.Fatalf("expected no-BMC preflight warning: %#v", preflightTarget)
+	}
+	operatorActions, ok := preflightTarget["operator_actions"].([]any)
+	if !ok || len(operatorActions) != 3 || !jsonArrayContainsString(operatorActions, "确认平台收到该服务器 MAC 对应的 PXE/iPXE 启动事件") {
+		t.Fatalf("expected no-BMC preflight to include manual operator actions: %#v", preflightTarget["operator_actions"])
+	}
+	var deploymentsBeforeCreate int64
+	if err := db.Model(&models.Deployment{}).Where("server_id = ?", server.ID).Count(&deploymentsBeforeCreate).Error; err != nil {
+		t.Fatalf("count deployments before create: %v", err)
+	}
+	if deploymentsBeforeCreate != 0 {
+		t.Fatalf("preflight must not create deployments, got %d", deploymentsBeforeCreate)
+	}
+
+	deploymentResp := requestJSONWithConfirm(t, r, http.MethodPost, "/api/v1/deployments", token, deployPayload, "deployment.create")
+	if intFromJSON(t, deploymentResp, "server_id") != int(server.ID) || deploymentResp["status"] != "pending" {
+		t.Fatalf("expected no-BMC deployment to be accepted for PXE/manual power path: %#v", deploymentResp)
+	}
+	deploymentID := intFromJSON(t, deploymentResp, "id")
+	runningDeployment := waitForDeploymentStatus(t, r, token, deploymentID, 2*time.Second, "running")
+	if runningDeployment["status"] != "running" {
+		t.Fatalf("expected no-BMC deployment to wait for physical evidence, got %#v", runningDeployment)
+	}
+	logs := requestJSON(t, r, http.MethodGet, "/api/v1/deployments/"+itoa(deploymentID)+"/logs", token, nil)
+	tasks := logs["tasks"].([]any)
+	taskStatus := func(action string) string {
+		for _, row := range tasks {
+			obj, ok := row.(map[string]any)
+			if ok && obj["action"] == action {
+				status, _ := obj["status"].(string)
+				return status
+			}
+		}
+		return ""
+	}
+	for _, action := range []string{"manual_power_pxe", "wait_physical_pxe", "wait_metadata_access", "wait_ssh_or_full_evidence"} {
+		if !jsonArrayContainsAction(tasks, action) {
+			t.Fatalf("expected no-BMC physical workflow task %s in %#v", action, tasks)
+		}
+	}
+	if taskStatus("manual_power_pxe") != "running" || taskStatus("wait_physical_pxe") != "pending" || taskStatus("wait_metadata_access") != "pending" || taskStatus("wait_ssh_or_full_evidence") != "pending" {
+		t.Fatalf("expected no-BMC workflow to wait on physical PXE evidence, tasks=%#v", tasks)
+	}
+	requestJSONExpectStatus(t, r, http.MethodPost, "/api/v1/deployments", token, deployPayload, http.StatusConflict, "deployment.create")
+
+	ipxe := requestTextWithRemote(t, r, http.MethodGet, "/boot/ipxe?mac="+server.PrimaryMAC+"&arch=x86_64&firmware=uefi", "", nil, "192.168.251.55:1234")
+	if !strings.Contains(ipxe, "#!ipxe") || !strings.Contains(ipxe, "metadata/by-token") {
+		t.Fatalf("expected physical iPXE request to render deployment script, got %s", ipxe)
+	}
+	metadataToken := metadataTokenFromIPXE(t, ipxe)
+	var pxeEvent models.BootEvent
+	if err := db.Where("deployment_id = ? AND source = ?", deploymentID, "http_ipxe").First(&pxeEvent).Error; err != nil {
+		t.Fatalf("expected physical PXE boot event to be linked to deployment: %v", err)
+	}
+	userdata := requestTextWithRemote(t, r, http.MethodGet, "/metadata/by-token/"+metadataToken+"/userdata", "", nil, "192.168.251.56:1234")
+	if !strings.Contains(userdata, "#cloud-config") {
+		t.Fatalf("expected deployment metadata userdata, got %s", userdata)
+	}
+	logs = requestJSON(t, r, http.MethodGet, "/api/v1/deployments/"+itoa(deploymentID)+"/logs", token, nil)
+	tasks = logs["tasks"].([]any)
+	taskStatus = func(action string) string {
+		for _, row := range tasks {
+			obj, ok := row.(map[string]any)
+			if ok && obj["action"] == action {
+				status, _ := obj["status"].(string)
+				return status
+			}
+		}
+		return ""
+	}
+	if taskStatus("manual_power_pxe") != "success" || taskStatus("wait_physical_pxe") != "success" || taskStatus("wait_metadata_access") != "success" || taskStatus("wait_ssh_or_full_evidence") != "running" {
+		t.Fatalf("expected PXE and metadata evidence to advance workflow, tasks=%#v", tasks)
+	}
+	checkedAt := time.Now().UTC()
+	if err := db.Create(&models.SSHAccess{ServerID: server.ID, Host: "192.0.2.50", Port: 22, Username: "root", AuthType: "password", Status: "ok", LastCheckedAt: &checkedAt}).Error; err != nil {
+		t.Fatalf("create ssh access evidence: %v", err)
+	}
+	successDeployment := waitForDeploymentStatus(t, r, token, deploymentID, 2*time.Second, "success")
+	if successDeployment["status"] != "success" {
+		t.Fatalf("expected no-BMC deployment to complete after SSH evidence: %#v", successDeployment)
+	}
+	finalLogs := requestJSON(t, r, http.MethodGet, "/api/v1/deployments/"+itoa(deploymentID)+"/logs", token, nil)
+	finalTasks := finalLogs["tasks"].([]any)
+	for _, action := range []string{"manual_power_pxe", "wait_physical_pxe", "wait_metadata_access", "wait_ssh_or_full_evidence"} {
+		foundSuccess := false
+		for _, row := range finalTasks {
+			obj, ok := row.(map[string]any)
+			if ok && obj["action"] == action && obj["status"] == "success" {
+				foundSuccess = true
+				break
+			}
+		}
+		if !foundSuccess {
+			t.Fatalf("expected final no-BMC task %s to succeed, tasks=%#v", action, finalTasks)
+		}
+	}
+	if err := db.First(&server, server.ID).Error; err != nil {
+		t.Fatalf("reload server: %v", err)
+	}
+	if server.Status != "running" {
+		t.Fatalf("expected no-BMC server to be running after deployment success, got %s", server.Status)
+	}
+	var deployments int64
+	if err := db.Model(&models.Deployment{}).Where("server_id = ?", server.ID).Count(&deployments).Error; err != nil {
+		t.Fatalf("count deployments: %v", err)
+	}
+	if deployments != 1 {
+		t.Fatalf("expected one deployment for no-BMC server, got %d", deployments)
+	}
+	var endpoints int64
+	if err := db.Model(&models.BmcEndpoint{}).Where("server_id = ?", server.ID).Count(&endpoints).Error; err != nil {
+		t.Fatalf("count bmc endpoints: %v", err)
+	}
+	if endpoints != 0 {
+		t.Fatalf("test setup should not create a BMC endpoint, got %d", endpoints)
+	}
+}
+
+func TestRouterStartupResumesPendingNoBMCDeployment(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:no-bmc-startup-resume?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "redfish", CollectorMode: "simulated", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: true,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+
+	now := time.Now().UTC()
+	server := models.Server{AssetNo: "BM-NO-BMC-RESUME", Hostname: "no-bmc-resume", Status: "deploying", Architecture: "x86_64", PrimaryMAC: "18:65:71:fb:d6:c5"}
+	image := models.Image{Name: "No BMC resume image", OSFamily: "ubuntu", OSVersion: "24.04", Architecture: "x86_64", FilePath: tempImageFile(t, cfg.ImageStorageDir), Status: "enabled", TestStatus: "tested_passed"}
+	network := models.NetworkConfig{Name: "No BMC resume network", Purpose: "deployment", CIDR: "192.168.252.0/24", Gateway: "192.168.252.1", DHCPMode: "proxy", Status: "enabled"}
+	installTemplate := models.InstallTemplate{Name: "No BMC resume install", TemplateType: "cloud-init", Content: "#cloud-config\n", Status: "enabled"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := db.Create(&image).Error; err != nil {
+		t.Fatalf("create image: %v", err)
+	}
+	if err := db.Create(&network).Error; err != nil {
+		t.Fatalf("create network: %v", err)
+	}
+	if err := db.Create(&installTemplate).Error; err != nil {
+		t.Fatalf("create install template: %v", err)
+	}
+	deployment := models.Deployment{ServerID: server.ID, ImageID: image.ID, TemplateID: &installTemplate.ID, NetworkID: &network.ID, ErasePolicy: "quick", EraseConfirmed: true, EraseConfirmedAt: &now, Status: "pending", RequestedBy: "admin@example.com"}
+	if err := db.Create(&deployment).Error; err != nil {
+		t.Fatalf("create pending deployment: %v", err)
+	}
+	var workflowsBefore int64
+	if err := db.Model(&models.WorkflowRun{}).Where("deployment_id = ?", deployment.ID).Count(&workflowsBefore).Error; err != nil {
+		t.Fatalf("count workflows before startup: %v", err)
+	}
+	if workflowsBefore != 0 {
+		t.Fatalf("test setup should start without workflow runs, got %d", workflowsBefore)
+	}
+
+	r := NewRouter(db, cfg)
+	token := loginForTest(t, r)
+	runningDeployment := waitForDeploymentStatus(t, r, token, int(deployment.ID), 2*time.Second, "running")
+	if runningDeployment["status"] != "running" {
+		t.Fatalf("expected startup resume to move pending no-BMC deployment to running: %#v", runningDeployment)
+	}
+	logs := requestJSON(t, r, http.MethodGet, "/api/v1/deployments/"+itoa(int(deployment.ID))+"/logs", token, nil)
+	tasks := logs["tasks"].([]any)
+	for _, action := range []string{"manual_power_pxe", "wait_physical_pxe", "wait_metadata_access", "wait_ssh_or_full_evidence"} {
+		if !jsonArrayContainsAction(tasks, action) {
+			t.Fatalf("expected startup resume to create physical workflow task %s in %#v", action, tasks)
+		}
+	}
+	var workflow models.WorkflowRun
+	if err := db.Where("deployment_id = ? AND status = ?", deployment.ID, "running").First(&workflow).Error; err != nil {
+		t.Fatalf("expected running workflow after startup resume: %v", err)
+	}
+	if workflow.Name != "Physical PXE Installation" {
+		t.Fatalf("expected physical PXE workflow, got %q", workflow.Name)
+	}
+}
+
 func TestDeploymentPreflightRequiresBMCConnectivity(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	redfish := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1477,6 +1750,19 @@ func TestDeploymentPreflightRequiresBMCConnectivity(t *testing.T) {
 	}
 	if failedCheckAudits != 1 {
 		t.Fatalf("expected failed BMC check to be audited, got %d", failedCheckAudits)
+	}
+
+	preflightResp := requestJSON(t, r, http.MethodPost, "/api/v1/deployments/preflight", token, deploymentPayload(map[string]any{"server_id": server.ID, "image_id": image.ID, "template_id": installTemplate.ID, "workflow_id": workflowTemplate.ID}))
+	if preflightResp["status"] != "blocked" {
+		t.Fatalf("expected failed BMC endpoint to block deployment preflight: %#v", preflightResp)
+	}
+	preflightTargets := preflightResp["targets"].([]any)
+	preflightTarget := preflightTargets[0].(map[string]any)
+	if preflightTarget["power_control"] != "bmc" || !jsonArrayContainsString(preflightTarget["problems"].([]any), "bmc connectivity check failed: redfish GET /redfish/v1 returned 500: bmc unavailable") {
+		t.Fatalf("expected BMC preflight failure on configured endpoint: %#v", preflightTarget)
+	}
+	if operatorActions, ok := preflightTarget["operator_actions"].([]any); !ok || len(operatorActions) != 0 {
+		t.Fatalf("expected BMC preflight to avoid manual operator actions: %#v", preflightTarget["operator_actions"])
 	}
 
 	deploymentResp := requestJSONExpectStatus(t, r, http.MethodPost, "/api/v1/deployments", token, deploymentPayload(map[string]any{"server_id": server.ID, "image_id": image.ID, "template_id": installTemplate.ID, "workflow_id": workflowTemplate.ID}), http.StatusBadRequest, "deployment.create")
@@ -1770,6 +2056,34 @@ func TestSameLabSubjectNormalizesMACFormats(t *testing.T) {
 	}
 	if !sameLabSubject("PXE-LAB-RUN-1", "pxe-lab-run-1") {
 		t.Fatalf("non-MAC subjects should remain case-insensitive")
+	}
+}
+
+func TestDevelopmentCORSAllowsLANViteOrigin(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := config.Config{
+		AppEnv: "development", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file::memory:?cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "simulated", CollectorMode: "simulated", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: true,
+		CORSAllowedOrigins: config.DefaultCORSAllowedOrigins(),
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	r := NewRouter(db, cfg)
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/v1/auth/login", nil)
+	req.Header.Set("Origin", "http://192.168.1.88:5173")
+	req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	req.Header.Set("Access-Control-Request-Headers", "content-type,x-request-id")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected LAN Vite preflight to pass, got status %d body %q", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "http://192.168.1.88:5173" {
+		t.Fatalf("expected CORS allow origin to echo LAN origin, got %q", got)
 	}
 }
 
@@ -2484,7 +2798,7 @@ func TestLabOperatorChecklistRequiresRunProofDetails(t *testing.T) {
 	bootEventID := uint(7)
 	target := labValidationTarget{
 		ServerID: serverID, AssetNo: "BM-CHECKLIST-PROOF", PrimaryMAC: "52:54:00:aa:bb:cc",
-		PXEStatus: "ok", PXEBootEventID: &bootEventID, BMCStatus: "ok", SSHStatus: "ok",
+		PXEStatus: "ok", PXEBootEventID: &bootEventID, BMCRequired: true, BMCStatus: "ok", SSHStatus: "ok",
 	}
 	checklist := h.labOperatorChecklist(detail, []labValidationTarget{target}, []labBootEvent{{ID: bootEventID, MAC: "52:54:00:aa:bb:cc", Source: "http_ipxe"}})
 	if labChecklistHas(checklist, serverID, "bmc_identity", "ok") || labChecklistHas(checklist, serverID, "ssh_command", "ok") {
@@ -2492,6 +2806,11 @@ func TestLabOperatorChecklistRequiresRunProofDetails(t *testing.T) {
 	}
 	if !labChecklistHas(checklist, serverID, "bmc_identity", "warning") || !labChecklistHas(checklist, serverID, "ssh_command", "warning") {
 		t.Fatalf("expected BMC/SSH checklist warnings for missing proof details: %#v", checklist)
+	}
+	target.BMCRequired = false
+	checklist = h.labOperatorChecklist(detail, []labValidationTarget{target}, []labBootEvent{{ID: bootEventID, MAC: "52:54:00:aa:bb:cc", Source: "http_ipxe"}})
+	if !labChecklistHas(checklist, serverID, "bmc_identity", "skipped") || !labChecklistHas(checklist, serverID, "ssh_command", "warning") {
+		t.Fatalf("expected optional BMC to be skipped while SSH proof still warns: %#v", checklist)
 	}
 }
 
@@ -2728,6 +3047,80 @@ func TestStrictFullChainTargetAcceptsPXEBootEventMatchedByMAC(t *testing.T) {
 		!labChecklistHas(bundle.OperatorChecklist, server.ID, "ssh_command", "ok") ||
 		!labChecklistHas(bundle.OperatorChecklist, server.ID, "full_chain_evidence", "ok") {
 		t.Fatalf("expected operator checklist to capture full physical proof path: %#v", bundle.OperatorChecklist)
+	}
+}
+
+func TestStrictFullChainTargetAllowsServerWithoutBMC(t *testing.T) {
+	cfg := config.Config{
+		AppEnv: "test", HTTPAddr: ":0", JWTSecret: "test-secret", TokenTTL: time.Hour,
+		DBDriver: "sqlite", DatabaseURL: "file:lab-full-chain-without-bmc?mode=memory&cache=shared", AdminEmail: "admin@example.com", AdminPassword: "Admin@123456", CredentialKey: "test-credential-key", BMCAdapter: "simulated", CollectorMode: "ssh", SSHOperationsMode: "ssh", BootBaseURL: "http://boot.test", ImageStorageDir: t.TempDir(), ImageUploadMaxBytes: 1024 * 1024, EnableDemoSeeder: false,
+	}
+	db, err := database.Connect(cfg)
+	if err != nil {
+		t.Fatalf("database init: %v", err)
+	}
+	now := time.Now().UTC()
+	server := models.Server{AssetNo: "BM-NO-BMC", Hostname: "no-bmc", Status: "ready", Architecture: "x86_64", PrimaryMAC: "52:54:00:aa:77:01"}
+	if err := db.Create(&server).Error; err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	bootEvent := models.BootEvent{MAC: "52:54:00:aa:77:01", Architecture: "x86_64", Firmware: "uefi", RemoteAddr: "192.0.2.77", Source: "http_ipxe", CreatedAt: now}
+	if err := db.Create(&bootEvent).Error; err != nil {
+		t.Fatalf("create boot event: %v", err)
+	}
+	ssh := models.SSHAccess{ServerID: server.ID, Host: "192.0.2.78", Port: 22, Username: "root", AuthType: "password", Status: "ok", LastCheckedAt: &now}
+	if err := db.Create(&ssh).Error; err != nil {
+		t.Fatalf("create ssh access: %v", err)
+	}
+	h := Handler{db: db, cfg: cfg, bmc: services.NewBMCService(db, cfg)}
+	results := h.runLabBMCChecks(context.Background(), 10, []uint{server.ID}, true)
+	if len(results) != 1 || results[0].Status != "skipped" || !strings.Contains(results[0].Message, "BMC is optional") {
+		t.Fatalf("expected missing BMC endpoint to be skipped for optional BMC target: %#v", results)
+	}
+	if gate := h.strictLabValidationGate(labValidationRunOptions{Strict: true, ServerIDs: []uint{server.ID}, PXEMACs: []string{bootEvent.MAC}}, true, true, true); len(gate) != 0 {
+		t.Fatalf("BMC_ADAPTER=simulated should not fail strict gate when requested target has no BMC endpoint: %#v", gate)
+	}
+	run := models.LabValidationRun{
+		Status: "error", Strict: true, CheckPXE: true, CheckBMC: false, CheckSSH: true, Limit: 20,
+		ServerIDs: labJSONValue([]uint{server.ID}), PXEMACs: labJSONValue([]string{bootEvent.MAC}),
+		PXEArch: 9, SSHProbeCommand: services.DefaultSSHCheckCommand, RequestedBy: "tester@example.com", RequestID: "test-no-bmc-full-chain", StartedAt: now, FinishedAt: &now,
+	}
+	if err := db.Create(&run).Error; err != nil {
+		t.Fatalf("create no-BMC strict run: %v", err)
+	}
+	runResults := []models.LabValidationRunResult{
+		{RunID: run.ID, Kind: "pxe_boot_event", ServerID: server.ID, AssetNo: bootEvent.MAC, Status: "success", Message: "PXE boot event for " + bootEvent.MAC + " recorded via http_ipxe", CheckedAt: &now},
+		{RunID: run.ID, Kind: "ssh", ServerID: server.ID, Status: "success", Message: "SSH probe passed: exit_code=0; host_key_policy=known_hosts; host_key_verified=true", Details: labRemoteCommandDetails(services.DefaultSSHCheckCommand, services.RemoteCommandResult{ExitCode: 0, Stdout: "ok no-bmc root Linux x86_64", HostKeyPolicy: "known_hosts", HostKeyVerified: true, HostKeyAlgorithm: "ssh-ed25519", HostKeySHA256: "SHA256:nobmcfingerprint", HostKeyHost: "[192.0.2.78]:22", HostKeyRemote: "192.0.2.78:22"}, nil), CheckedAt: &now},
+		{RunID: run.ID, Kind: "full_chain_target", ServerID: server.ID, Status: "failed", Message: "full-chain target is not ready: full-chain evidence is not fresh ok", CheckedAt: &now},
+	}
+	if err := db.Create(&runResults).Error; err != nil {
+		t.Fatalf("create no-BMC strict run results: %v", err)
+	}
+	detail, err := h.labValidationRunDetail(run.ID)
+	if err != nil {
+		t.Fatalf("load no-BMC strict run detail: %v", err)
+	}
+	bundle := h.buildLabValidationEvidenceBundle(detail)
+	if !labChecklistHas(bundle.OperatorChecklist, server.ID, "bmc_identity", "skipped") || !labEvidenceCandidateHas(bundle.EvidenceCandidates, "full", server.ID, bootEvent.ID) {
+		t.Fatalf("expected no-BMC bundle to skip BMC and expose full evidence candidate: checklist=%#v candidates=%#v", bundle.OperatorChecklist, bundle.EvidenceCandidates)
+	}
+	evidence := models.LabValidationEvidence{Kind: "full", Subject: "no-bmc-full-chain", Status: "ok", Summary: "PXE and SSH physical evidence", CreatedBy: "tester@example.com"}
+	if err := h.attachLabEvidenceReferences(&evidence, &run.ID, &server.ID, &bootEvent.ID); err != nil {
+		t.Fatalf("attach no-BMC full evidence: %v", err)
+	}
+	if evidence.BmcEndpointID != nil || evidence.SSHAccessID == nil || *evidence.SSHAccessID != ssh.ID {
+		t.Fatalf("expected no-BMC full evidence to bind SSH but not BMC: %#v", evidence)
+	}
+	if err := db.Create(&evidence).Error; err != nil {
+		t.Fatalf("create no-BMC full evidence: %v", err)
+	}
+	targets, readyCount := h.labValidationTargets()
+	if readyCount != 1 || len(targets) != 1 || !targets[0].FullChainReady || targets[0].BMCRequired || targets[0].BMCStatus != "missing" {
+		t.Fatalf("expected no-BMC target to become full-chain ready through PXE+SSH: ready=%d targets=%#v", readyCount, targets)
+	}
+	fullResults := h.strictFullChainTargetResults([]uint{server.ID})
+	if len(fullResults) != 1 || fullResults[0].Status != "success" || !strings.Contains(fullResults[0].Message, "BMC is not configured") {
+		t.Fatalf("expected no-BMC full-chain target result to pass with explicit message: %#v", fullResults)
 	}
 }
 

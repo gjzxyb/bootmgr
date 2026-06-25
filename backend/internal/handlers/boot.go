@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -30,11 +32,12 @@ func (h Handler) renderIPXE(c *gin.Context) {
 		c.String(http.StatusBadRequest, "missing mac")
 		return
 	}
-	script, _, err := h.boot.RenderIPXEScript(req)
+	script, event, err := h.boot.RenderIPXEScript(req)
 	if err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.reconcileBootEvent(event)
 	c.Header("Content-Type", "text/plain; charset=utf-8")
 	c.String(http.StatusOK, script)
 }
@@ -60,6 +63,20 @@ func (h Handler) linuxInstallerIPXE(c *gin.Context) {
 	c.String(http.StatusOK, h.boot.LinuxInstallerScript())
 }
 
+func (h Handler) serveBootAsset(c *gin.Context) {
+	assetPath, err := resolveBootAssetPath(h.cfg.BootTFTPRoot, c.Param("path"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	info, err := os.Stat(assetPath)
+	if err != nil || info.IsDir() {
+		c.JSON(http.StatusNotFound, gin.H{"error": "boot asset not found"})
+		return
+	}
+	http.ServeFile(c.Writer, c.Request, assetPath)
+}
+
 func (h Handler) recordBootEvent(c *gin.Context) {
 	var req struct {
 		MAC          string `json:"mac" binding:"required"`
@@ -74,6 +91,7 @@ func (h Handler) recordBootEvent(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	h.reconcileBootEvent(event)
 	c.JSON(http.StatusCreated, event)
 }
 
@@ -205,6 +223,44 @@ func (h Handler) metadataUserdataByToken(c *gin.Context) {
 	}
 	h.recordMetadataAccess(c, ctx.Server.ID, ctx.Token.DeploymentID, "userdata", "by-token")
 	h.renderUserdata(c, &ctx.Server, ctx.Deployment, ctx.Token.Token)
+}
+
+func (h Handler) metadataNoCloudUserDataByToken(c *gin.Context) {
+	if !h.ensureMetadataNetworkAccess(c, "user-data", "by-token") {
+		return
+	}
+	ctx := h.metadataFromToken(c)
+	if ctx == nil {
+		return
+	}
+	h.recordMetadataAccess(c, ctx.Server.ID, ctx.Token.DeploymentID, "user-data", "by-token")
+	h.renderUserdata(c, &ctx.Server, ctx.Deployment, ctx.Token.Token)
+}
+
+func (h Handler) metadataNoCloudMetaDataByToken(c *gin.Context) {
+	if !h.ensureMetadataNetworkAccess(c, "meta-data", "by-token") {
+		return
+	}
+	ctx := h.metadataFromToken(c)
+	if ctx == nil {
+		return
+	}
+	h.recordMetadataAccess(c, ctx.Server.ID, ctx.Token.DeploymentID, "meta-data", "by-token")
+	c.Header("Content-Type", "text/plain; charset=utf-8")
+	c.String(http.StatusOK, "instance-id: server-%d\nlocal-hostname: %s\n", ctx.Server.ID, ctx.Server.Hostname)
+}
+
+func (h Handler) metadataNoCloudVendorDataByToken(c *gin.Context) {
+	if !h.ensureMetadataNetworkAccess(c, "vendor-data", "by-token") {
+		return
+	}
+	ctx := h.metadataFromToken(c)
+	if ctx == nil {
+		return
+	}
+	h.recordMetadataAccess(c, ctx.Server.ID, ctx.Token.DeploymentID, "vendor-data", "by-token")
+	c.Header("Content-Type", "text/plain; charset=utf-8")
+	c.String(http.StatusOK, "")
 }
 
 func (h Handler) metadataSSHKeysByToken(c *gin.Context) {
@@ -358,6 +414,25 @@ func (h Handler) recordMetadataAccess(c *gin.Context, serverID uint, deploymentI
 		TraceID:    middleware.RequestIDValue(c),
 		OccurredAt: now,
 	}).Error
+	h.reconcileMetadataAccess(serverID, deploymentID)
+}
+
+func (h Handler) reconcileBootEvent(event models.BootEvent) {
+	if event.DeploymentID != nil {
+		_ = h.workflow.ReconcileDeployment(*event.DeploymentID)
+		return
+	}
+	if event.ServerID != nil {
+		h.workflow.ReconcileActiveDeploymentForServer(*event.ServerID)
+	}
+}
+
+func (h Handler) reconcileMetadataAccess(serverID uint, deploymentID *uint) {
+	if deploymentID != nil {
+		_ = h.workflow.ReconcileDeployment(*deploymentID)
+		return
+	}
+	h.workflow.ReconcileActiveDeploymentForServer(serverID)
 }
 
 func (h Handler) ensureMetadataNetworkAccess(c *gin.Context, endpoint string, mode string) bool {
@@ -590,6 +665,31 @@ func normalizeMetadataMAC(mac string) string {
 	return strings.ToLower(value)
 }
 
+func resolveBootAssetPath(tftpRoot string, rawPath string) (string, error) {
+	root := strings.TrimSpace(tftpRoot)
+	if root == "" {
+		return "", fmt.Errorf("BOOT_TFTP_ROOT must not be empty")
+	}
+	name := strings.TrimSpace(strings.ReplaceAll(rawPath, "\\", "/"))
+	name = strings.TrimLeft(name, "/")
+	if name == "" || name == "." || strings.Contains(name, "../") || strings.HasPrefix(name, "..") {
+		return "", fmt.Errorf("boot asset path must be relative to BOOT_TFTP_ROOT/assets")
+	}
+	assetRoot, err := filepath.Abs(filepath.Join(root, "assets"))
+	if err != nil {
+		return "", err
+	}
+	candidate, err := filepath.Abs(filepath.Join(assetRoot, filepath.FromSlash(name)))
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(assetRoot, candidate)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("boot asset path must stay inside BOOT_TFTP_ROOT/assets")
+	}
+	return filepath.Clean(candidate), nil
+}
+
 func (h Handler) latestActiveDeploymentID(serverID uint) *uint {
 	deployment := h.latestActiveDeployment(serverID)
 	if deployment == nil {
@@ -635,5 +735,6 @@ func (h Handler) metadataFromToken(c *gin.Context) *metadataContext {
 	now := time.Now().UTC()
 	h.db.Model(&token).Update("last_used_at", now)
 	token.LastUsedAt = &now
+	h.reconcileMetadataAccess(server.ID, token.DeploymentID)
 	return &metadataContext{Server: server, Deployment: deployment, Token: token}
 }

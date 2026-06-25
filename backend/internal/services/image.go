@@ -64,10 +64,6 @@ func (s ImageService) Preflight(serverID, imageID uint, templateID *uint, workfl
 	} else if !deployableServerStatus(server.Status) {
 		problems = append(problems, "server status is not deployable: "+server.Status)
 	}
-	var bmc models.BmcEndpoint
-	if err := s.db.Where("server_id = ?", serverID).First(&bmc).Error; err != nil {
-		problems = append(problems, "bmc endpoint not configured")
-	}
 	var networkCount int64
 	if err := s.db.Model(&models.NetworkConfig{}).Where("purpose = ? AND status = ?", "deployment", "enabled").Count(&networkCount).Error; err != nil || networkCount == 0 {
 		problems = append(problems, "deployment network not configured")

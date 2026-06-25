@@ -202,7 +202,7 @@ components:
       properties:
         subject: { type: string }
         step: { type: string, enum: [pxe_boot_event, bmc_identity, ssh_command, full_chain_evidence] }
-        status: { type: string, enum: [ok, warning, pending, error] }
+        status: { type: string, enum: [ok, warning, pending, error, skipped] }
         message: { type: string }
         next_action: { type: string }
         run_id: { type: integer }
@@ -214,7 +214,7 @@ components:
           items: { type: string }
     LabEvidenceCandidate:
       type: object
-      description: Server-computed evidence payload draft that can be submitted to POST /system/lab-validation/evidence after operator review. Candidates are emitted only when the referenced run has enough physical PXE/BMC/SSH proof for that evidence kind.
+      description: Server-computed evidence payload draft that can be submitted to POST /system/lab-validation/evidence after operator review. Candidates are emitted only when the referenced run has enough physical PXE/SSH proof for that evidence kind; BMC proof is required only for targets with BMC configured.
       properties:
         kind: { type: string, enum: [pxe, bmc, ssh, full] }
         status: { type: string, enum: [ok] }
@@ -283,7 +283,7 @@ components:
           items: { type: string }
         operator_checklist:
           type: array
-          description: Machine-readable operator checklist for physical PXE, BMC identity, SSH command proof, and full-chain evidence references in this bundle. BMC checklist items are ok only when this run has a successful result with adapter=redfish|ipmi structured identity details; SSH checklist items are ok only when this run has known_hosts host key proof plus command/exit_code/stdout details.
+          description: Machine-readable operator checklist for physical PXE, optional BMC identity, SSH command proof, and full-chain evidence references in this bundle. BMC checklist items are skipped when the target has no BMC endpoint, and ok only when this run has a successful result with adapter=redfish|ipmi structured identity details; SSH checklist items are ok only when this run has known_hosts host key proof plus command/exit_code/stdout details.
           items: { $ref: '#/components/schemas/LabOperatorChecklistItem' }
     LabValidationEvidence:
       type: object
@@ -313,6 +313,7 @@ components:
         pxe_status: { type: string, enum: [ok, stale, missing, api_only] }
         pxe_boot_event_id: { type: integer, nullable: true }
         pxe_boot_at: { type: string, format: date-time, nullable: true }
+        bmc_required: { type: boolean }
         bmc_status: { type: string }
         bmc_checked_at: { type: string, format: date-time, nullable: true }
         ssh_status: { type: string }
@@ -345,7 +346,7 @@ components:
         run_id:
           type: integer
           minimum: 1
-          description: Optional for warning/error evidence. Required for ok BMC, ok SSH, and ok full-chain evidence. BMC/SSH evidence must reference a recent finished strict run that checked that capability and contains the target adapter=redfish|ipmi structured BMC identity proof details or SSH known_hosts host key proof plus command/exit_code/stdout proof details. SSH proof requires host_key_policy=known_hosts, host_key_verified=true, and host_key_sha256 in the referenced run details. Full-chain evidence must reference a recent finished strict run that checked PXE, BMC, and SSH and contains successful target PXE results plus adapter=redfish|ipmi BMC identity proof details and SSH known_hosts host key proof plus command/exit_code/stdout proof details; the referenced run may have overall status error if only full_chain_target failed because full-chain evidence had not been recorded yet.
+          description: Optional for warning/error evidence. Required for ok BMC, ok SSH, and ok full-chain evidence. BMC/SSH evidence must reference a recent finished strict run that checked that capability and contains the target adapter=redfish|ipmi structured BMC identity proof details or SSH known_hosts host key proof plus command/exit_code/stdout proof details. SSH proof requires host_key_policy=known_hosts, host_key_verified=true, and host_key_sha256 in the referenced run details. Full-chain evidence must reference a recent finished strict run that checked PXE and SSH and contains successful target PXE results plus SSH known_hosts host key proof plus command/exit_code/stdout proof details; targets with BMC configured must also have adapter=redfish|ipmi BMC identity proof details in that run. The referenced run may have overall status error if only full_chain_target failed because full-chain evidence had not been recorded yet.
         server_id:
           type: integer
           minimum: 1
@@ -440,13 +441,13 @@ components:
         strict:
           type: boolean
           default: false
-          description: When true, requires real physical targets instead of synthetic-only checks. PXE checks require pxe_macs, BMC/SSH checks require server_ids, and BMC cannot use the simulated adapter.
+          description: When true, requires real physical targets instead of synthetic-only checks. PXE checks require pxe_macs and BMC/SSH checks require server_ids. BMC is optional per target; the simulated adapter is rejected only for requested targets that have BMC endpoints.
         limit: { type: integer, minimum: 1, maximum: 50, default: 20 }
         server_ids:
           type: array
           maxItems: 50
           uniqueItems: true
-          description: Optional target server IDs. When present, BMC and SSH checks are limited to these physical assets and missing BMC/SSH configuration is returned as a failed target result.
+          description: Optional target server IDs. When present, BMC and SSH checks are limited to these physical assets. Missing SSH configuration is failed; missing BMC configuration is skipped because BMC is optional per target.
           items: { type: integer, minimum: 1 }
         pxe_macs:
           type: array
@@ -769,6 +770,47 @@ components:
         status: { type: string }
         requested_by: { type: string }
         error_message: { type: string }
+    DeploymentPreflightCheck:
+      type: object
+      properties:
+        name: { type: string, enum: [target, active_deployment, network, bmc] }
+        status: { type: string, enum: [ok, warning, error] }
+        message: { type: string }
+    DeploymentPreflightTarget:
+      type: object
+      properties:
+        server_id: { type: integer }
+        status: { type: string, enum: [ok, blocked] }
+        power_control:
+          type: string
+          enum: [manual, bmc]
+          description: bmc when the target has a configured BMC endpoint; manual when the operator must power/PXE boot the machine without BMC.
+        checks:
+          type: array
+          items: { $ref: '#/components/schemas/DeploymentPreflightCheck' }
+        problems:
+          type: array
+          items: { type: string }
+        warnings:
+          type: array
+          items: { type: string }
+        operator_actions:
+          type: array
+          description: Operator actions required before/while creating the deployment; populated for manual power/PXE targets without BMC.
+          items: { type: string }
+    DeploymentPreflightResult:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, blocked] }
+        targets:
+          type: array
+          items: { $ref: '#/components/schemas/DeploymentPreflightTarget' }
+        problems:
+          type: array
+          items: { type: string }
+        warnings:
+          type: array
+          items: { type: string }
     DeploymentLogSummary:
       type: object
       properties:
@@ -1558,9 +1600,10 @@ paths:
       summary: Record physical lab validation evidence.
       description: >-
         Admin role and X-Confirm-Action system.lab-validation.evidence are required.
-        Stores a non-secret summary that a real PXE client, physical BMC, real SSH host,
+        Stores a non-secret summary that a real PXE client, optional physical BMC, real SSH host,
         or full-chain lab run was validated. subject identifies the MAC, BMC endpoint,
-        SSH host, or lab run batch. Optional run_id links the evidence to a finished
+        SSH host, or lab run batch. BMC is optional per target: targets without BMC endpoints
+        can complete full-chain validation with PXE and SSH proof. Optional run_id links the evidence to a finished
         validation run from the freshness window; ok BMC and ok SSH evidence require
         run_id from a recent finished strict run that checked the corresponding
         capability and contains adapter=redfish|ipmi structured BMC identity proof details or SSH
@@ -1568,8 +1611,9 @@ paths:
         proof requires host_key_policy=known_hosts, host_key_verified=true, and
         host_key_sha256 in the referenced run details.
         ok full-chain evidence requires run_id
-        from a recent finished strict run that checked PXE, BMC, and SSH and has
-        successful target PXE/BMC/SSH results with those proof details. The
+        from a recent finished strict run that checked PXE and SSH and has
+        successful target PXE/SSH results with those proof details; targets with BMC endpoints
+        must also have successful BMC identity proof details in that run. The
         referenced run may have overall status error when full_chain_target failed
         only because full-chain evidence had not been recorded yet. Ok evidence
         must include platform references:
@@ -1579,8 +1623,9 @@ paths:
         ok endpoint check whose type matches the current BMC_ADAPTER, SSH uses
         server_id with a current recent ok access check and production-safe host
         key verification, and full-chain evidence uses both server_id and a
-        same-server real-source boot_event_id with current recent ok BMC/SSH
-        checks. api_event boot events are accepted for troubleshooting history
+        same-server real-source boot_event_id with current recent ok SSH
+        checks; targets with BMC endpoints also require a current recent ok BMC check.
+        api_event boot events are accepted for troubleshooting history
         but cannot produce ok physical evidence. physical_evidence only treats
         referenced ok evidence from the last 7 days as current proof, and in
         production only counts SSH evidence whose host key policy is valid.
@@ -1606,7 +1651,26 @@ paths:
   /system/lab-validation/run:
     post:
       summary: Run safe physical lab connectivity checks.
-      description: Admin role and X-Confirm-Action system.lab-validation.run are required. Runs read-only PXE HTTP/DHCP/TFTP probes, BMC connectivity checks, BMC tooling checks, and SSH lightweight checks for configured endpoints up to the requested limit. Synthetic DHCP probes do not create BootEvent evidence, and the HTTP iPXE probe sends X-Lab-Validation-Probe so it is recorded as api_event instead of physical http_ipxe evidence; pass pxe_macs to verify physical PXE client boot events. Strict PXE validation accepts fresh http_ipxe or pxe_dhcp events from the last 7 days, and when server_ids are also supplied each PXE BootEvent must either carry one of those server_ids or match a requested server primary_mac. The target matrix prefers the latest physical PXE event over later api_event troubleshooting records. Set strict=true for a physical acceptance gate that requires pxe_macs, server_ids for BMC/SSH targets, a non-simulated BMC adapter, and in production SSH_HOST_KEY_POLICY=known_hosts with a readable SSH_KNOWN_HOSTS_PATH. It does not perform power operations or enable DHCP/TFTP listeners.
+      description: >-
+        Admin role and X-Confirm-Action system.lab-validation.run are required.
+        Runs read-only PXE HTTP/DHCP/TFTP probes, BMC connectivity checks for
+        configured BMC endpoints, BMC tooling checks, and SSH lightweight checks
+        for configured endpoints up to the requested limit. Synthetic DHCP probes
+        do not create BootEvent evidence, and the HTTP iPXE probe sends
+        X-Lab-Validation-Probe so it is recorded as api_event instead of physical
+        http_ipxe evidence; pass pxe_macs to verify physical PXE client boot
+        events. Strict PXE validation accepts fresh http_ipxe or pxe_dhcp events
+        from the last 7 days, and when server_ids are also supplied each PXE
+        BootEvent must either carry one of those server_ids or match a requested
+        server primary_mac. The target matrix prefers the latest physical PXE
+        event over later api_event troubleshooting records. Set strict=true for a
+        physical acceptance gate that requires pxe_macs and server_ids for
+        targets. BMC is optional per target: a non-simulated BMC adapter is
+        required only when requested targets have BMC endpoints; targets without
+        BMC endpoints can complete with PXE and SSH proof. Production SSH
+        validation still requires SSH_HOST_KEY_POLICY=known_hosts with a readable
+        SSH_KNOWN_HOSTS_PATH. It does not perform power operations or enable
+        DHCP/TFTP listeners.
       parameters:
         - name: X-Confirm-Action
           in: header
@@ -2119,7 +2183,7 @@ paths:
         Requires X-Confirm-Action: deployment.create and erase_confirmed=true.
         erase_policy accepts none, quick, full, or external_verified and defaults to quick.
         variables must be a JSON object when provided; template_id, workflow_id, and network_id must be greater than 0 when provided.
-        Preflight verifies deployable server state, BMC endpoint connectivity through the configured adapter, selected enabled deployment network when provided, at least one enabled deployment network, verified image, and enabled templates.
+        Preflight verifies deployable server state, selected enabled deployment network when provided, at least one enabled deployment network, verified image, and enabled templates. BMC is optional per target: when a BMC endpoint is configured, connectivity is checked through the configured adapter; when no BMC endpoint is configured, deployment can proceed through PXE/manual power operation and SSH/physical evidence flow.
       requestBody:
         required: true
         content:
@@ -2131,6 +2195,35 @@ paths:
         '404': { description: Server not found. }
         '409': { description: Server already has an active deployment or is not in a deployable state. }
         '428': { $ref: '#/components/responses/ConfirmationRequired' }
+  /deployments/preflight:
+    post:
+      summary: Dry-run deployment preflight.
+      description: >-
+        Runs deployment creation checks without requiring X-Confirm-Action and without creating deployment records.
+        The request may use server_id for a single target or server_ids for batch preview. The response reports
+        target checks, blocking problems, warnings, operator_actions, and whether each target will use BMC power
+        control or the manual power/PXE/SSH evidence path for machines without BMC.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/Deployment'
+                - type: object
+                  properties:
+                    server_ids:
+                      type: array
+                      minItems: 1
+                      maxItems: 20
+                      items: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: Deployment preflight result.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeploymentPreflightResult' }
+        '400': { description: Invalid preflight request. }
   /deployments/batch:
     post:
       summary: Create deployments for up to 20 servers.

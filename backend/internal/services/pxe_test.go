@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -24,7 +25,7 @@ func TestPXETFTPDataServesDynamicIPXEScriptAndRejectsTraversal(t *testing.T) {
 		t.Fatalf("dynamic boot.ipxe: %v", err)
 	}
 	text := string(data)
-	if !strings.Contains(text, "#!ipxe") || !strings.Contains(text, "set base-url http://boot.example.com") || !strings.Contains(text, "chain ${base-url}/boot/ipxe") || !strings.Contains(text, "${net0/mac}") {
+	if !strings.Contains(text, "#!ipxe") || !strings.Contains(text, "dhcp || shell") || !strings.Contains(text, "set base-url http://boot.example.com") || !strings.Contains(text, "chain ${base-url}/boot/ipxe") || !strings.Contains(text, "${net0/mac}") {
 		t.Fatalf("unexpected dynamic iPXE script: %s", text)
 	}
 
@@ -239,6 +240,96 @@ func TestParseDHCPPacketAndBootfileSelection(t *testing.T) {
 	}
 }
 
+func TestPXEBootfileReturnsHTTPBootScriptForIPXEClient(t *testing.T) {
+	packet, err := parseDHCPPacket(ipxeDHCPDiscover(t, []byte{0x52, 0x54, 0x00, 0xaa, 0xbb, 0xce}, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !packet.isIPXEClient() {
+		t.Fatalf("expected iPXE client detection")
+	}
+	service := PXEService{cfg: config.Config{
+		BootBaseURL:          "http://boot.example.com",
+		BootTFTPBootfileUEFI: "ipxe.efi",
+		BootTFTPBootfileBIOS: "undionly.kpxe",
+	}}
+	got := service.bootfile(packet)
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("parse iPXE boot URL %q: %v", got, err)
+	}
+	if parsed.Scheme != "http" || parsed.Host != "boot.example.com" || parsed.Path != "/boot/ipxe" {
+		t.Fatalf("expected HTTP /boot/ipxe URL, got %q", got)
+	}
+	if parsed.Query().Get("mac") != "52:54:00:aa:bb:ce" || parsed.Query().Get("arch") != "x86" || parsed.Query().Get("firmware") != "bios" {
+		t.Fatalf("unexpected iPXE boot URL query: %q", got)
+	}
+}
+
+func TestProxyDHCPAllowsIPXEClientWithoutPXEVendorClass(t *testing.T) {
+	db := newPXETestDB(t)
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("listen test DHCP: %v", err)
+	}
+	defer conn.Close()
+	service := NewPXEService(db, config.Config{
+		BootServiceMode:      "proxy",
+		BootDHCPServerIP:     "192.168.100.10",
+		BootBaseURL:          "http://boot.example.com",
+		BootTFTPBootfileUEFI: "ipxe.efi",
+		BootTFTPBootfileBIOS: "undionly.kpxe",
+	}, t.Logf)
+	go service.serveDHCP(conn)
+
+	response := sendDHCPAndReadResponse(t, conn.LocalAddr().String(), ipxeDHCPDiscover(t, []byte{0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcf}, 0))
+	if got := strings.TrimSpace(string(response.options[67])); !strings.HasPrefix(got, "http://boot.example.com/boot/ipxe?") {
+		t.Fatalf("expected iPXE client to receive HTTP boot script, got %q", got)
+	}
+}
+
+func TestProxyDHCPRespondsToPXEBootServerInform(t *testing.T) {
+	db := newPXETestDB(t)
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("listen test PXE boot server: %v", err)
+	}
+	defer conn.Close()
+	service := NewPXEService(db, config.Config{
+		BootServiceMode:      "proxy",
+		BootDHCPServerIP:     "192.168.100.10",
+		BootBaseURL:          "http://boot.example.com",
+		BootTFTPBootfileUEFI: "ipxe.efi",
+		BootTFTPBootfileBIOS: "undionly.kpxe",
+	}, t.Logf)
+	go service.serveDHCP(conn)
+
+	response := sendDHCPAndReadResponse(t, conn.LocalAddr().String(), pxeDHCPInform(t, []byte{0x52, 0x54, 0x00, 0xaa, 0xbb, 0xd0}, net.IPv4(192, 168, 100, 20), 0))
+	if got := response.options[53]; len(got) != 1 || got[0] != dhcpAck {
+		t.Fatalf("expected DHCPACK response to PXE boot server INFORM, got %#v", got)
+	}
+	if got := strings.TrimSpace(string(response.options[67])); got != "undionly.kpxe" {
+		t.Fatalf("expected BIOS bootfile in PXE boot server response, got %q", got)
+	}
+}
+
+func TestProxyDHCPBootServerListenAddr(t *testing.T) {
+	got, err := ProxyDHCPBootServerListenAddr("192.168.100.10:67")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "0.0.0.0:4011" {
+		t.Fatalf("expected proxy boot server to listen on all interfaces for broadcast discovery, got %q", got)
+	}
+	got, err = ProxyDHCPBootServerListenAddr("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "127.0.0.1:0" {
+		t.Fatalf("expected ephemeral test port to stay ephemeral, got %q", got)
+	}
+}
+
 func TestBuildDHCPResponseIncludesOption67AndBOOTPFile(t *testing.T) {
 	service := PXEService{cfg: config.Config{
 		BootDHCPServerIP:     "192.168.100.10",
@@ -380,6 +471,11 @@ func waitForBootEvents(t *testing.T, db *gorm.DB, mac string, expected int64) in
 
 func sendRawDHCPDiscover(t *testing.T, addr string, packet []byte) {
 	t.Helper()
+	_ = sendDHCPAndReadResponse(t, addr, packet)
+}
+
+func sendDHCPAndReadResponse(t *testing.T, addr string, packet []byte) dhcpPacket {
+	t.Helper()
 	serverAddr, err := net.ResolveUDPAddr("udp4", addr)
 	if err != nil {
 		t.Fatalf("resolve DHCP server addr: %v", err)
@@ -394,9 +490,15 @@ func sendRawDHCPDiscover(t *testing.T, addr string, packet []byte) {
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 1500)
-	if _, _, err := conn.ReadFromUDP(buf); err != nil {
+	n, _, err := conn.ReadFromUDP(buf)
+	if err != nil {
 		t.Fatalf("read DHCP response: %v", err)
 	}
+	response, err := parseDHCPResponse(buf[:n])
+	if err != nil {
+		t.Fatalf("parse DHCP response: %v", err)
+	}
+	return response
 }
 
 func minimalDHCPDiscover(t *testing.T, mac []byte, arch uint16) []byte {
@@ -420,6 +522,43 @@ func minimalDHCPDiscover(t *testing.T, mac []byte, arch uint16) []byte {
 	packet = append(packet, options.Bytes()...)
 	if _, err := net.ParseMAC(net.HardwareAddr(mac).String()); err != nil {
 		t.Fatalf("test mac invalid: %v", err)
+	}
+	return packet
+}
+
+func ipxeDHCPDiscover(t *testing.T, mac []byte, arch uint16) []byte {
+	t.Helper()
+	if len(mac) != 6 {
+		t.Fatalf("test mac must have 6 bytes")
+	}
+	packet := make([]byte, 240)
+	packet[0] = 1
+	packet[1] = 1
+	packet[2] = 6
+	packet[4], packet[5], packet[6], packet[7] = 0x12, 0x34, 0x56, 0x79
+	copy(packet[28:34], mac)
+	packet[236], packet[237], packet[238], packet[239] = 99, 130, 83, 99
+	options := bytes.Buffer{}
+	options.Write([]byte{53, 1, 1})
+	options.Write([]byte{60, byte(len("iPXE"))})
+	options.WriteString("iPXE")
+	options.Write([]byte{77, byte(len("iPXE"))})
+	options.WriteString("iPXE")
+	options.Write([]byte{93, 2, byte(arch >> 8), byte(arch)})
+	options.WriteByte(255)
+	packet = append(packet, options.Bytes()...)
+	if _, err := net.ParseMAC(net.HardwareAddr(mac).String()); err != nil {
+		t.Fatalf("test mac invalid: %v", err)
+	}
+	return packet
+}
+
+func pxeDHCPInform(t *testing.T, mac []byte, ciaddr net.IP, arch uint16) []byte {
+	t.Helper()
+	packet := minimalDHCPDiscover(t, mac, arch)
+	packet[242] = dhcpInform
+	if ip := ciaddr.To4(); ip != nil {
+		copy(packet[12:16], ip)
 	}
 	return packet
 }

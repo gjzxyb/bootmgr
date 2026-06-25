@@ -9,6 +9,7 @@ import (
 	"hash/fnv"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -23,6 +24,15 @@ import (
 )
 
 const labValidationDHCPProbeVendorClass = "PXEClient:LabValidationProbe"
+const proxyDHCPBootServerPort = "4011"
+
+const (
+	dhcpDiscover = byte(1)
+	dhcpOffer    = byte(2)
+	dhcpRequest  = byte(3)
+	dhcpAck      = byte(5)
+	dhcpInform   = byte(8)
+)
 
 type PXEService struct {
 	db     *gorm.DB
@@ -38,13 +48,20 @@ func NewPXEService(db *gorm.DB, cfg config.Config, logger func(string, ...any)) 
 	return PXEService{db: db, cfg: cfg, boot: NewBootService(db, cfg), logger: logger}
 }
 
+func (s PXEService) logf(format string, args ...any) {
+	if s.logger == nil {
+		return
+	}
+	s.logger(format, args...)
+}
+
 func (s PXEService) Start(ctx context.Context) error {
 	if !s.cfg.BootServicesEnabled {
-		s.logger("PXE/DHCP/TFTP services disabled")
+		s.logf("PXE/DHCP/TFTP services disabled")
 		return nil
 	}
 	for _, issue := range config.BootRuntimeIssues(s.cfg) {
-		s.logger("boot service %s [%s]: %s", issue.Level, issue.Key, issue.Message)
+		s.logf("boot service %s [%s]: %s", issue.Level, issue.Key, issue.Message)
 		if issue.Level == "error" {
 			return fmt.Errorf("boot service runtime check failed: %s", issue.Message)
 		}
@@ -52,6 +69,11 @@ func (s PXEService) Start(ctx context.Context) error {
 	if strings.ToLower(strings.TrimSpace(s.cfg.BootServiceMode)) != "external" {
 		if err := s.startDHCP(ctx); err != nil {
 			return err
+		}
+		if strings.ToLower(strings.TrimSpace(s.cfg.BootServiceMode)) == "proxy" {
+			if err := s.startProxyDHCPBootServer(ctx); err != nil {
+				return err
+			}
 		}
 	}
 	if err := s.startTFTP(ctx); err != nil {
@@ -61,19 +83,34 @@ func (s PXEService) Start(ctx context.Context) error {
 }
 
 func (s PXEService) startDHCP(ctx context.Context) error {
-	addr, err := net.ResolveUDPAddr("udp4", s.cfg.BootDHCPListenAddr)
+	return s.startDHCPListener(ctx, s.cfg.BootDHCPListenAddr, "DHCP/ProxyDHCP")
+}
+
+func (s PXEService) startProxyDHCPBootServer(ctx context.Context) error {
+	listenAddr, err := ProxyDHCPBootServerListenAddr(s.cfg.BootDHCPListenAddr)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(listenAddr) == strings.TrimSpace(s.cfg.BootDHCPListenAddr) {
+		return nil
+	}
+	return s.startDHCPListener(ctx, listenAddr, "PXE Boot Server")
+}
+
+func (s PXEService) startDHCPListener(ctx context.Context, listenAddr string, label string) error {
+	addr, err := net.ResolveUDPAddr("udp4", listenAddr)
 	if err != nil {
 		return err
 	}
 	conn, err := net.ListenUDP("udp4", addr)
 	if err != nil {
-		return fmt.Errorf("listen DHCP on %s: %w", s.cfg.BootDHCPListenAddr, err)
+		return fmt.Errorf("listen %s on %s: %w", label, listenAddr, err)
 	}
 	if err := enableUDPBroadcast(conn); err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("enable DHCP broadcast on %s: %w", s.cfg.BootDHCPListenAddr, err)
+		return fmt.Errorf("enable %s broadcast on %s: %w", label, listenAddr, err)
 	}
-	s.logger("DHCP/ProxyDHCP listener active on %s mode=%s interface=%s", s.cfg.BootDHCPListenAddr, s.cfg.BootServiceMode, s.cfg.BootBindInterface)
+	s.logf("%s listener active on %s mode=%s interface=%s", label, listenAddr, s.cfg.BootServiceMode, s.cfg.BootBindInterface)
 	go func() {
 		<-ctx.Done()
 		_ = conn.Close()
@@ -88,7 +125,7 @@ func (s PXEService) serveDHCP(conn *net.UDPConn) {
 		n, addr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) {
-				s.logger("DHCP read failed: %v", err)
+				s.logf("DHCP read failed: %v", err)
 			}
 			return
 		}
@@ -102,34 +139,33 @@ func (s PXEService) serveDHCP(conn *net.UDPConn) {
 
 func (s PXEService) handleDHCPPacket(conn *net.UDPConn, addr *net.UDPAddr, packet dhcpPacket) {
 	msgType := packet.options[53]
-	if len(msgType) == 0 || (msgType[0] != 1 && msgType[0] != 3) {
+	if len(msgType) == 0 || (msgType[0] != dhcpDiscover && msgType[0] != dhcpRequest && msgType[0] != dhcpInform) {
 		return
 	}
 	mode := strings.ToLower(strings.TrimSpace(s.cfg.BootServiceMode))
-	if mode == "proxy" && !packet.isPXEClient() {
+	if mode == "proxy" && !packet.isPXEClient() && !packet.isIPXEClient() {
 		return
 	}
-	responseType := byte(2)
-	if msgType[0] == 3 {
-		responseType = 5
+	responseType := dhcpOffer
+	if msgType[0] == dhcpRequest || msgType[0] == dhcpInform {
+		responseType = dhcpAck
 	}
 	leaseIP := net.IPv4(0, 0, 0, 0)
-	if mode == "builtin" {
+	if mode == "builtin" && msgType[0] != dhcpInform {
 		leaseIP = s.leaseIP(packet)
 		if leaseIP == nil {
-			s.logger("DHCP request from %s could not receive a lease", packet.macString())
+			s.logf("DHCP request from %s could not receive a lease", packet.macString())
 			return
 		}
 	}
+	bootfile := s.bootfile(packet)
 	resp := s.buildDHCPResponse(packet, leaseIP, responseType)
-	dest := &net.UDPAddr{IP: net.IPv4bcast, Port: 68}
-	if addr != nil && addr.Port != 68 {
-		dest = addr
-	}
+	dest := dhcpResponseDestination(conn, addr, packet)
 	if _, err := conn.WriteToUDP(resp, dest); err != nil {
-		s.logger("DHCP response to %s failed: %v", dest, err)
+		s.logf("DHCP response to %s failed: %v", dest, err)
 		return
 	}
+	s.logf("PXE DHCP %s->%s sent mac=%s arch=%d firmware=%s ipxe=%t bootfile=%q local=%s remote=%s dest=%s mode=%s", dhcpMessageTypeName(msgType[0]), dhcpMessageTypeName(responseType), packet.macString(), packet.optionUint16(93), packet.firmware(), packet.isIPXEClient(), bootfile, udpLocalAddrString(conn), udpAddrString(addr), dest.String(), mode)
 	if packet.isLabValidationProbe() {
 		return
 	}
@@ -208,6 +244,9 @@ func (s PXEService) leaseIP(packet dhcpPacket) net.IP {
 }
 
 func (s PXEService) bootfile(packet dhcpPacket) string {
+	if packet.isIPXEClient() {
+		return s.ipxeBootURL(packet)
+	}
 	arch := packet.optionUint16(93)
 	switch arch {
 	case 7, 9, 11:
@@ -215,6 +254,18 @@ func (s PXEService) bootfile(packet dhcpPacket) string {
 	default:
 		return strings.TrimSpace(s.cfg.BootTFTPBootfileBIOS)
 	}
+}
+
+func (s PXEService) ipxeBootURL(packet dhcpPacket) string {
+	baseURL := strings.TrimRight(strings.TrimSpace(s.cfg.BootBaseURL), "/")
+	if baseURL == "" {
+		return "boot.ipxe"
+	}
+	query := url.Values{}
+	query.Set("mac", packet.macString())
+	query.Set("arch", packet.architecture())
+	query.Set("firmware", packet.firmware())
+	return baseURL + "/boot/ipxe?" + query.Encode()
 }
 
 func (s PXEService) deploymentNetwork() (models.NetworkConfig, bool) {
@@ -234,7 +285,7 @@ func (s PXEService) startTFTP(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen TFTP on %s: %w", s.cfg.BootTFTPListenAddr, err)
 	}
-	s.logger("TFTP listener active on %s root=%s", s.cfg.BootTFTPListenAddr, s.cfg.BootTFTPRoot)
+	s.logf("TFTP listener active on %s root=%s", s.cfg.BootTFTPListenAddr, s.cfg.BootTFTPRoot)
 	go func() {
 		<-ctx.Done()
 		_ = conn.Close()
@@ -249,7 +300,7 @@ func (s PXEService) serveTFTP(conn *net.UDPConn) {
 		n, addr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) {
-				s.logger("TFTP read failed: %v", err)
+				s.logf("TFTP read failed: %v", err)
 			}
 			return
 		}
@@ -262,13 +313,17 @@ func (s PXEService) serveTFTP(conn *net.UDPConn) {
 }
 
 func (s PXEService) serveTFTPRequest(addr *net.UDPAddr, req tftpRRQ) {
+	started := time.Now()
+	s.logf("TFTP RRQ filename=%q mode=%s remote=%s options=%s", req.filename, req.mode, udpAddrString(addr), formatTFTPOptions(req.options))
 	data, err := s.tftpData(req.filename)
 	if err != nil {
+		s.logf("TFTP RRQ filename=%q remote=%s rejected: %v", req.filename, udpAddrString(addr), err)
 		s.tftpError(addr, 1, err.Error())
 		return
 	}
 	conn, err := net.ListenUDP("udp4", nil)
 	if err != nil {
+		s.logf("TFTP transfer filename=%q remote=%s could not open transfer socket: %v", req.filename, udpAddrString(addr), err)
 		return
 	}
 	defer conn.Close()
@@ -276,9 +331,11 @@ func (s PXEService) serveTFTPRequest(addr *net.UDPAddr, req tftpRRQ) {
 	ackTimeout := req.ackTimeout()
 	if req.hasOptions() {
 		if err := tftpSendOACK(conn, addr, req, len(data), blockSize); err != nil {
+			s.logf("TFTP OACK filename=%q remote=%s failed: %v", req.filename, udpAddrString(addr), err)
 			return
 		}
 		if err := tftpWaitACK(conn, addr, 0, ackTimeout); err != nil {
+			s.logf("TFTP OACK filename=%q remote=%s ACK failed: %v", req.filename, udpAddrString(addr), err)
 			return
 		}
 	}
@@ -290,12 +347,15 @@ func (s PXEService) serveTFTPRequest(addr *net.UDPAddr, req tftpRRQ) {
 		if readErr == io.ErrUnexpectedEOF || readErr == io.EOF {
 			chunk = chunk[:n]
 		} else if readErr != nil {
+			s.logf("TFTP read filename=%q remote=%s failed: %v", req.filename, udpAddrString(addr), readErr)
 			return
 		}
 		if err := tftpSendDataWithRetry(conn, addr, block, chunk, ackTimeout); err != nil {
+			s.logf("TFTP DATA filename=%q remote=%s block=%d failed: %v", req.filename, udpAddrString(addr), block, err)
 			return
 		}
 		if len(chunk) < blockSize {
+			s.logf("TFTP transfer complete filename=%q remote=%s bytes=%d blocks=%d duration_ms=%d", req.filename, udpAddrString(addr), len(data), block, time.Since(started).Milliseconds())
 			return
 		}
 		block++
@@ -316,7 +376,7 @@ func (s PXEService) tftpData(filename string) ([]byte, error) {
 	clean = strings.TrimPrefix(clean, "/")
 	switch clean {
 	case "boot.ipxe", "auto.ipxe", "default.ipxe":
-		script := fmt.Sprintf("#!ipxe\nset base-url %s\nchain ${base-url}/boot/ipxe?mac=${net0/mac}&arch=${buildarch}&firmware=${platform} || shell\n", strings.TrimRight(s.cfg.BootBaseURL, "/"))
+		script := fmt.Sprintf("#!ipxe\ndhcp || shell\nset base-url %s\nchain ${base-url}/boot/ipxe?mac=${net0/mac}&arch=${buildarch}&firmware=${platform} || shell\n", strings.TrimRight(s.cfg.BootBaseURL, "/"))
 		return []byte(script), nil
 	}
 	if clean == "." || clean == "" || strings.HasPrefix(clean, "../") || strings.Contains(clean, "/../") {
@@ -432,6 +492,20 @@ func (p dhcpPacket) isPXEClient() bool {
 
 func (p dhcpPacket) isLabValidationProbe() bool {
 	return strings.Contains(strings.ToLower(string(p.options[60])), "labvalidationprobe")
+}
+
+func (p dhcpPacket) isIPXEClient() bool {
+	userClass := strings.ToLower(string(p.options[77]))
+	vendorClass := strings.ToLower(string(p.options[60]))
+	if strings.Contains(userClass, "ipxe") || strings.Contains(vendorClass, "ipxe") {
+		return true
+	}
+	_, ok := p.options[175]
+	return ok
+}
+
+func (p dhcpPacket) broadcastRequested() bool {
+	return binary.BigEndian.Uint16(p.flags[:])&0x8000 != 0
 }
 
 func (p dhcpPacket) optionUint16(code byte) uint16 {
@@ -591,6 +665,51 @@ func appendTFTPOption(payload []byte, key, value string) []byte {
 	payload = append(payload, []byte(value)...)
 	payload = append(payload, 0)
 	return payload
+}
+
+func ProxyDHCPBootServerListenAddr(dhcpListenAddr string) (string, error) {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(dhcpListenAddr))
+	if err != nil {
+		return "", fmt.Errorf("derive PXE boot server listen address from %q: %w", dhcpListenAddr, err)
+	}
+	if port == "0" {
+		return net.JoinHostPort(host, "0"), nil
+	}
+	if port != "67" {
+		parsedPort, err := strconv.Atoi(port)
+		if err != nil {
+			return "", fmt.Errorf("derive PXE boot server listen address from %q: %w", dhcpListenAddr, err)
+		}
+		if parsedPort > 0 && parsedPort <= 64535 {
+			return net.JoinHostPort(host, strconv.Itoa(parsedPort+1000)), nil
+		}
+		if parsedPort > 1000 && parsedPort <= 65535 {
+			return net.JoinHostPort(host, strconv.Itoa(parsedPort-1000)), nil
+		}
+	}
+	return net.JoinHostPort("0.0.0.0", proxyDHCPBootServerPort), nil
+}
+
+func dhcpResponseDestination(conn *net.UDPConn, addr *net.UDPAddr, packet dhcpPacket) *net.UDPAddr {
+	if addr == nil {
+		return &net.UDPAddr{IP: net.IPv4bcast, Port: 68}
+	}
+	if addr.Port != 68 {
+		return addr
+	}
+	localPort := 0
+	if conn != nil {
+		if local, ok := conn.LocalAddr().(*net.UDPAddr); ok && local != nil {
+			localPort = local.Port
+		}
+	}
+	if localPort == 4011 && addr.IP != nil && !addr.IP.IsUnspecified() {
+		return addr
+	}
+	if !packet.broadcastRequested() && addr.IP != nil && !addr.IP.IsUnspecified() {
+		return addr
+	}
+	return &net.UDPAddr{IP: net.IPv4bcast, Port: 68}
 }
 
 func tftpSendDataWithRetry(conn *net.UDPConn, addr *net.UDPAddr, block uint16, data []byte, ackTimeout time.Duration) error {
@@ -937,6 +1056,62 @@ func sendTFTPACK(conn *net.UDPConn, addr *net.UDPAddr, block uint16) error {
 	ack := []byte{0, 4, byte(block >> 8), byte(block)}
 	_, err := conn.WriteToUDP(ack, addr)
 	return err
+}
+
+func dhcpMessageTypeName(messageType byte) string {
+	switch messageType {
+	case dhcpDiscover:
+		return "DISCOVER"
+	case dhcpOffer:
+		return "OFFER"
+	case dhcpRequest:
+		return "REQUEST"
+	case dhcpAck:
+		return "ACK"
+	case dhcpInform:
+		return "INFORM"
+	default:
+		return strconv.Itoa(int(messageType))
+	}
+}
+
+func udpLocalAddrString(conn *net.UDPConn) string {
+	if conn == nil {
+		return ""
+	}
+	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		return udpAddrString(addr)
+	}
+	return conn.LocalAddr().String()
+}
+
+func udpAddrString(addr *net.UDPAddr) string {
+	if addr == nil {
+		return ""
+	}
+	return addr.String()
+}
+
+func formatTFTPOptions(options map[string]string) string {
+	if len(options) == 0 {
+		return "{}"
+	}
+	keys := make([]string, 0, len(options))
+	for key := range options {
+		keys = append(keys, key)
+	}
+	for i := 0; i < len(keys); i++ {
+		for j := i + 1; j < len(keys); j++ {
+			if keys[j] < keys[i] {
+				keys[i], keys[j] = keys[j], keys[i]
+			}
+		}
+	}
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+"="+options[key])
+	}
+	return "{" + strings.Join(parts, ",") + "}"
 }
 
 func subnetMask(cidr string) net.IP {

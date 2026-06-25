@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -141,6 +142,21 @@ func pxeReadinessStatus(ctx context.Context, cfg config.Config, bootIssues []con
 		}
 		if probe.TFTPServerName != "" {
 			message += " tftp_server_name=" + probe.TFTPServerName
+		}
+		if mode == "proxy" {
+			proxyAddr, err := services.ProxyDHCPBootServerListenAddr(cfg.BootDHCPListenAddr)
+			if err != nil {
+				return "error", "PXE Boot Server listen address is invalid: " + err.Error()
+			}
+			proxyProbeAddr := proxyAddr
+			if host, port, splitErr := net.SplitHostPort(proxyAddr); splitErr == nil && (host == "0.0.0.0" || host == "::" || host == "") {
+				proxyProbeAddr = net.JoinHostPort(strings.TrimSpace(cfg.BootDHCPServerIP), port)
+			}
+			proxyProbe, err := services.ProbePXEDHCP(ctx, proxyProbeAddr, "52:54:00:00:00:fd", 9)
+			if err != nil {
+				return "error", "PXE Boot Server probe failed: " + err.Error()
+			}
+			message += " proxy_boot_server=" + proxyAddr + " proxy_probe=" + proxyProbeAddr + " proxy_bootfile=" + proxyProbe.Bootfile
 		}
 	}
 	if status == "warning" {

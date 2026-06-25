@@ -40,21 +40,22 @@ type labValidationEnvironment struct {
 }
 
 type labValidationPXE struct {
-	Enabled            bool           `json:"enabled"`
-	Mode               string         `json:"mode"`
-	BindInterface      string         `json:"bind_interface"`
-	DHCPListenAddr     string         `json:"dhcp_listen_addr"`
-	DHCPServerIP       string         `json:"dhcp_server_ip"`
-	DHCPLeaseStart     string         `json:"dhcp_lease_start"`
-	DHCPLeaseEnd       string         `json:"dhcp_lease_end"`
-	TFTPListenAddr     string         `json:"tftp_listen_addr"`
-	TFTPRoot           string         `json:"tftp_root"`
-	BootfileUEFI       string         `json:"bootfile_uefi"`
-	BootfileBIOS       string         `json:"bootfile_bios"`
-	DeploymentNetworks int64          `json:"deployment_networks"`
-	BootEvents         int64          `json:"boot_events"`
-	RecentBootEvents   []labBootEvent `json:"recent_boot_events"`
-	RuntimeIssues      []config.Issue `json:"runtime_issues"`
+	Enabled             bool           `json:"enabled"`
+	Mode                string         `json:"mode"`
+	BindInterface       string         `json:"bind_interface"`
+	DHCPListenAddr      string         `json:"dhcp_listen_addr"`
+	ProxyDHCPListenAddr string         `json:"proxy_dhcp_listen_addr,omitempty"`
+	DHCPServerIP        string         `json:"dhcp_server_ip"`
+	DHCPLeaseStart      string         `json:"dhcp_lease_start"`
+	DHCPLeaseEnd        string         `json:"dhcp_lease_end"`
+	TFTPListenAddr      string         `json:"tftp_listen_addr"`
+	TFTPRoot            string         `json:"tftp_root"`
+	BootfileUEFI        string         `json:"bootfile_uefi"`
+	BootfileBIOS        string         `json:"bootfile_bios"`
+	DeploymentNetworks  int64          `json:"deployment_networks"`
+	BootEvents          int64          `json:"boot_events"`
+	RecentBootEvents    []labBootEvent `json:"recent_boot_events"`
+	RuntimeIssues       []config.Issue `json:"runtime_issues"`
 }
 
 type labBootEvent struct {
@@ -287,6 +288,7 @@ type labValidationTarget struct {
 	PXEStatus             string     `json:"pxe_status"`
 	PXEBootEventID        *uint      `json:"pxe_boot_event_id,omitempty"`
 	PXEBootAt             *time.Time `json:"pxe_boot_at,omitempty"`
+	BMCRequired           bool       `json:"bmc_required"`
 	BMCStatus             string     `json:"bmc_status"`
 	BMCCheckedAt          *time.Time `json:"bmc_checked_at,omitempty"`
 	SSHStatus             string     `json:"ssh_status"`
@@ -392,8 +394,8 @@ func (h Handler) buildLabValidationEvidenceBundle(detail labValidationRunDetail)
 	if detail.Run.Status != "ok" {
 		notes = append(notes, "run status is not ok; inspect failed and skipped results before accepting physical validation")
 	}
-	if h.bmc.AdapterName() == "simulated" {
-		notes = append(notes, "BMC_ADAPTER=simulated cannot prove physical Redfish/IPMI validation")
+	if h.bmc.AdapterName() == "simulated" && len(bmcEndpoints) > 0 {
+		notes = append(notes, "BMC_ADAPTER=simulated cannot prove physical Redfish/IPMI validation for targets with BMC endpoints")
 	}
 	if len(bootEvents) == 0 && detail.Run.CheckPXE {
 		notes = append(notes, "no referenced PXE boot event is included in this bundle")
@@ -444,6 +446,12 @@ func (h Handler) labEvidenceCandidates(runID uint, checklist []labOperatorCheckl
 			}
 		}
 		return false
+	}
+	bmcStepSatisfied := func(serverID uint) bool {
+		if target, ok := targetByServer[serverID]; ok && !target.BMCRequired {
+			return true
+		}
+		return stepOK(serverID, "bmc_identity")
 	}
 	subjectForServer := func(serverID uint, fallback string) string {
 		if target, ok := targetByServer[serverID]; ok {
@@ -522,15 +530,21 @@ func (h Handler) labEvidenceCandidates(runID uint, checklist []labOperatorCheckl
 			if item.ServerID == 0 || item.BootEventID == nil || *item.BootEventID == 0 || item.EvidenceID != nil {
 				continue
 			}
-			if !stepOK(item.ServerID, "pxe_boot_event") || !stepOK(item.ServerID, "bmc_identity") || !stepOK(item.ServerID, "ssh_command") {
+			if !stepOK(item.ServerID, "pxe_boot_event") || !bmcStepSatisfied(item.ServerID) || !stepOK(item.ServerID, "ssh_command") {
 				continue
 			}
 			subject := subjectForServer(item.ServerID, item.Subject)
+			proofSummary := "physical PXE BootEvent and SSH command proof"
+			proofDetails := fmt.Sprintf("Strict lab validation run %d produced physical PXE BootEvent #%d and SSH command proof for server_id %d. BMC was not configured for this target and was treated as optional.", runID, *item.BootEventID, item.ServerID)
+			if target, ok := targetByServer[item.ServerID]; !ok || target.BMCRequired {
+				proofSummary = "physical PXE BootEvent, BMC identity proof, and SSH command proof"
+				proofDetails = fmt.Sprintf("Strict lab validation run %d produced physical PXE BootEvent #%d, BMC identity proof, and SSH command proof for server_id %d.", runID, *item.BootEventID, item.ServerID)
+			}
 			add(labEvidenceCandidate{
 				Kind: "full", Status: "ok", Subject: subject, RunID: runID, ServerID: item.ServerID, BootEventID: *item.BootEventID,
 				SourceStep: "full_chain_evidence",
-				Summary:    "Full-chain PXE/BMC/SSH physical validation evidence recorded by lab validation",
-				Details:    fmt.Sprintf("Strict lab validation run %d produced physical PXE BootEvent #%d, BMC identity proof, and SSH command proof for server_id %d.", runID, *item.BootEventID, item.ServerID),
+				Summary:    "Full-chain " + proofSummary + " recorded by lab validation",
+				Details:    proofDetails,
 			})
 		}
 	}
@@ -602,7 +616,11 @@ func (h Handler) labOperatorChecklist(detail labValidationRunDetail, targets []l
 		bmcStatus := "pending"
 		bmcMessage := "waiting for physical Redfish/IPMI identity probe"
 		bmcNextAction := "configure a matching BMC endpoint, run strict lab validation, and verify BMC result details contain non-secret identity fields"
-		if result, ok := bmcResults[target.ServerID]; ok && labBMCResultHasIdentityProof(result) {
+		if !target.BMCRequired {
+			bmcStatus = "skipped"
+			bmcMessage = "BMC is not configured for this target and is optional"
+			bmcNextAction = ""
+		} else if result, ok := bmcResults[target.ServerID]; ok && labBMCResultHasIdentityProof(result) {
 			bmcStatus = "ok"
 			bmcMessage = "this run includes successful physical BMC identity proof"
 			bmcNextAction = ""
@@ -651,7 +669,10 @@ func (h Handler) labOperatorChecklist(detail labValidationRunDetail, targets []l
 
 		fullStatus := "pending"
 		fullMessage := "waiting for full-chain physical evidence"
-		fullNextAction := "record ok full evidence with this run_id, server_id, and boot_event_id after PXE, BMC, and SSH target results are successful"
+		fullNextAction := "record ok full evidence with this run_id, server_id, and boot_event_id after PXE and SSH target results are successful"
+		if target.BMCRequired {
+			fullNextAction = "record ok full evidence with this run_id, server_id, and boot_event_id after PXE, BMC, and SSH target results are successful"
+		}
 		if target.FullChainReady {
 			fullStatus = "ok"
 			fullMessage = "full-chain physical validation is ready for this target"
@@ -831,6 +852,9 @@ func (h Handler) recordLabValidationEvidence(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if evidence.ServerID != nil {
+		h.workflow.ReconcileActiveDeploymentForServer(*evidence.ServerID)
+	}
 	h.audit.Record(actorID, actorEmail, "system.lab_validation.evidence", "lab_validation_evidence", evidence.ID, "medium", c.ClientIP(), c.Request.UserAgent(), c.GetString("request_id"))
 	c.JSON(http.StatusCreated, labEvidenceFromModel(evidence))
 }
@@ -898,9 +922,13 @@ func (h Handler) attachLabEvidenceReferences(evidence *models.LabValidationEvide
 		if !h.labBootEventBelongsToServer(event, *serverID) {
 			return errors.New("boot_event_id must reference the same server_id or match the server primary_mac for full-chain evidence")
 		}
-		endpoint, err := h.requireLabBMCOK(serverID)
-		if err != nil {
-			return err
+		var endpoint *models.BmcEndpoint
+		if h.labServerHasBMCEndpoint(*serverID) {
+			checkedEndpoint, err := h.requireLabBMCOK(serverID)
+			if err != nil {
+				return err
+			}
+			endpoint = &checkedEndpoint
 		}
 		access, err := h.requireLabSSHOK(serverID)
 		if err != nil {
@@ -911,7 +939,9 @@ func (h Handler) attachLabEvidenceReferences(evidence *models.LabValidationEvide
 		}
 		evidence.ServerID = serverID
 		evidence.BootEventID = &event.ID
-		evidence.BmcEndpointID = &endpoint.ID
+		if endpoint != nil {
+			evidence.BmcEndpointID = &endpoint.ID
+		}
 		evidence.SSHAccessID = &access.ID
 	}
 	return nil
@@ -969,8 +999,12 @@ func (h Handler) requireFullEvidenceRun(runID *uint, serverID uint, event models
 	if run.Status == "running" || run.FinishedAt == nil {
 		return errors.New("run_id must reference a finished lab validation run")
 	}
-	if !run.Strict || !run.CheckPXE || !run.CheckBMC || !run.CheckSSH {
-		return errors.New("ok full-chain evidence requires a strict lab validation run that checked PXE, BMC, and SSH")
+	if !run.Strict || !run.CheckPXE || !run.CheckSSH {
+		return errors.New("ok full-chain evidence requires a strict lab validation run that checked PXE and SSH")
+	}
+	bmcRequired := h.labServerHasBMCEndpoint(serverID)
+	if bmcRequired && !run.CheckBMC {
+		return errors.New("ok full-chain evidence for a target with BMC requires a strict lab validation run that checked BMC")
 	}
 	var serverIDs []uint
 	_ = json.Unmarshal(run.ServerIDs, &serverIDs)
@@ -985,13 +1019,22 @@ func (h Handler) requireFullEvidenceRun(runID *uint, serverID uint, event models
 	if !h.labRunHasSuccessfulResult(run.ID, "pxe_boot_event", serverID, event.MAC) {
 		return errors.New("ok full-chain evidence requires the referenced run to include a successful PXE boot event result for this target")
 	}
-	if !h.labRunHasBMCIdentityProof(run.ID, serverID) {
+	if bmcRequired && !h.labRunHasBMCIdentityProof(run.ID, serverID) {
 		return errors.New("ok full-chain evidence requires the referenced run to include a successful BMC result with structured identity proof details for this target")
 	}
 	if !h.labRunHasSSHCommandProof(run.ID, serverID) {
 		return errors.New("ok full-chain evidence requires the referenced run to include a successful SSH result with known_hosts host key proof plus structured command, exit_code, and stdout details for this target")
 	}
 	return nil
+}
+
+func (h Handler) labServerHasBMCEndpoint(serverID uint) bool {
+	if serverID == 0 {
+		return false
+	}
+	var count int64
+	h.db.Model(&models.BmcEndpoint{}).Where("server_id = ?", serverID).Count(&count)
+	return count > 0
 }
 
 func (h Handler) requireBMCEvidenceRun(runID *uint, serverID uint) error {
@@ -1219,7 +1262,7 @@ func (h Handler) runLabValidation(c *gin.Context) {
 	if runSSH {
 		results = append(results, h.runLabSSHChecks(c.Request.Context(), opts.Limit, opts.ServerIDs, opts.SSHProbeCommand)...)
 	}
-	if opts.Strict && runPXE && runBMC && runSSH && len(opts.ServerIDs) > 0 {
+	if opts.Strict && runPXE && runSSH && len(opts.ServerIDs) > 0 {
 		results = append(results, h.strictFullChainTargetResults(opts.ServerIDs)...)
 	}
 	if err := h.persistLabValidationRunResults(run.ID, results); err != nil {
@@ -1427,10 +1470,21 @@ func (h Handler) strictLabValidationGate(opts labValidationRunOptions, runPXE bo
 	if (runBMC || runSSH) && len(opts.ServerIDs) == 0 {
 		addFailure("strict physical validation requires server_ids for BMC/SSH targets")
 	}
-	if runBMC && h.bmc.AdapterName() == "simulated" {
-		addFailure("strict physical validation requires BMC_ADAPTER=redfish or ipmi")
+	if runBMC && h.bmc.AdapterName() == "simulated" && h.labAnyRequestedServerHasBMCEndpoint(opts.ServerIDs) {
+		addFailure("strict physical validation requires BMC_ADAPTER=redfish or ipmi when requested targets have BMC endpoints")
 	}
 	return results
+}
+
+func (h Handler) labAnyRequestedServerHasBMCEndpoint(serverIDs []uint) bool {
+	if len(serverIDs) == 0 {
+		var count int64
+		h.db.Model(&models.BmcEndpoint{}).Limit(1).Count(&count)
+		return count > 0
+	}
+	var count int64
+	h.db.Model(&models.BmcEndpoint{}).Where("server_id IN ?", serverIDs).Limit(1).Count(&count)
+	return count > 0
 }
 
 func (h Handler) fillLabEvidence(report *labValidationReport) {
@@ -1458,7 +1512,7 @@ func (h Handler) fillLabEvidence(report *labValidationReport) {
 		return
 	}
 	missing := []string{}
-	for _, kind := range []string{"pxe", "bmc", "ssh"} {
+	for _, kind := range []string{"pxe", "ssh"} {
 		if !okKinds[kind] && !okKinds["full"] {
 			missing = append(missing, kind)
 		}
@@ -1467,7 +1521,11 @@ func (h Handler) fillLabEvidence(report *labValidationReport) {
 		report.addCheck("physical_evidence", "warning", fmt.Sprintf("missing fresh ok physical evidence within %s for %s", formatEvidenceWindow(labEvidenceFreshnessWindow), strings.Join(missing, ", ")))
 		return
 	}
-	report.addCheck("physical_evidence", "ok", fmt.Sprintf("PXE, BMC, and SSH physical evidence has been recorded within %s", formatEvidenceWindow(labEvidenceFreshnessWindow)))
+	message := fmt.Sprintf("PXE and SSH physical evidence has been recorded within %s", formatEvidenceWindow(labEvidenceFreshnessWindow))
+	if okKinds["bmc"] || okKinds["full"] {
+		message = fmt.Sprintf("PXE, optional BMC where configured, and SSH physical evidence has been recorded within %s", formatEvidenceWindow(labEvidenceFreshnessWindow))
+	}
+	report.addCheck("physical_evidence", "ok", message)
 }
 
 func (h Handler) fillLabTargets(report *labValidationReport) {
@@ -1594,6 +1652,7 @@ func (h Handler) labValidationTargets() ([]labValidationTarget, int) {
 			}
 		}
 		if endpoint, ok := endpointByServer[server.ID]; ok {
+			target.BMCRequired = true
 			target.BMCStatus = endpoint.Status
 			target.BMCCheckedAt = endpoint.LastCheckedAt
 			if target.BMCStatus == "ok" && h.labBMCEndpointPolicyIssue(endpoint) != "" {
@@ -1635,15 +1694,15 @@ func (h Handler) labValidationTargets() ([]labValidationTarget, int) {
 		} else if target.PXEStatus != "ok" {
 			target.BlockingReasons = append(target.BlockingReasons, "PXE boot event is not fresh")
 		}
-		if h.bmc.AdapterName() == "simulated" {
-			target.BlockingReasons = append(target.BlockingReasons, "BMC adapter is simulated")
-		} else if target.BMCStatus == "adapter_mismatch" {
+		if target.BMCRequired && h.bmc.AdapterName() == "simulated" {
+			target.BlockingReasons = append(target.BlockingReasons, "BMC adapter is simulated for configured BMC endpoint")
+		} else if target.BMCRequired && target.BMCStatus == "adapter_mismatch" {
 			if endpoint, ok := endpointByServer[server.ID]; ok {
 				target.BlockingReasons = append(target.BlockingReasons, h.labBMCEndpointPolicyIssue(endpoint))
 			} else {
 				target.BlockingReasons = append(target.BlockingReasons, "BMC endpoint does not match current adapter")
 			}
-		} else if target.BMCStatus != "ok" {
+		} else if target.BMCRequired && target.BMCStatus != "ok" {
 			target.BlockingReasons = append(target.BlockingReasons, "BMC check is not fresh ok")
 		}
 		if target.SSHStatus == "policy_mismatch" {
@@ -1694,7 +1753,11 @@ func (h Handler) strictFullChainTargetResults(serverIDs []uint) []labValidationR
 		result.AssetNo = target.AssetNo
 		if target.FullChainReady {
 			result.Status = "success"
-			result.Message = fmt.Sprintf("full-chain target is ready: PXE BootEvent #%d, BMC ok, SSH ok, and fresh full-chain evidence are present", valueOrZero(target.PXEBootEventID))
+			if target.BMCRequired {
+				result.Message = fmt.Sprintf("full-chain target is ready: PXE BootEvent #%d, BMC ok, SSH ok, and fresh full-chain evidence are present", valueOrZero(target.PXEBootEventID))
+			} else {
+				result.Message = fmt.Sprintf("full-chain target is ready: PXE BootEvent #%d, SSH ok, and fresh full-chain evidence are present; BMC is not configured for this target", valueOrZero(target.PXEBootEventID))
+			}
 		} else {
 			result.Message = "full-chain target is not ready: " + strings.Join(target.BlockingReasons, "; ")
 		}
@@ -2023,7 +2086,7 @@ func (h Handler) labEvidenceCountsAsFreshOK(row models.LabValidationEvidence, fr
 	case "ssh":
 		return h.labEvidenceSSHReferenceOK(row, freshCutoff) && h.labEvidenceSSHRunOK(row)
 	case "full":
-		return h.labEvidenceBootEventHasPhysicalSource(row) && h.labEvidenceBMCReferenceOK(row, freshCutoff) && h.labEvidenceSSHReferenceOK(row, freshCutoff) && h.labEvidenceFullRunOK(row)
+		return h.labEvidenceBootEventHasPhysicalSource(row) && h.labEvidenceFullBMCReferenceOK(row, freshCutoff) && h.labEvidenceSSHReferenceOK(row, freshCutoff) && h.labEvidenceFullRunOK(row)
 	default:
 		return false
 	}
@@ -2077,6 +2140,16 @@ func (h Handler) labEvidenceBMCReferenceOK(row models.LabValidationEvidence, fre
 		return false
 	}
 	return h.labBMCEndpointMatchesAdapter(endpoint)
+}
+
+func (h Handler) labEvidenceFullBMCReferenceOK(row models.LabValidationEvidence, freshCutoff time.Time) bool {
+	if row.ServerID == nil || *row.ServerID == 0 {
+		return false
+	}
+	if !h.labServerHasBMCEndpoint(*row.ServerID) {
+		return true
+	}
+	return h.labEvidenceBMCReferenceOK(row, freshCutoff)
 }
 
 func (h Handler) labEvidenceSSHReferenceOK(row models.LabValidationEvidence, freshCutoff time.Time) bool {
@@ -2135,6 +2208,11 @@ func (h Handler) fillPXELabValidation(report *labValidationReport) {
 		BootfileUEFI:   h.cfg.BootTFTPBootfileUEFI,
 		BootfileBIOS:   h.cfg.BootTFTPBootfileBIOS,
 		RuntimeIssues:  config.BootRuntimeIssues(h.cfg),
+	}
+	if strings.ToLower(strings.TrimSpace(h.cfg.BootServiceMode)) == "proxy" {
+		if proxyAddr, err := services.ProxyDHCPBootServerListenAddr(h.cfg.BootDHCPListenAddr); err == nil {
+			pxe.ProxyDHCPListenAddr = proxyAddr
+		}
 	}
 	h.db.Model(&models.NetworkConfig{}).Where("purpose = ? AND status = ?", "deployment", "enabled").Count(&pxe.DeploymentNetworks)
 	h.db.Model(&models.BootEvent{}).Count(&pxe.BootEvents)
@@ -2612,7 +2690,7 @@ func (h Handler) runLabBMCChecks(parent context.Context, limit int, serverIDs []
 			continue
 		}
 		ref := h.labServerRef(serverID)
-		results = append(results, labValidationRunResult{Kind: "bmc", ServerID: serverID, Hostname: ref.Hostname, AssetNo: ref.AssetNo, Status: "failed", Message: "BMC endpoint is not configured for requested server"})
+		results = append(results, labValidationRunResult{Kind: "bmc", ServerID: serverID, Hostname: ref.Hostname, AssetNo: ref.AssetNo, Status: "skipped", Message: "BMC endpoint is not configured for requested server; BMC is optional for this target"})
 	}
 	return results
 }

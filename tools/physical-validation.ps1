@@ -291,6 +291,23 @@ function Test-ChecklistOK {
     return [string](Get-ObjectProperty $item "status") -eq "ok"
 }
 
+function Test-ChecklistSatisfiedForFull {
+    param(
+        [object]$Bundle,
+        [uint32]$CandidateServerId,
+        [Parameter(Mandatory = $true)][string]$Step
+    )
+    $item = Get-ChecklistItem -Bundle $Bundle -CandidateServerId $CandidateServerId -Step $Step
+    if ($null -eq $item) {
+        return $false
+    }
+    $status = [string](Get-ObjectProperty $item "status")
+    if ($Step -eq "bmc_identity" -and $status -eq "skipped") {
+        return $true
+    }
+    return $status -eq "ok"
+}
+
 function Get-BundleBootEvent {
     param(
         [object]$Bundle,
@@ -479,9 +496,9 @@ function Get-FullEvidenceCandidates {
         if (-not (Test-PXEMacRequested (Get-ObjectProperty $target "primary_mac"))) {
             continue
         }
-        $pxeOK = Test-ChecklistOK -Bundle $Bundle -CandidateServerId $candidateServerID -Step "pxe_boot_event"
-        $bmcOK = Test-ChecklistOK -Bundle $Bundle -CandidateServerId $candidateServerID -Step "bmc_identity"
-        $sshOK = Test-ChecklistOK -Bundle $Bundle -CandidateServerId $candidateServerID -Step "ssh_command"
+        $pxeOK = Test-ChecklistSatisfiedForFull -Bundle $Bundle -CandidateServerId $candidateServerID -Step "pxe_boot_event"
+        $bmcOK = Test-ChecklistSatisfiedForFull -Bundle $Bundle -CandidateServerId $candidateServerID -Step "bmc_identity"
+        $sshOK = Test-ChecklistSatisfiedForFull -Bundle $Bundle -CandidateServerId $candidateServerID -Step "ssh_command"
         if (-not ($pxeOK -and $bmcOK -and $sshOK)) {
             continue
         }
@@ -582,7 +599,7 @@ function New-FullEvidencePayload {
     }
     $details = $EvidenceDetails
     if ([string]::IsNullOrWhiteSpace($details)) {
-        $details = "Strict PXE/BMC/SSH run $RunID produced physical PXE BootEvent #$BootEventID, BMC identity proof, and SSH command proof for server_id $CandidateServerID."
+        $details = "Strict physical validation run $RunID produced physical PXE BootEvent #$BootEventID and SSH command proof for server_id $CandidateServerID. If this target has BMC configured, the backend also requires BMC identity proof before accepting full evidence."
     }
     return @{
         kind          = "full"
@@ -686,7 +703,7 @@ if ($RecordEvidence) {
         $itemCandidates = @(Get-ItemEvidenceCandidates -Bundle $bundle -RunID ([uint32]$run.run_id))
     }
     if ($itemCandidates.Count -eq 0) {
-        Write-Host "No PXE/BMC/SSH item evidence is ready for automatic recording. Inspect $timestamp-evidence-bundle.json for checklist details."
+        Write-Host "No PXE/BMC/SSH item evidence is ready for automatic recording. BMC is optional per target; inspect $timestamp-evidence-bundle.json for checklist details."
     } else {
         $evidenceHeaders = @{
             Authorization      = "Bearer $($login.token)"

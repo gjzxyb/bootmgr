@@ -8,6 +8,12 @@ const readinessColor = (status: string) => status === 'ok' ? 'green' : status ==
 const labRunColor = (status: string) => status === 'running' ? 'blue' : readinessColor(status);
 const runResultColor = (status: string) => status === 'success' ? 'green' : status === 'skipped' ? 'default' : 'red';
 const labTargetStatusColor = (status: string) => status === 'ok' ? 'green' : status === 'missing' ? 'default' : status === 'stale' || status === 'partial' || status === 'configured' || status === 'unknown' ? 'orange' : 'red';
+const bmcTargetCell = (row: LabValidationTarget) => (
+  <Space>
+    <Tag color={row.bmc_required ? labTargetStatusColor(row.bmc_status) : 'blue'}>{row.bmc_status}</Tag>
+    <Tag color={row.bmc_required ? 'orange' : 'default'}>{row.bmc_required ? 'required' : 'optional'}</Tag>
+  </Space>
+);
 const serverLabel = (row: { hostname?: string; asset_no?: string; server_id: number }) => row.hostname || row.asset_no || `server-${row.server_id}`;
 const labRunTargets = (row: LabValidationRunSummary) => {
   const parts = [];
@@ -230,7 +236,7 @@ export function SystemPage() {
       run_id: target?.latest_run_strict ? target.latest_run_id : undefined,
       server_id: target?.server_id,
       boot_event_id: target?.pxe_boot_event_id,
-      summary: target ? `${serverLabel(target)} 真实 PXE/BMC/SSH 验收证据` : undefined
+      summary: target ? `${serverLabel(target)} 真实 ${target.bmc_required ? 'PXE/BMC/SSH' : 'PXE/SSH'} 验收证据` : undefined
     });
     setEvidenceOpen(true);
   };
@@ -245,9 +251,9 @@ export function SystemPage() {
     return labEvidenceBundle.targets.find(target => target.server_id === row.server_id);
   };
 
-  const checklistStepOK = (serverID: number | undefined, step: string) => {
+  const checklistStepSatisfiedForFull = (serverID: number | undefined, step: string) => {
     if (!serverID || !labEvidenceBundle) return false;
-    return labEvidenceBundle.operator_checklist.some(item => item.server_id === serverID && item.step === step && item.status === 'ok');
+    return labEvidenceBundle.operator_checklist.some(item => item.server_id === serverID && item.step === step && (item.status === 'ok' || (step === 'bmc_identity' && item.status === 'skipped')));
   };
 
   const canRecordChecklistEvidence = (row: LabOperatorChecklistItem) => {
@@ -255,10 +261,10 @@ export function SystemPage() {
     if (row.step === 'pxe_boot_event') return row.status === 'ok' && !!row.boot_event_id && !!checklistBootEvent(row)?.mac;
     if (row.step === 'bmc_identity' || row.step === 'ssh_command') return row.status === 'ok' && !!row.server_id;
     if (row.step === 'full_chain_evidence') {
-      return !!row.server_id && !!row.boot_event_id && !row.evidence_id &&
-        checklistStepOK(row.server_id, 'pxe_boot_event') &&
-        checklistStepOK(row.server_id, 'bmc_identity') &&
-        checklistStepOK(row.server_id, 'ssh_command');
+        return !!row.server_id && !!row.boot_event_id && !row.evidence_id &&
+        checklistStepSatisfiedForFull(row.server_id, 'pxe_boot_event') &&
+        checklistStepSatisfiedForFull(row.server_id, 'bmc_identity') &&
+        checklistStepSatisfiedForFull(row.server_id, 'ssh_command');
     }
     return false;
   };
@@ -291,8 +297,13 @@ export function SystemPage() {
     } else {
       values.kind = 'full';
       values.subject = targetName;
-      values.summary = `全链路 PXE/BMC/SSH 验收证据 - ${targetName}`;
-      values.details = `验收批次 #${row.run_id} 已包含 server_id ${row.server_id} 的真实 PXE BootEvent #${row.boot_event_id}、物理 BMC 身份 proof 和真实 SSH 命令 proof。`;
+      if (target?.bmc_required) {
+        values.summary = `全链路 PXE/BMC/SSH 验收证据 - ${targetName}`;
+        values.details = `验收批次 #${row.run_id} 已包含 server_id ${row.server_id} 的真实 PXE BootEvent #${row.boot_event_id}、物理 BMC 身份 proof 和真实 SSH 命令 proof。`;
+      } else {
+        values.summary = `全链路 PXE/SSH 验收证据 - ${targetName}`;
+        values.details = `验收批次 #${row.run_id} 已包含 server_id ${row.server_id} 的真实 PXE BootEvent #${row.boot_event_id} 和真实 SSH 命令 proof；该目标未配置 BMC，BMC 按可选能力跳过。`;
+      }
     }
     evidenceForm.resetFields();
     evidenceForm.setFieldsValue(values);
@@ -629,7 +640,7 @@ export function SystemPage() {
           { title: '资产', render: (_, row) => serverLabel(row) },
           { title: 'MAC', dataIndex: 'primary_mac', render: value => value || '-' },
           { title: 'PXE', dataIndex: 'pxe_status', render: (_, row) => <Space><Tag color={labTargetStatusColor(row.pxe_status)}>{row.pxe_status}</Tag>{row.pxe_boot_event_id ? <Typography.Text type="secondary">#{row.pxe_boot_event_id}</Typography.Text> : null}</Space> },
-          { title: 'BMC', dataIndex: 'bmc_status', render: value => <Tag color={labTargetStatusColor(value)}>{value}</Tag> },
+          { title: 'BMC', render: (_, row) => bmcTargetCell(row) },
           { title: 'SSH', dataIndex: 'ssh_status', render: value => <Tag color={labTargetStatusColor(value)}>{value}</Tag> },
           { title: '证据', dataIndex: 'evidence_status', render: (_, row) => <Space><Tag color={labTargetStatusColor(row.evidence_status)}>{row.evidence_status}</Tag>{row.evidence_id ? <Typography.Text type="secondary">#{row.evidence_id}</Typography.Text> : null}</Space> },
           { title: '最近批次', render: (_, row) => row.latest_run_id ? <Space><Typography.Text>#{row.latest_run_id}</Typography.Text>{row.latest_run_strict ? <Tag color="red">strict</Tag> : null}{row.latest_run_status ? <Tag color={labRunColor(row.latest_run_status)}>{row.latest_run_status}</Tag> : null}{row.latest_run_kind ? <Typography.Text type="secondary">{row.latest_run_kind}</Typography.Text> : null}{row.latest_run_result_status ? <Tag color={runResultColor(row.latest_run_result_status)}>{row.latest_run_result_status}</Tag> : null}</Space> : '-' },
@@ -905,7 +916,7 @@ export function SystemPage() {
       <Table<LabOperatorChecklistItem> rowKey={record => `${record.subject}-${record.step}-${record.server_id || 0}-${record.boot_event_id || 0}`} dataSource={labEvidenceBundle?.operator_checklist || []} loading={labEvidenceBundleLoading} pagination={false} size="small" locale={{ emptyText: '暂无现场检查清单' }} columns={[
         { title: '对象', dataIndex: 'subject' },
         { title: '步骤', dataIndex: 'step' },
-        { title: '状态', dataIndex: 'status', render: value => <Tag color={value === 'pending' ? 'orange' : readinessColor(value)}>{value}</Tag> },
+        { title: '状态', dataIndex: 'status', render: value => <Tag color={value === 'pending' ? 'orange' : value === 'skipped' ? 'default' : readinessColor(value)}>{value}</Tag> },
         { title: '引用', render: (_, row) => <Space wrap>{row.run_id ? <Typography.Text>run #{row.run_id}</Typography.Text> : null}{row.server_id ? <Typography.Text>server #{row.server_id}</Typography.Text> : null}{row.boot_event_id ? <Typography.Text>BootEvent #{row.boot_event_id}</Typography.Text> : null}{row.evidence_id ? <Typography.Text>evidence #{row.evidence_id}</Typography.Text> : null}</Space> },
         { title: '结果', dataIndex: 'message' },
         { title: '下一步', dataIndex: 'next_action', render: value => value || '-' },
@@ -935,7 +946,7 @@ export function SystemPage() {
         { title: '资产', render: (_, row) => serverLabel(row) },
         { title: 'MAC', dataIndex: 'primary_mac', render: value => value || '-' },
         { title: 'PXE', dataIndex: 'pxe_status', render: value => <Tag color={labTargetStatusColor(value)}>{value}</Tag> },
-        { title: 'BMC', dataIndex: 'bmc_status', render: value => <Tag color={labTargetStatusColor(value)}>{value}</Tag> },
+        { title: 'BMC', render: (_, row) => bmcTargetCell(row) },
         { title: 'SSH', dataIndex: 'ssh_status', render: value => <Tag color={labTargetStatusColor(value)}>{value}</Tag> },
         { title: '证据', dataIndex: 'evidence_status', render: value => <Tag color={labTargetStatusColor(value)}>{value}</Tag> },
         { title: '最近批次', render: (_, row) => row.latest_run_id ? <Space><Typography.Text>#{row.latest_run_id}</Typography.Text>{row.latest_run_strict ? <Tag color="red">strict</Tag> : null}{row.latest_run_status ? <Tag color={labRunColor(row.latest_run_status)}>{row.latest_run_status}</Tag> : null}{row.latest_run_result_status ? <Tag color={runResultColor(row.latest_run_result_status)}>{row.latest_run_result_status}</Tag> : null}</Space> : '-' },
