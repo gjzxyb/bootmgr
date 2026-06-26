@@ -10,7 +10,7 @@ export function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
   const submit = async (values: { email: string; password: string }) => {
     setSubmitting(true);
     try {
-      const { data } = await api.post('/auth/login', values);
+      const { data } = await api.post('/auth/login', values, { suppressGlobalError: true });
       localStorage.setItem('token', data.token);
       setToken(data.token);
       onLogin(data.user);

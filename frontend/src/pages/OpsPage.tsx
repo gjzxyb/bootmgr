@@ -1,7 +1,7 @@
 import { CodeOutlined, DownloadOutlined, FileSearchOutlined, LaptopOutlined, ReloadOutlined, UploadOutlined } from '@ant-design/icons';
 import { Alert, Button, Form, Input, InputNumber, Modal, Select, Space, Table, Tabs, Tag, Typography, message } from 'antd';
 import { useEffect, useRef, useState } from 'react';
-import { api, BackupRestoreResult, BackupValidationCheck, BackupValidationReport, PageResult, ScriptExecution, ScriptJob, Server, TerminalSession } from '../api/client';
+import { api, apiErrorMessage, BackupRestoreResult, BackupValidationCheck, BackupValidationReport, PageResult, ScriptExecution, ScriptJob, Server, TerminalSession } from '../api/client';
 import { canManage, isAdmin } from '../authz';
 
 const color = (status: string) => status === 'success' || status === 'closed' ? 'green' : status === 'running' || status === 'active' ? 'blue' : status === 'failed' ? 'red' : 'default';
@@ -34,6 +34,10 @@ export function OpsPage({ role }: { role?: string }) {
   const [logSummary, setLogSummary] = useState<LogCollectionResponse | null>(null);
   const [backupReport, setBackupReport] = useState<BackupValidationReport | null>(null);
   const [backupPayloadText, setBackupPayloadText] = useState('');
+  const [scriptCreating, setScriptCreating] = useState(false);
+  const [logCollecting, setLogCollecting] = useState(false);
+  const [terminalCreating, setTerminalCreating] = useState(false);
+  const [terminalCommandRunning, setTerminalCommandRunning] = useState(false);
   const [backupValidating, setBackupValidating] = useState(false);
   const [backupRestoring, setBackupRestoring] = useState(false);
   const [scriptForm] = Form.useForm();
@@ -78,12 +82,20 @@ export function OpsPage({ role }: { role?: string }) {
   };
 
   const createScript = async () => {
+    if (scriptCreating) return;
     const values = await scriptForm.validateFields();
-    await api.post('/ops/script-jobs', values, { headers: { 'X-Confirm-Action': 'ops.script.create' } });
-    msg.success('批量脚本任务已创建');
-    setScriptOpen(false);
-    scriptForm.resetFields();
-    setTimeout(() => loadJobs(1, jobPageSize), 700);
+    setScriptCreating(true);
+    try {
+      await api.post('/ops/script-jobs', values, { headers: { 'X-Confirm-Action': 'ops.script.create' }, suppressGlobalError: true });
+      msg.success('批量脚本任务已创建');
+      setScriptOpen(false);
+      scriptForm.resetFields();
+      setTimeout(() => loadJobs(1, jobPageSize), 700);
+    } catch (error) {
+      msg.error(apiErrorMessage(error, '批量脚本任务创建失败'));
+    } finally {
+      setScriptCreating(false);
+    }
   };
 
   const showResults = async (job: ScriptJob) => {
@@ -100,14 +112,22 @@ export function OpsPage({ role }: { role?: string }) {
   };
 
   const collectLogs = async () => {
+    if (logCollecting) return;
     const values = await logForm.validateFields();
-    const { data } = await api.post<LogCollectionResponse>('/ops/log-collections', values, { headers: { 'X-Confirm-Action': 'ops.logs.collect' } });
-    setLogSummary(data);
-    setLogResults(data.results || []);
-    if (data.failed > 0) msg.warning(`日志采集完成：成功 ${data.succeeded}，失败 ${data.failed}`);
-    else msg.success(`日志采集完成：生成 ${data.events_created} 条事件`);
-    setLogOpen(false);
-    logForm.resetFields();
+    setLogCollecting(true);
+    try {
+      const { data } = await api.post<LogCollectionResponse>('/ops/log-collections', values, { headers: { 'X-Confirm-Action': 'ops.logs.collect' }, suppressGlobalError: true });
+      setLogSummary(data);
+      setLogResults(data.results || []);
+      if (data.failed > 0) msg.warning(`日志采集完成：成功 ${data.succeeded}，失败 ${data.failed}`);
+      else msg.success(`日志采集完成：生成 ${data.events_created} 条事件`);
+      setLogOpen(false);
+      logForm.resetFields();
+    } catch (error) {
+      msg.error(apiErrorMessage(error, '日志采集失败'));
+    } finally {
+      setLogCollecting(false);
+    }
   };
 
   const openTerminal = async () => {
@@ -118,12 +138,20 @@ export function OpsPage({ role }: { role?: string }) {
   };
 
   const createTerminal = async () => {
+    if (terminalCreating) return;
     const values = await terminalForm.validateFields();
-    await api.post('/ops/terminal-sessions', values, { headers: { 'X-Confirm-Action': 'ops.terminal.open' } });
-    msg.success('终端会话已打开');
-    setTerminalOpen(false);
-    terminalForm.resetFields();
-    void loadSessions(1, sessionPageSize);
+    setTerminalCreating(true);
+    try {
+      await api.post('/ops/terminal-sessions', values, { headers: { 'X-Confirm-Action': 'ops.terminal.open' }, suppressGlobalError: true });
+      msg.success('终端会话已打开');
+      setTerminalOpen(false);
+      terminalForm.resetFields();
+      void loadSessions(1, sessionPageSize);
+    } catch (error) {
+      msg.error(apiErrorMessage(error, '终端会话打开失败'));
+    } finally {
+      setTerminalCreating(false);
+    }
   };
 
   const showTranscript = async (session: TerminalSession) => {
@@ -135,13 +163,20 @@ export function OpsPage({ role }: { role?: string }) {
   };
 
   const runTerminalCommand = async () => {
-    if (!activeTranscriptSession || !terminalCommand.trim()) return;
-    const { data } = await api.post<TerminalSession>(`/ops/terminal-sessions/${activeTranscriptSession.id}/commands`, { command: terminalCommand }, { headers: { 'X-Confirm-Action': 'ops.terminal.command' } });
-    setActiveTranscriptSession(data);
-    setTranscript(data.transcript || '');
-    setTerminalCommand('');
-    msg.success('命令已执行');
-    void loadSessions(sessionPage, sessionPageSize);
+    if (!activeTranscriptSession || !terminalCommand.trim() || terminalCommandRunning) return;
+    setTerminalCommandRunning(true);
+    try {
+      const { data } = await api.post<TerminalSession>(`/ops/terminal-sessions/${activeTranscriptSession.id}/commands`, { command: terminalCommand }, { headers: { 'X-Confirm-Action': 'ops.terminal.command' }, suppressGlobalError: true });
+      setActiveTranscriptSession(data);
+      setTranscript(data.transcript || '');
+      setTerminalCommand('');
+      msg.success('命令已执行');
+      void loadSessions(sessionPage, sessionPageSize);
+    } catch (error) {
+      msg.error(apiErrorMessage(error, '命令执行失败'));
+    } finally {
+      setTerminalCommandRunning(false);
+    }
   };
 
   const closeTerminal = (session: TerminalSession) => {
@@ -179,12 +214,14 @@ export function OpsPage({ role }: { role?: string }) {
     setBackupReport(null);
     try {
       const text = await file.text();
-      const { data } = await api.post<BackupValidationReport>('/ops/backup/validate', text, { headers: { 'Content-Type': 'application/json' } });
+      const { data } = await api.post<BackupValidationReport>('/ops/backup/validate', text, { headers: { 'Content-Type': 'application/json' }, suppressGlobalError: true });
       setBackupPayloadText(text);
       setBackupReport(data);
       if (data.status === 'error') msg.error('备份预检发现错误');
       else if (data.status === 'warning') msg.warning('备份预检存在警告');
       else msg.success('备份预检通过');
+    } catch (error) {
+      msg.error(apiErrorMessage(error, '备份预检失败'));
     } finally {
       setBackupValidating(false);
     }
@@ -336,7 +373,7 @@ export function OpsPage({ role }: { role?: string }) {
       }] : [])
     ]} />
 
-    <Modal title="创建批量脚本任务" open={scriptOpen} onOk={createScript} onCancel={() => setScriptOpen(false)} width={760} forceRender>
+    <Modal title="创建批量脚本任务" open={scriptOpen} onOk={createScript} confirmLoading={scriptCreating} onCancel={() => setScriptOpen(false)} width={760} forceRender>
       <Form form={scriptForm} layout="vertical">
         <Form.Item name="name" label="任务名称" rules={[{ required: true }]}><Input /></Form.Item>
         {serverTargetOptions.length === 0 && <Alert type="warning" showIcon message="暂无可用目标服务器" style={{ marginBottom: 12 }} />}
@@ -346,7 +383,7 @@ export function OpsPage({ role }: { role?: string }) {
       </Form>
     </Modal>
 
-    <Modal title="一键采集日志" open={logOpen} onOk={collectLogs} onCancel={() => setLogOpen(false)} width={680} forceRender>
+    <Modal title="一键采集日志" open={logOpen} onOk={collectLogs} confirmLoading={logCollecting} onCancel={() => setLogOpen(false)} width={680} forceRender>
       <Form form={logForm} layout="vertical">
         {serverTargetOptions.length === 0 && <Alert type="warning" showIcon message="暂无可用目标服务器" style={{ marginBottom: 12 }} />}
         <Form.Item name="server_ids" label="目标服务器" rules={[{ required: true }]}><Select mode="multiple" options={serverTargetOptions} /></Form.Item>
@@ -358,7 +395,7 @@ export function OpsPage({ role }: { role?: string }) {
       </Form>
     </Modal>
 
-    <Modal title="打开远程终端" open={terminalOpen} onOk={createTerminal} onCancel={() => setTerminalOpen(false)} width={620} forceRender>
+    <Modal title="打开远程终端" open={terminalOpen} onOk={createTerminal} confirmLoading={terminalCreating} onCancel={() => setTerminalOpen(false)} width={620} forceRender>
       <Form form={terminalForm} layout="vertical">
         {serverTargetOptions.length === 0 && <Alert type="warning" showIcon message="暂无可用目标服务器" style={{ marginBottom: 12 }} />}
         <Form.Item name="server_id" label="服务器" rules={[{ required: true }]}><Select options={serverTargetOptions} /></Form.Item>
@@ -377,8 +414,8 @@ export function OpsPage({ role }: { role?: string }) {
 
     <Modal title="终端会话记录" open={transcriptOpen} footer={null} onCancel={() => setTranscriptOpen(false)} width={760}>
       <Space.Compact style={{ width: '100%', marginBottom: 12 }}>
-        <Input value={terminalCommand} onChange={event => setTerminalCommand(event.target.value)} onPressEnter={runTerminalCommand} placeholder="输入命令" disabled={!canWrite || activeTranscriptSession?.status === 'closed'} />
-        <Button type="primary" onClick={runTerminalCommand} disabled={!canWrite || activeTranscriptSession?.status === 'closed' || !terminalCommand.trim()}>执行</Button>
+        <Input value={terminalCommand} onChange={event => setTerminalCommand(event.target.value)} onPressEnter={runTerminalCommand} placeholder="输入命令" disabled={!canWrite || activeTranscriptSession?.status === 'closed' || terminalCommandRunning} />
+        <Button type="primary" onClick={runTerminalCommand} loading={terminalCommandRunning} disabled={!canWrite || activeTranscriptSession?.status === 'closed' || !terminalCommand.trim()}>执行</Button>
       </Space.Compact>
       <Input.TextArea value={transcript} rows={10} readOnly />
     </Modal>

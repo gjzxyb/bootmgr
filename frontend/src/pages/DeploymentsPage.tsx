@@ -1,7 +1,7 @@
 import { ReloadOutlined, FileTextOutlined, StopOutlined, RedoOutlined } from '@ant-design/icons';
 import { Alert, Button, Checkbox, Descriptions, Form, Input, Modal, Popconfirm, Select, Space, Table, Tag, Tooltip, Typography, message } from 'antd';
 import { useEffect, useState } from 'react';
-import { api, Deployment, Image, InstallTemplate, NetworkConfig, PageResult, Server, WorkflowTemplate } from '../api/client';
+import { api, apiErrorMessage, Deployment, Image, InstallTemplate, NetworkConfig, PageResult, Server, WorkflowTemplate } from '../api/client';
 import { canManage } from '../authz';
 
 type DeploymentLog = {
@@ -179,7 +179,7 @@ export function DeploymentsPage({ role }: { role?: string }) {
     setPreflightLoading(true);
     clearPreflight();
     try {
-      const { data } = await api.post<DeploymentPreflightResponse>('/deployments/preflight', request.body);
+      const { data } = await api.post<DeploymentPreflightResponse>('/deployments/preflight', request.body, { suppressGlobalError: true });
       const latestRequest = currentPreflightRequest();
       if (preflightRequestKey(latestRequest.body) !== requestKey) {
         msg.info('部署参数已变化，请重新运行预检');
@@ -189,6 +189,8 @@ export function DeploymentsPage({ role }: { role?: string }) {
       setPreflightKey(requestKey);
       if (data.status === 'ok') msg.success(stringList(data.warnings).length ? '预检通过，存在需人工确认的提示' : '预检通过');
       else msg.error('预检存在阻断项');
+    } catch (error) {
+      msg.error(apiErrorMessage(error, '部署预检失败'));
     } finally {
       setPreflightLoading(false);
     }

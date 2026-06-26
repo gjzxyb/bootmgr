@@ -463,6 +463,7 @@ func TestMVPFlow(t *testing.T) {
 	if downloadedImage != string(uploadedContent) {
 		t.Fatalf("downloaded image content did not match upload: %q", downloadedImage)
 	}
+	requestMultipartImageExpectStatus(t, r, token, map[string]string{"name": "Too large", "architecture": "x86_64"}, "too-large.iso", bytes.Repeat([]byte("x"), int(cfg.ImageUploadMaxBytes)), http.StatusRequestEntityTooLarge, "IMAGE_UPLOAD_MAX_MB")
 	tempDeleteImage := requestJSON(t, r, http.MethodPost, "/api/v1/images", token, map[string]any{"name": "Temporary delete image", "os_family": "ubuntu", "os_version": "24.04", "architecture": "x86_64", "file_path": imagePath})
 	beforeDeleteDashboard := requestJSON(t, r, http.MethodGet, "/api/v1/dashboard", token, nil)
 	requestJSONWithConfirm(t, r, http.MethodDelete, "/api/v1/images/"+itoa(intFromJSON(t, tempDeleteImage, "id")), token, nil, "image.delete")
@@ -3793,6 +3794,40 @@ func requestMultipartImage(t *testing.T, r http.Handler, token string, fields ma
 		t.Fatalf("decode response: %v body=%s", err, res.Body.String())
 	}
 	return obj
+}
+
+func requestMultipartImageExpectStatus(t *testing.T, r http.Handler, token string, fields map[string]string, filename string, content []byte, status int, bodyContains string) {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range fields {
+		if err := writer.WriteField(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/images/upload", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	res := httptest.NewRecorder()
+	r.ServeHTTP(res, req)
+	if res.Code != status {
+		t.Fatalf("POST /api/v1/images/upload returned %d, expected %d: %s", res.Code, status, res.Body.String())
+	}
+	if bodyContains != "" && !strings.Contains(res.Body.String(), bodyContains) {
+		t.Fatalf("expected response to contain %q: %s", bodyContains, res.Body.String())
+	}
 }
 
 func requestExpectStatus(t *testing.T, r http.Handler, method, path, token string, payload any, status int, confirm string) {

@@ -1,7 +1,7 @@
 import { CheckOutlined, EditOutlined, HistoryOutlined, ReloadOutlined, ToolOutlined } from '@ant-design/icons';
 import { Button, Form, Input, InputNumber, Modal, Select, Space, Table, Tabs, Tag, Typography, message } from 'antd';
 import { useEffect, useState } from 'react';
-import { Alert, AlertEvent, AlertRule, CollectionJob, LogEvent, PageResult, api } from '../api/client';
+import { Alert, AlertEvent, AlertRule, CollectionJob, LogEvent, PageResult, api, apiErrorMessage } from '../api/client';
 import { canManage, isAdmin } from '../authz';
 
 const severityColor = (severity: string) => severity === 'critical' ? 'red' : severity === 'warning' ? 'orange' : 'blue';
@@ -35,6 +35,10 @@ export function AlertsPage({ role }: { role?: string }) {
   const [editingRule, setEditingRule] = useState<AlertRule | null>(null);
   const [handleAction, setHandleAction] = useState<'ack' | 'resolve'>('ack');
   const [events, setEvents] = useState<AlertEvent[]>([]);
+  const [collectSubmitting, setCollectSubmitting] = useState(false);
+  const [ruleSaving, setRuleSaving] = useState(false);
+  const [handleSubmitting, setHandleSubmitting] = useState(false);
+  const [evaluatingRules, setEvaluatingRules] = useState(false);
   const [filterForm] = Form.useForm();
   const [ruleFilterForm] = Form.useForm();
   const [ruleForm] = Form.useForm();
@@ -91,6 +95,7 @@ export function AlertsPage({ role }: { role?: string }) {
 
   const openEditRule = (rule: AlertRule) => {
     setEditingRule(rule);
+    ruleForm.resetFields();
     ruleForm.setFieldsValue({
       rule_id: rule.rule_id,
       name: rule.name,
@@ -111,17 +116,25 @@ export function AlertsPage({ role }: { role?: string }) {
   };
 
   const saveRule = async () => {
+    if (ruleSaving) return;
     const values = await ruleForm.validateFields();
-    if (editingRule) {
-      await api.patch(`/alert-rules/${editingRule.id}`, values);
-      msg.success('告警规则已更新');
-      closeRuleModal();
-      void loadRules(rulePage, rulePageSize);
-    } else {
-      await api.post('/alert-rules', values);
-      msg.success('告警规则已创建');
-      closeRuleModal();
-      void loadRules(1, rulePageSize);
+    setRuleSaving(true);
+    try {
+      if (editingRule) {
+        await api.patch(`/alert-rules/${editingRule.id}`, values, { suppressGlobalError: true });
+        msg.success('告警规则已更新');
+        closeRuleModal();
+        void loadRules(rulePage, rulePageSize);
+      } else {
+        await api.post('/alert-rules', values, { suppressGlobalError: true });
+        msg.success('告警规则已创建');
+        closeRuleModal();
+        void loadRules(1, rulePageSize);
+      }
+    } catch (error) {
+      msg.error(apiErrorMessage(error, '告警规则保存失败'));
+    } finally {
+      setRuleSaving(false);
     }
   };
 
@@ -133,26 +146,42 @@ export function AlertsPage({ role }: { role?: string }) {
   };
 
   const evaluateRules = async () => {
-    const { data } = await api.post('/alert-rules/evaluate');
-    msg.success(`规则评估完成，新增 ${data.created || 0} 条，去重 ${data.deduplicated || 0} 条`);
-    void load(1, pageSize);
+    if (evaluatingRules) return;
+    setEvaluatingRules(true);
+    try {
+      const { data } = await api.post('/alert-rules/evaluate', {}, { suppressGlobalError: true });
+      msg.success(`规则评估完成，新增 ${data.created || 0} 条，去重 ${data.deduplicated || 0} 条`);
+      void load(1, pageSize);
+    } catch (error) {
+      msg.error(apiErrorMessage(error, '规则评估失败'));
+    } finally {
+      setEvaluatingRules(false);
+    }
   };
 
   const openHandle = (alert: Alert, action: 'ack' | 'resolve') => {
     setCurrent(alert);
     setHandleAction(action);
+    handleForm.resetFields();
     handleForm.setFieldsValue({ note: action === 'ack' ? '开始排查' : '故障已处理' });
     setHandleOpen(true);
   };
 
   const submitHandle = async () => {
-    if (!current) return;
+    if (!current || handleSubmitting) return;
     const values = await handleForm.validateFields();
-    await api.post(`/alerts/${current.id}/${handleAction}`, values);
-    msg.success(handleAction === 'ack' ? '告警已确认' : '告警已关闭');
-    setHandleOpen(false);
-    handleForm.resetFields();
-    void load(page, pageSize);
+    setHandleSubmitting(true);
+    try {
+      await api.post(`/alerts/${current.id}/${handleAction}`, values, { suppressGlobalError: true });
+      msg.success(handleAction === 'ack' ? '告警已确认' : '告警已关闭');
+      setHandleOpen(false);
+      handleForm.resetFields();
+      void load(page, pageSize);
+    } catch (error) {
+      msg.error(apiErrorMessage(error, handleAction === 'ack' ? '告警确认失败' : '告警关闭失败'));
+    } finally {
+      setHandleSubmitting(false);
+    }
   };
 
   const showEvents = async (alert: Alert) => {
@@ -162,24 +191,34 @@ export function AlertsPage({ role }: { role?: string }) {
   };
 
   const openCollect = () => {
+    collectForm.resetFields();
+    collectForm.setFieldsValue({ auth_type: 'password' });
     setCollectOpen(true);
   };
 
   const collect = async () => {
+    if (collectSubmitting) return;
     const values = await collectForm.validateFields();
     const { server_id, host, username, secret, port, auth_type } = values;
-    if (host && username) {
-      if (!admin) {
-        msg.error('只有管理员可以保存 SSH 凭据');
-        return;
+    setCollectSubmitting(true);
+    try {
+      if (host && username) {
+        if (!admin) {
+          msg.error('只有管理员可以保存 SSH 凭据');
+          return;
+        }
+        await api.post(`/servers/${server_id}/ssh`, { host, username, secret, port: port || 22, auth_type: auth_type || 'password' }, { headers: { 'X-Confirm-Action': 'ssh.upsert' }, suppressGlobalError: true });
       }
-      await api.post(`/servers/${server_id}/ssh`, { host, username, secret, port: port || 22, auth_type: auth_type || 'password' }, { headers: { 'X-Confirm-Action': 'ssh.upsert' } });
+      await api.post(`/servers/${server_id}/collections`, {}, { suppressGlobalError: true });
+      msg.success('Agentless 采集任务已启动');
+      setCollectOpen(false);
+      collectForm.resetFields();
+      void loadJobs(1, jobPageSize);
+    } catch (error) {
+      msg.error(apiErrorMessage(error, 'Agentless 采集任务启动失败'));
+    } finally {
+      setCollectSubmitting(false);
     }
-    await api.post(`/servers/${server_id}/collections`);
-    msg.success('Agentless 采集任务已启动');
-    setCollectOpen(false);
-    collectForm.resetFields();
-    void loadJobs(1, jobPageSize);
   };
 
   return <>
@@ -212,7 +251,7 @@ export function AlertsPage({ role }: { role?: string }) {
       </> },
       { key: 'rules', label: '告警规则', forceRender: true, children: <>
         <div className="toolbar">
-          <Space>{canWrite && <Button type="primary" onClick={openCreateRule}>新建规则</Button>}<Button icon={<ReloadOutlined />} onClick={() => loadRules(rulePage, rulePageSize)}>刷新</Button>{canWrite && <Button onClick={evaluateRules}>评估规则</Button>}</Space>
+          <Space>{canWrite && <Button type="primary" onClick={openCreateRule}>新建规则</Button>}<Button icon={<ReloadOutlined />} onClick={() => loadRules(rulePage, rulePageSize)}>刷新</Button>{canWrite && <Button onClick={evaluateRules} loading={evaluatingRules}>评估规则</Button>}</Space>
           <Form form={ruleFilterForm} layout="inline" onFinish={() => loadRules(1, rulePageSize)} style={{ marginTop: 12 }}>
             <Form.Item name="keyword"><Input placeholder="规则/名称/描述" allowClear /></Form.Item>
             <Form.Item name="metric_name"><Input placeholder="指标名" allowClear /></Form.Item>
@@ -275,7 +314,7 @@ export function AlertsPage({ role }: { role?: string }) {
       </> }
     ]} />
 
-    <Modal title="触发 SSH Agentless 采集" open={collectOpen} onOk={collect} onCancel={() => setCollectOpen(false)} forceRender>
+    <Modal title="触发 SSH Agentless 采集" open={collectOpen} onOk={collect} confirmLoading={collectSubmitting} onCancel={() => setCollectOpen(false)} forceRender>
       <Form form={collectForm} layout="vertical" initialValues={{ auth_type: 'password' }}>
         <Form.Item name="server_id" label="服务器 ID" rules={[{ required: true }]}><InputNumber min={1} style={{ width: '100%' }} /></Form.Item>
         {admin && <Form.Item name="host" label="SSH Host"><Input placeholder="留空则使用模拟采集" /></Form.Item>}
@@ -286,7 +325,7 @@ export function AlertsPage({ role }: { role?: string }) {
       </Form>
     </Modal>
 
-    <Modal title={editingRule ? `编辑告警规则 - ${editingRule.rule_id}` : '新建告警规则'} open={ruleOpen} onOk={saveRule} onCancel={closeRuleModal} width={680} forceRender>
+    <Modal title={editingRule ? `编辑告警规则 - ${editingRule.rule_id}` : '新建告警规则'} open={ruleOpen} onOk={saveRule} confirmLoading={ruleSaving} onCancel={closeRuleModal} width={680} forceRender>
       <Form form={ruleForm} layout="vertical">
         <Form.Item name="rule_id" label="规则 ID" rules={[{ required: true }]}><Input placeholder="cpu.high" /></Form.Item>
         <Form.Item name="name" label="名称" rules={[{ required: true }]}><Input /></Form.Item>
@@ -301,7 +340,7 @@ export function AlertsPage({ role }: { role?: string }) {
       </Form>
     </Modal>
 
-    <Modal title={handleAction === 'ack' ? '确认告警' : '关闭告警'} open={handleOpen} onOk={submitHandle} onCancel={() => setHandleOpen(false)} forceRender>
+    <Modal title={handleAction === 'ack' ? '确认告警' : '关闭告警'} open={handleOpen} onOk={submitHandle} confirmLoading={handleSubmitting} onCancel={() => setHandleOpen(false)} forceRender>
       <Form form={handleForm} layout="vertical">
         <Form.Item name="note" label="处理说明" rules={[{ required: true }]}><Input.TextArea rows={4} /></Form.Item>
       </Form>

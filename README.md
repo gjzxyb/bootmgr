@@ -129,7 +129,7 @@ IPMI 身份 proof 会额外包含 Device ID、Device Revision、Manufacturer ID 
 `ok` BMC 和 SSH 单项证据也必须引用最近完成的严格验收 `run_id`，并要求该批次中对应目标存在来自 `redfish`/`ipmi` 的结构化 BMC 身份 proof，或 SSH known_hosts host key proof 加 command/exit_code/stdout proof；生产 SSH 验证必须使用 `SSH_HOST_KEY_POLICY=known_hosts` 和可读、可解析且非空的 `SSH_KNOWN_HOSTS_PATH`；仅有当前 Endpoint/Access 状态为 `ok` 不再足以证明物理验收通过。
 Docker Compose 为 PostgreSQL、Redis、后端和前端配置了容器健康检查；后端会等待 PostgreSQL/Redis healthy 后启动，前端会等待后端 `/healthz` healthy 后启动。生产覆盖文件会把后端健康检查切换为 `/readyz` 且要求 `status=ok`，用于提前暴露 PXE/TFTP、BMC 工具链、known_hosts 和配置问题。后端自身也会按 `DB_CONNECT_MAX_ATTEMPTS` 和 `DB_CONNECT_RETRY_DELAY_MS` 重试数据库初始化，避免数据库冷启动时短暂不可用导致容器直接退出。
 Docker Compose 会把后端 `/app/data` 挂载到 `backend-data` 卷，用于持久化 demo 镜像和上传镜像文件。
-前端镜像构建时可通过 `VITE_API_BASE_URL` 和 `VITE_API_ROOT_URL` 覆盖浏览器访问后端的地址；默认值适配本机 `localhost:8080` 演示。
+前端镜像构建时可通过 `VITE_API_BASE_URL` 和 `VITE_API_ROOT_URL` 覆盖浏览器访问后端的地址；未设置时前端会使用当前浏览器访问的 host 和 `VITE_API_PORT`（默认 `8080`）自动生成 API 地址，例如 `http://192.168.1.88:5173` 会调用 `http://192.168.1.88:8080/api/v1`。`VITE_IMAGE_UPLOAD_MAX_MB` 用于前端提前拦截超限镜像上传，建议与后端 `IMAGE_UPLOAD_MAX_MB` 保持一致。
 生产前端构建建议设置 `VITE_SHOW_DEMO_CREDENTIALS=false`，避免登录页展示或预填演示账号。
 后端会为每个请求生成或沿用 `X-Request-ID`，响应头会返回同名字段；访问日志为 JSON 行格式，审计日志中的 `request_id` 可与访问日志关联。
 
@@ -193,7 +193,7 @@ Docker Compose 会把后端 `/app/data` 挂载到 `backend-data` 卷，用于持
 - 自定义安装模板写入时要求 `name`、`template_type` 和非空 `content`，`template_type` 仅允许 `cloud-init`、`autoinstall`、`kickstart`、`preseed`、`unattend`，`variables_schema` 必须是 JSON object；工作流模板要求 `definition.steps` 至少包含一个带 `name` 和 `action` 的步骤。
 - 安装模板和工作流模板删除需要管理员角色与二次确认；已有部署引用的模板不能删除，应改为禁用，以保留历史部署可追溯性。
 - 默认种子镜像是用于校验和模拟部署的占位文件，不是可启动的真实操作系统 ISO。
-- `IMAGE_STORAGE_DIR` 控制上传镜像、手工登记镜像和默认种子镜像的可服务目录，默认 `data/images`；`IMAGE_UPLOAD_MAX_MB` 控制单文件上传大小，默认 20 MB。
+- `IMAGE_STORAGE_DIR` 控制上传镜像、手工登记镜像和默认种子镜像的可服务目录，默认 `data/images`；`IMAGE_UPLOAD_MAX_MB` 控制后端单文件上传大小，默认 20 MB。前端可用 `VITE_IMAGE_UPLOAD_MAX_MB` 提前提示超限文件，Docker Compose 默认会跟随 `IMAGE_UPLOAD_MAX_MB`。上传真实 OS ISO 前请按镜像大小调大，例如 `10240` 表示 10 GB。
 - 告警确认和关闭会记录处理人、处理时间、处理说明和审计日志。
 - 真实 PXE/DHCP/TFTP 通过 `PXEService` 接入：TFTP 只服务 `BOOT_TFTP_ROOT` 内文件并提供动态 `boot.ipxe`/`auto.ipxe`/`default.ipxe`，支持真实 PXE/iPXE 客户端常见 RRQ options `blksize`、`timeout`、`tsize` 的 OACK 协商；ProxyDHCP/内置 DHCP 会把 PXE 客户端链到平台 `/boot/ipxe`，并同时写入 option 54、BOOTP `siaddr`、option 66、option 67 和 BOOTP file，兼容读取不同字段的物理 PXE 固件。启用前必须绑定隔离部署网/VLAN，生产环境需显式监听部署网接口 IP，避免 DHCP/TFTP 暴露到非部署网卡。
 - 后端已提供 iPXE 和 Metadata API 边界：`/boot/ipxe`、`/boot/events`、按客户端 IP 匹配的 `/metadata/hostname`/`network`/`ssh-keys`/`userdata`，`/metadata/by-token/{token}/...`，以及兼容用 `/metadata/by-server/{id}/...`、`/metadata/by-mac/{mac}/{field}`、`/metadata/by-ip/{ip}/{field}`、`/metadata/by-deployment/{id}/{field}`，未知 MAC 会进入 `discovered` 资产台账；部署 iPXE 脚本默认使用 24 小时有效的 metadata token，过期后会轮换；生产环境会限制 Metadata/Userdata API 只能从启用的部署网 CIDR 访问，启动事件和 metadata 访问日志落库时会脱敏 token。

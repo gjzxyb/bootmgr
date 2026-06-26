@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -84,9 +85,17 @@ func (h Handler) createImage(c *gin.Context) {
 }
 
 func (h Handler) uploadImage(c *gin.Context) {
+	if c.Request.ContentLength > h.cfg.ImageUploadMaxBytes {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": imageUploadTooLargeMessage(h.cfg.ImageUploadMaxBytes)})
+		return
+	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.cfg.ImageUploadMaxBytes)
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
+		if requestBodyTooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": imageUploadTooLargeMessage(h.cfg.ImageUploadMaxBytes)})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "image file is required"})
 		return
 	}
@@ -134,6 +143,10 @@ func (h Handler) uploadImage(c *gin.Context) {
 	size, err := io.Copy(io.MultiWriter(dst, hash), file)
 	if err != nil {
 		_ = os.Remove(path)
+		if requestBodyTooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": imageUploadTooLargeMessage(h.cfg.ImageUploadMaxBytes)})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -164,6 +177,19 @@ func (h Handler) uploadImage(c *gin.Context) {
 	}
 	h.audit.Record(id, email, "image.upload", "image", row.ID, "medium", c.ClientIP(), c.Request.UserAgent(), c.GetString("request_id"))
 	c.JSON(http.StatusCreated, row)
+}
+
+func requestBodyTooLarge(err error) bool {
+	var maxBytesError *http.MaxBytesError
+	return errors.As(err, &maxBytesError) || strings.Contains(err.Error(), "request body too large")
+}
+
+func imageUploadTooLargeMessage(maxBytes int64) string {
+	maxMB := maxBytes / (1024 * 1024)
+	if maxMB < 1 {
+		return fmt.Sprintf("image file exceeds upload size limit (%d bytes); adjust IMAGE_UPLOAD_MAX_MB to allow larger ISO files", maxBytes)
+	}
+	return fmt.Sprintf("image file exceeds upload size limit (%d MB); adjust IMAGE_UPLOAD_MAX_MB to allow larger ISO files", maxMB)
 }
 
 func (h Handler) updateImage(c *gin.Context) {

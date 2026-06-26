@@ -6,14 +6,20 @@ declare module 'axios' {
   }
 }
 
-export const api = axios.create({ baseURL: import.meta.env.VITE_API_BASE_URL || 'http://localhost:8080/api/v1' });
-export const rootApi = axios.create({ baseURL: import.meta.env.VITE_API_ROOT_URL || apiRootURL() });
+export const api = axios.create({ baseURL: apiBaseURL() });
+export const rootApi = axios.create({ baseURL: apiRootURL() });
 
 export function setToken(token: string | null) {
   for (const client of [api, rootApi]) {
     if (token) client.defaults.headers.common.Authorization = `Bearer ${token}`;
     else delete client.defaults.headers.common.Authorization;
   }
+}
+
+export function apiErrorMessage(error: unknown, fallback: string) {
+  if (!axios.isAxiosError(error)) return fallback;
+  if (!error.response) return '无法连接后端服务，请检查 API 是否已启动';
+  return responseErrorDetail(error.response.data, error.response.headers, fallback);
 }
 
 const token = localStorage.getItem('token');
@@ -43,8 +49,9 @@ function installInterceptors(client: AxiosInstance) {
       } else if (error?.response?.status === 403) {
         window.dispatchEvent(new CustomEvent('api:forbidden'));
       } else if (!error.response) {
+        if (suppressGlobalError) return Promise.reject(error);
         window.dispatchEvent(new CustomEvent('api:error', { detail: '无法连接后端服务，请检查 API 是否已启动' }));
-      } else if (!suppressGlobalError && (status === 400 || status === 409 || status === 428)) {
+      } else if (!suppressGlobalError && (status === 400 || status === 409 || status === 413 || status === 428)) {
         window.dispatchEvent(new CustomEvent('api:error', { detail: responseErrorDetail(error.response.data, error.response.headers, '请求未通过校验') }));
       } else if (error.response.status >= 500) {
         window.dispatchEvent(new CustomEvent('api:error', { detail: responseErrorDetail(error.response.data, error.response.headers, '后端服务异常，请稍后重试') }));
@@ -59,14 +66,33 @@ function newClientRequestID() {
   return `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function apiBaseURL() {
+  const configured = configuredURL(import.meta.env.VITE_API_BASE_URL);
+  if (configured) return configured;
+  const currentOrigin = new URL(window.location.origin);
+  currentOrigin.port = configuredAPIPort();
+  return `${currentOrigin.origin}/api/v1`;
+}
+
 function apiRootURL() {
-  const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8080/api/v1';
+  const configured = configuredURL(import.meta.env.VITE_API_ROOT_URL);
+  if (configured) return configured;
+  const apiBase = apiBaseURL();
   const parsed = new URL(apiBase, window.location.origin);
   parsed.pathname = parsed.pathname.replace(/\/api\/v1\/?$/, '');
   parsed.search = '';
   parsed.hash = '';
   const path = parsed.pathname === '/' ? '' : parsed.pathname.replace(/\/$/, '');
   return `${parsed.origin}${path}`;
+}
+
+function configuredURL(value: unknown) {
+  return typeof value === 'string' && value.trim() ? value.trim() : '';
+}
+
+function configuredAPIPort() {
+  const configured = import.meta.env.VITE_API_PORT;
+  return typeof configured === 'string' && configured.trim() ? configured.trim() : '8080';
 }
 
 function responseHeader(headers: unknown, name: string) {

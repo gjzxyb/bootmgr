@@ -62,8 +62,10 @@ services:
     build:
       context: ../frontend
       args:
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL:?set VITE_API_BASE_URL}
-        VITE_API_ROOT_URL: ${VITE_API_ROOT_URL:?set VITE_API_ROOT_URL}
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+        VITE_API_ROOT_URL: ${VITE_API_ROOT_URL:-}
+        VITE_API_PORT: ${VITE_API_PORT:-8080}
+        VITE_IMAGE_UPLOAD_MAX_MB: ${VITE_IMAGE_UPLOAD_MAX_MB:-${IMAGE_UPLOAD_MAX_MB:-20}}
         VITE_SHOW_DEMO_CREDENTIALS: ${VITE_SHOW_DEMO_CREDENTIALS:-false}
     depends_on:
       backend:

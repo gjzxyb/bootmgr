@@ -1,7 +1,7 @@
 import { CodeOutlined, DeleteOutlined, PlusOutlined, ReloadOutlined, ToolOutlined } from '@ant-design/icons';
 import { Button, Form, Input, Modal, Popconfirm, Select, Space, Table, Tabs, Tag, Typography, message } from 'antd';
 import { useEffect, useState } from 'react';
-import { api, InstallTemplate, PageResult, WorkflowTemplate } from '../api/client';
+import { api, apiErrorMessage, InstallTemplate, PageResult, WorkflowTemplate } from '../api/client';
 import { canManage, isAdmin } from '../authz';
 
 const statusColor = (status: string) => status === 'enabled' ? 'green' : 'default';
@@ -30,6 +30,8 @@ export function TemplatesPage({ role }: { role?: string }) {
   const [workflowPageSize, setWorkflowPageSize] = useState(20);
   const [installOpen, setInstallOpen] = useState(false);
   const [workflowOpen, setWorkflowOpen] = useState(false);
+  const [installSaving, setInstallSaving] = useState(false);
+  const [workflowSaving, setWorkflowSaving] = useState(false);
   const [editingInstall, setEditingInstall] = useState<InstallTemplate | null>(null);
   const [editingWorkflow, setEditingWorkflow] = useState<WorkflowTemplate | null>(null);
   const [installForm] = Form.useForm();
@@ -73,6 +75,7 @@ export function TemplatesPage({ role }: { role?: string }) {
   };
 
   const saveInstall = async () => {
+    if (installSaving) return;
     const values = await installForm.validateFields();
     const payload = { ...values };
     const schemaText = typeof payload.variables_schema_text === 'string' ? payload.variables_schema_text.trim() : '';
@@ -92,11 +95,18 @@ export function TemplatesPage({ role }: { role?: string }) {
       payload.variables_schema = null;
     }
     delete payload.variables_schema_text;
-    if (editingInstall) await api.patch(`/install-templates/${editingInstall.id}`, payload);
-    else await api.post('/install-templates', payload);
-    msg.success('安装模板已保存');
-    setInstallOpen(false);
-    void loadInstall(1, installPageSize);
+    setInstallSaving(true);
+    try {
+      if (editingInstall) await api.patch(`/install-templates/${editingInstall.id}`, payload, { suppressGlobalError: true });
+      else await api.post('/install-templates', payload, { suppressGlobalError: true });
+      msg.success('安装模板已保存');
+      setInstallOpen(false);
+      void loadInstall(1, installPageSize);
+    } catch (error) {
+      msg.error(apiErrorMessage(error, '安装模板保存失败'));
+    } finally {
+      setInstallSaving(false);
+    }
   };
 
   const toggleInstall = async (row: InstallTemplate) => {
@@ -113,19 +123,28 @@ export function TemplatesPage({ role }: { role?: string }) {
 
   const openWorkflow = (row?: WorkflowTemplate) => {
     setEditingWorkflow(row || null);
+    workflowForm.resetFields();
     const definition = row?.definition ? JSON.stringify(row.definition, null, 2) : '{\n  "steps": [\n    { "name": "Render iPXE", "action": "render_ipxe" },\n    { "name": "Install OS", "action": "install_os" }\n  ]\n}';
     workflowForm.setFieldsValue(row ? { ...row, definition } : { status: 'enabled', version: 'v1', definition });
     setWorkflowOpen(true);
   };
 
   const saveWorkflow = async () => {
-    const values = workflowForm.getFieldsValue();
+    if (workflowSaving) return;
+    const values = await workflowForm.validateFields();
     try { values.definition = JSON.parse(values.definition); } catch { msg.error('工作流定义 JSON 无效'); return; }
-    if (editingWorkflow) await api.patch(`/workflow-templates/${editingWorkflow.id}`, values);
-    else await api.post('/workflow-templates', values);
-    msg.success('工作流模板已保存');
-    setWorkflowOpen(false);
-    void loadWorkflow(1, workflowPageSize);
+    setWorkflowSaving(true);
+    try {
+      if (editingWorkflow) await api.patch(`/workflow-templates/${editingWorkflow.id}`, values, { suppressGlobalError: true });
+      else await api.post('/workflow-templates', values, { suppressGlobalError: true });
+      msg.success('工作流模板已保存');
+      setWorkflowOpen(false);
+      void loadWorkflow(1, workflowPageSize);
+    } catch (error) {
+      msg.error(apiErrorMessage(error, '工作流模板保存失败'));
+    } finally {
+      setWorkflowSaving(false);
+    }
   };
 
   const toggleWorkflow = async (row: WorkflowTemplate) => {
@@ -185,7 +204,7 @@ export function TemplatesPage({ role }: { role?: string }) {
       </> }
     ]} />
 
-    <Modal title={editingInstall ? '编辑安装模板' : '新建安装模板'} open={installOpen} onOk={saveInstall} onCancel={() => setInstallOpen(false)} width={820} forceRender>
+    <Modal title={editingInstall ? '编辑安装模板' : '新建安装模板'} open={installOpen} onOk={saveInstall} confirmLoading={installSaving} onCancel={() => setInstallOpen(false)} width={820} forceRender>
       <Form form={installForm} layout="vertical">
         <Form.Item name="name" label="名称" rules={[{ required: true }]}><Input /></Form.Item>
         <Space.Compact block><Form.Item name="os_family" label="系统族" style={{ width: '50%' }}><Select options={osFamilyOptions} /></Form.Item><Form.Item name="os_version" label="系统版本" style={{ width: '50%' }}><Input /></Form.Item></Space.Compact>
@@ -196,7 +215,7 @@ export function TemplatesPage({ role }: { role?: string }) {
       </Form>
     </Modal>
 
-    <Modal title={editingWorkflow ? '编辑工作流模板' : '新建工作流模板'} open={workflowOpen} onOk={saveWorkflow} onCancel={() => setWorkflowOpen(false)} width={820} forceRender>
+    <Modal title={editingWorkflow ? '编辑工作流模板' : '新建工作流模板'} open={workflowOpen} onOk={saveWorkflow} confirmLoading={workflowSaving} onCancel={() => setWorkflowOpen(false)} width={820} forceRender>
       <Form form={workflowForm} layout="vertical">
         <Form.Item name="name" label="名称" rules={[{ required: true }]}><Input /></Form.Item>
         <Form.Item name="version" label="版本"><Input /></Form.Item>

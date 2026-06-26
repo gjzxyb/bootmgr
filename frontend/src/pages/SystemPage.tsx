@@ -1,7 +1,7 @@
 import { DownloadOutlined, EditOutlined, ExperimentOutlined, FileDoneOutlined, LockOutlined, PlayCircleOutlined, PlusOutlined, ReloadOutlined, SafetyCertificateOutlined, SearchOutlined } from '@ant-design/icons';
 import { Button, Descriptions, Form, Input, InputNumber, Modal, Select, Space, Table, Tabs, Tag, Typography, message } from 'antd';
 import { useEffect, useState } from 'react';
-import { api, ConfigIssue, LabBMCRef, LabBootEvent, LabEvidenceCandidate, LabOperatorChecklistItem, LabSSHRef, LabValidationCheck, LabValidationEvidence, LabValidationEvidenceBundle, LabValidationLogEvent, LabValidationReport, LabValidationRunDetail, LabValidationRunResult, LabValidationRunSummary, LabValidationScriptExecution, LabValidationTarget, LabValidationTerminalSession, NetworkCheck, NetworkCheckReport, NetworkConfig, PageResult, ReadinessCheck, ReadinessStatus, rootApi, Tenant, User } from '../api/client';
+import { api, apiErrorMessage, ConfigIssue, LabBMCRef, LabBootEvent, LabEvidenceCandidate, LabOperatorChecklistItem, LabSSHRef, LabValidationCheck, LabValidationEvidence, LabValidationEvidenceBundle, LabValidationLogEvent, LabValidationReport, LabValidationRunDetail, LabValidationRunResult, LabValidationRunSummary, LabValidationScriptExecution, LabValidationTarget, LabValidationTerminalSession, NetworkCheck, NetworkCheckReport, NetworkConfig, PageResult, ReadinessCheck, ReadinessStatus, rootApi, Tenant, User } from '../api/client';
 
 const roleColor = (role: string) => role === 'admin' ? 'red' : role === 'operator' ? 'blue' : 'default';
 const readinessColor = (status: string) => status === 'ok' ? 'green' : status === 'warning' ? 'orange' : 'red';
@@ -179,12 +179,14 @@ export function SystemPage() {
     };
     setLabValidationRunLoading(true);
     try {
-      const { data } = await api.post<LabValidationReport>('/system/lab-validation/run', payload, { headers: { 'X-Confirm-Action': 'system.lab-validation.run' } });
+      const { data } = await api.post<LabValidationReport>('/system/lab-validation/run', payload, { headers: { 'X-Confirm-Action': 'system.lab-validation.run' }, suppressGlobalError: true });
       setLabValidation(data);
       setLabRunOpen(false);
       if (data.status === 'ok') msg.success('真实验收检查通过');
       else if (data.status === 'warning') msg.warning('真实验收检查存在 warning');
       else msg.error('真实验收检查存在 error');
+    } catch (error) {
+      msg.error(apiErrorMessage(error, '真实验收检查运行失败'));
     } finally {
       setLabValidationRunLoading(false);
     }
@@ -348,14 +350,6 @@ export function SystemPage() {
     setCreateOpen(false);
     createForm.resetFields();
     void loadUsers(1, pageSize);
-  };
-
-  const apiErrorMessage = (error: unknown, fallback: string) => {
-    if (error && typeof error === 'object' && 'response' in error) {
-      const response = (error as { response?: { data?: { error?: unknown } } }).response;
-      if (typeof response?.data?.error === 'string') return response.data.error;
-    }
-    return fallback;
   };
 
   const updateRole = async (user: User, role: string) => {
@@ -523,11 +517,13 @@ export function SystemPage() {
     setNetworkCheckOpen(true);
     setNetworkCheckLoading(true);
     try {
-      const { data } = await api.post<NetworkCheckReport>(`/network-configs/${network.id}/check`, {});
+      const { data } = await api.post<NetworkCheckReport>(`/network-configs/${network.id}/check`, {}, { suppressGlobalError: true });
       setNetworkCheck(data);
       if (data.status === 'ok') msg.success('网络检查通过');
       else if (data.status === 'warning') msg.warning('网络检查存在 warning');
       else msg.error('网络检查存在 error');
+    } catch (error) {
+      msg.error(apiErrorMessage(error, '网络检查失败'));
     } finally {
       setNetworkCheckLoading(false);
     }
